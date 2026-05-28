@@ -255,6 +255,12 @@ impl Windows<'_, '_> {
         })
     }
 
+    pub fn ids_for_parent(&self, parent: Entity) -> impl Iterator<Item = WinID> + '_ {
+        self.all.iter().filter_map(move |(window, _, childof, _)| {
+            (childof.parent() == parent).then_some(window.id())
+        })
+    }
+
     pub fn find_managed(&self, window_id: WinID) -> Option<(&Window, Entity)> {
         self.all.iter().find_map(|(window, entity, _, unmanaged)| {
             (unmanaged.is_none() && window.id() == window_id).then_some((window, entity))

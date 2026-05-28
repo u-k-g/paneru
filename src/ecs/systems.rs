@@ -469,6 +469,7 @@ pub(super) fn timeout_ticker(
 pub(super) fn retry_front_switch(
     retries: Populated<(Entity, &RetryFrontSwitch)>,
     applications: Query<&Application>,
+    windows: Windows,
     mut commands: Commands,
 ) {
     for (entity, retry) in retries.iter() {
@@ -487,7 +488,8 @@ pub(super) fn retry_front_switch(
             }
             continue;
         }
-        if let Ok(focused_id) = app.focused_window_id() {
+        if let Ok(focused_id) = super::triggers::normalize_focused_window_id(retry.0, app, &windows)
+        {
             debug!("Front switch retry succeeded for window {focused_id}.");
             commands.trigger(SendMessageTrigger(Event::WindowFocused {
                 window_id: focused_id,

@@ -43,6 +43,70 @@ fn update_passthrough(window: &Window, app: &Application, config: &Config) {
     crate::platform::input::set_focused_passthrough(properties.passthrough_keys());
 }
 
+pub(super) fn normalize_focused_window_id(
+    app_entity: Entity,
+    app: &Application,
+    windows: &Windows,
+) -> crate::errors::Result<WinID> {
+    let focused_id = app.focused_window_id()?;
+    if windows
+        .find_parent(focused_id)
+        .is_some_and(|(_, _, parent)| parent == app_entity)
+    {
+        return Ok(focused_id);
+    }
+
+    let tracked_ids: Vec<_> = windows.ids_for_parent(app_entity).collect();
+    if tracked_ids.len() == 1 {
+        debug!(
+            "normalizing untracked focused window {focused_id} to only tracked app window {}",
+            tracked_ids[0]
+        );
+        return Ok(tracked_ids[0]);
+    }
+
+    let current_ids: Vec<_> = app
+        .window_list()
+        .into_iter()
+        .map(|window| window.id())
+        .collect();
+    let matching_ids: Vec<_> = tracked_ids
+        .iter()
+        .copied()
+        .filter(|id| current_ids.contains(id))
+        .collect();
+    if matching_ids.len() == 1 {
+        debug!(
+            "normalizing untracked focused window {focused_id} to current tracked app window {}",
+            matching_ids[0]
+        );
+        return Ok(matching_ids[0]);
+    }
+
+    Ok(focused_id)
+}
+
+fn normalize_focus_event_window_id(
+    window_id: WinID,
+    applications: &Query<(Entity, &Application)>,
+    windows: &Windows,
+) -> WinID {
+    if windows.find_parent(window_id).is_some() {
+        return window_id;
+    }
+
+    applications
+        .iter()
+        .filter(|(_, app)| app.is_frontmost())
+        .find_map(|(app_entity, app)| {
+            app.focused_window_id()
+                .is_ok_and(|focused_id| focused_id == window_id)
+                .then(|| normalize_focused_window_id(app_entity, app, windows).ok())
+                .flatten()
+        })
+        .unwrap_or(window_id)
+}
+
 /// Handles the event when an application switches to the front. It updates the focused window and PSN.
 ///
 /// # Arguments
@@ -58,6 +122,7 @@ pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
     applications: Query<&Application>,
+    windows: Windows,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
     mut commands: Commands,
@@ -89,9 +154,11 @@ pub(super) fn front_switched_trigger(
 
         debug!("front switching process: {}", process.name());
 
-        if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
-            warn!("can not get current focus: {err}");
-        }) {
+        if let Ok(focused_id) =
+            normalize_focused_window_id(app_entity, app, &windows).inspect_err(|err| {
+                warn!("can not get current focus: {err}");
+            })
+        {
             if let Some(point) = window_manager.cursor_position()
                 && window_manager
                     .find_window_at_point(&point)
@@ -179,7 +246,7 @@ pub(super) fn theme_change_trigger(
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
-    applications: Query<&Application>,
+    applications: Query<(Entity, &Application)>,
     windows: Windows,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut focus_history: ResMut<FocusHistory>,
@@ -193,6 +260,7 @@ pub(super) fn window_focused_trigger(
         let Event::WindowFocused { window_id } = *event else {
             continue;
         };
+        let window_id = normalize_focus_event_window_id(window_id, &applications, &windows);
 
         let Some((window, entity, parent)) = windows.find_parent(window_id) else {
             let timeout = Timeout::new(
@@ -204,7 +272,7 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
-        let Ok(app) = applications.get(parent) else {
+        let Ok((_, app)) = applications.get(parent) else {
             warn!("Unable to get parent for window {}.", window.id());
             continue;
         };
