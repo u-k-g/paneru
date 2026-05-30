@@ -52,6 +52,7 @@ impl TestHarness {
         let wm = MockWindowManager {
             windows: spawner,
             workspaces: vec![TEST_WORKSPACE_ID],
+            associated_windows: Vec::new(),
         };
         self.app
             .world_mut()

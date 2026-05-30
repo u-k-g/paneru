@@ -6,7 +6,10 @@ use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::{ActiveWorkspaceMarker, Position, Unmanaged, layout::LayoutStrip};
+use crate::ecs::{
+    ActiveWorkspaceMarker, OsFocusState, OsFocusTarget, Position, SelectedVirtualMarker, Unmanaged,
+    layout::LayoutStrip,
+};
 use crate::events::Event;
 use crate::manager::{Origin, Size, Window};
 use crate::{assert_focused, assert_window_at, assert_window_size};
@@ -604,6 +607,7 @@ fn test_external_focus_restores_hidden_window_without_visible_event() {
             vec![Window::new(Box::new(window))]
         }),
         workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
     };
 
     harness
@@ -626,6 +630,133 @@ fn test_external_focus_restores_hidden_window_without_visible_event() {
             assert_eq!(active, 0);
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_application_activated_by_pid_normalizes_untracked_native_tab_focus() {
+    let commands = vec![Event::ApplicationActivated {
+        pid: TEST_PROCESS_ID,
+    }];
+
+    let mut harness = TestHarness::new();
+    harness
+        .app
+        .world_mut()
+        .insert_resource(OsFocusState::default());
+    let mock_app = setup_process(harness.app.world_mut());
+    mock_app.inner.write().unwrap().focused_id = Some(999);
+    let wm = MockWindowManager {
+        windows: window_spawner(1, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(0, |world| {
+            let os_focus = world.resource::<OsFocusState>();
+            assert_eq!(os_focus.target, OsFocusTarget::ManagedWindow);
+            assert_eq!(os_focus.window_id, Some(0));
+
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_native_tab_focus_coalesces_tabs_into_one_virtual_workspace() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::WindowFocused { window_id: 1 },
+    ];
+
+    let mut harness = TestHarness::new();
+    let mock_app = setup_process(harness.app.world_mut());
+    let focused_app = mock_app.clone();
+    let wm = MockWindowManager {
+        windows: window_spawner(2, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: vec![(0, vec![0, 1]), (1, vec![0, 1])],
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(0, move |world| {
+            focused_app.inner.write().unwrap().focused_id = Some(1);
+            let tab = find_window_entity(1, world);
+            let display = world
+                .query_filtered::<Entity, With<crate::ecs::ActiveDisplayMarker>>()
+                .single(world)
+                .expect("active display");
+
+            let mut active =
+                world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+            active.single_mut(world).expect("active strip").remove(tab);
+
+            let mut other = LayoutStrip::new(TEST_WORKSPACE_ID, 1);
+            other.append(tab);
+            world.spawn((other, Position(Origin::new(0, 0)), ChildOf(display)));
+        })
+        .on_iteration(1, |world| {
+            assert_focused!(world, 1);
+
+            let tab0 = find_window_entity(0, world);
+            let tab1 = find_window_entity(1, world);
+            let mut strips = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let owners = strips
+                .iter(world)
+                .filter(|(strip, _)| strip.contains(tab0) || strip.contains(tab1))
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1);
+            assert!(owners[0].0.tab_group(tab1).is_some_and(|tabs| {
+                tabs.len() == 2 && tabs.contains(&tab0) && tabs.contains(&tab1)
+            }));
+            assert!(owners[0].1, "native tabs should be on the active strip");
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_duplicate_virtual_workspaces_are_merged() {
+    let commands = vec![Event::MenuOpened { window_id: 0 }];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |world| {
+            let tab = find_window_entity(2, world);
+            let display = world
+                .query_filtered::<Entity, With<crate::ecs::ActiveDisplayMarker>>()
+                .single(world)
+                .expect("active display");
+
+            let mut active =
+                world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+            active.single_mut(world).expect("active strip").remove(tab);
+
+            let mut duplicate = LayoutStrip::new(TEST_WORKSPACE_ID, 0);
+            duplicate.append(tab);
+            world.spawn((
+                duplicate,
+                Position(Origin::new(0, 0)),
+                ActiveWorkspaceMarker,
+                SelectedVirtualMarker,
+                ChildOf(display),
+            ));
+        })
+        .on_iteration(1, |world| {
+            let mut strips = world.query::<&LayoutStrip>();
+            let matching = strips
+                .iter(world)
+                .filter(|strip| strip.id() == TEST_WORKSPACE_ID && strip.virtual_index == 0)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            let windows = matching[0].all_windows();
+            assert_eq!(windows.len(), 3);
+            for id in 0..=2 {
+                assert!(windows.contains(&find_window_entity(id, world)));
+            }
         })
         .run(commands);
 }
@@ -771,6 +902,7 @@ fn focus_unmanaged_ignores_floats_from_other_workspaces() {
     let wm = MockWindowManager {
         windows,
         workspaces: vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1],
+        associated_windows: Vec::new(),
     };
 
     let commands = vec![

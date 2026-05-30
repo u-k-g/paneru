@@ -556,6 +556,7 @@ fn test_late_startup_window_restores_during_grace_period() {
     harness = harness.with_wm(MockWindowManager {
         windows,
         workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
     });
     harness
         .app

@@ -109,6 +109,7 @@ fn test_multi_workspace_orphaning() {
     let wm = MockWindowManager {
         windows: spawner,
         workspaces: vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1],
+        associated_windows: Vec::new(),
     };
 
     TestHarness::new()

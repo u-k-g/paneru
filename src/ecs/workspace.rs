@@ -10,7 +10,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
 use bevy::time::common_conditions::on_timer;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
@@ -53,6 +53,7 @@ impl Plugin for WorkspaceEventsPlugin {
                 workspace_change_trigger,
                 workspace_created_trigger,
                 workspace_destroyed_trigger,
+                dedupe_duplicate_virtual_workspaces,
                 show_active_workspace,
                 handle_virtual_window_moves,
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
@@ -68,6 +69,69 @@ impl Plugin for WorkspaceEventsPlugin {
         );
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn dedupe_duplicate_virtual_workspaces(
+    mut strips: Query<(
+        Entity,
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+        Option<&Position>,
+        Option<&PreviousStripPosition>,
+    )>,
+    mut commands: Commands,
+) {
+    let mut owners = HashMap::new();
+    let mut duplicates = Vec::new();
+
+    for (entity, strip, active, selected, _, previous) in &strips {
+        if previous.is_some() {
+            continue;
+        }
+
+        let key = (strip.id(), strip.virtual_index);
+        if let Some(owner) = owners.get(&key).copied() {
+            duplicates.push((key, owner, entity, active, selected));
+        } else {
+            owners.insert(key, entity);
+        }
+    }
+
+    for ((workspace_id, virtual_index), owner, duplicate, active, selected) in duplicates {
+        let Some(windows) = strips
+            .get(duplicate)
+            .ok()
+            .map(|(_, strip, _, _, _, _)| strip.all_windows())
+        else {
+            continue;
+        };
+
+        if let Ok((_, mut owner_strip, _, _, _, _)) = strips.get_mut(owner) {
+            for window in &windows {
+                owner_strip.append(*window);
+            }
+        }
+
+        if active || selected {
+            if let Ok(mut owner_commands) = commands.get_entity(owner) {
+                if active {
+                    owner_commands.try_insert(ActiveWorkspaceMarker);
+                }
+                if selected {
+                    owner_commands.try_insert(SelectedVirtualMarker);
+                }
+            }
+        }
+
+        debug!(
+            "merged duplicate virtual workspace {}v{} into {:?}",
+            workspace_id, virtual_index, owner
+        );
+        commands.entity(duplicate).despawn();
     }
 }
 

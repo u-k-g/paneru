@@ -241,6 +241,9 @@ impl LayoutStrip {
 
     /// Converts a column containing `leader` to a `Tabs` column and adds `follower`.
     pub fn convert_to_tabs(&mut self, leader: Entity, follower: Entity) -> Result<()> {
+        if leader == follower {
+            return Ok(());
+        }
         let index = self.index_of(leader)?;
         let column = self.columns.remove(index).unwrap();
         match column {
@@ -271,6 +274,17 @@ impl LayoutStrip {
             }
         }
         Ok(())
+    }
+
+    pub fn tab_group(&self, entity: Entity) -> Option<Vec<Entity>> {
+        self.columns.iter().find_map(|column| match column {
+            Column::Tabs(tabs) if tabs.contains(&entity) => Some(tabs.clone()),
+            Column::Stack(items) => items.iter().find_map(|item| match item {
+                StackItem::Tabs(tabs) if tabs.contains(&entity) => Some(tabs.clone()),
+                StackItem::Single(_) | StackItem::Tabs(_) => None,
+            }),
+            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => None,
+        })
     }
 
     /// Removes a window ID from the pane.

@@ -370,6 +370,7 @@ pub(super) fn window_focused_trigger(
     applications: Query<(Entity, &Application)>,
     windows: Windows,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
     config: Res<Config>,
     global_state: GlobalState,
@@ -432,6 +433,18 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
+        let mut native_tab_entities = window_manager
+            .get_associated_windows(window_id)
+            .into_iter()
+            .filter_map(|associated_id| windows.find(associated_id).map(|(_, entity)| entity))
+            .chain(std::iter::once(entity))
+            .fold(Vec::new(), |mut entities, entity| {
+                if !entities.contains(&entity) {
+                    entities.push(entity);
+                }
+                entities
+            });
+
         // Handle tab switching: if the focused window is a tab, make it the leader.
         // Also reactivate the owning virtual strip before treating duplicate
         // focus as a no-op; the focus marker can be stale on a hidden strip.
@@ -445,6 +458,11 @@ pub(super) fn window_focused_trigger(
                 active_workspace_id = Some(strip.id());
             }
             if owner.is_none() && strip.contains(entity) {
+                for tab_entity in strip.tab_group(entity).unwrap_or_default() {
+                    if !native_tab_entities.contains(&tab_entity) {
+                        native_tab_entities.push(tab_entity);
+                    }
+                }
                 if let Ok(index) = strip.index_of(entity)
                     && let Some(column) = strip.get_column_mut(index)
                 {
@@ -452,6 +470,32 @@ pub(super) fn window_focused_trigger(
                 }
                 owning_workspace_id = Some(strip.id());
                 owner = Some((strip_entity, active));
+            }
+        }
+
+        if native_tab_entities.len() > 1
+            && let Some((owner_entity, _)) = owner
+        {
+            for (strip_entity, mut strip, _) in &mut workspaces {
+                if strip_entity != owner_entity {
+                    for tab_entity in &native_tab_entities {
+                        strip.remove(*tab_entity);
+                    }
+                }
+            }
+
+            if let Ok((_, mut owner_strip, _)) = workspaces.get_mut(owner_entity) {
+                for tab_entity in native_tab_entities {
+                    if tab_entity != entity {
+                        owner_strip.remove(tab_entity);
+                        _ = owner_strip.convert_to_tabs(entity, tab_entity);
+                    }
+                }
+                if let Ok(index) = owner_strip.index_of(entity)
+                    && let Some(column) = owner_strip.get_column_mut(index)
+                {
+                    column.move_to_front(entity);
+                }
             }
         }
 

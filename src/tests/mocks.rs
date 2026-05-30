@@ -190,6 +190,7 @@ impl ApplicationApi for MockApplication {
 pub(crate) struct MockWindowManager {
     pub(crate) windows: TestWindowSpawner,
     pub(crate) workspaces: Vec<WorkspaceId>,
+    pub(crate) associated_windows: Vec<(WinID, Vec<WinID>)>,
 }
 
 impl std::fmt::Debug for MockWindowManager {
@@ -215,11 +216,13 @@ impl WindowManagerApi for MockWindowManager {
         })))
     }
 
-    /// Always returns an empty vector, as associated windows are not tested at this level.
     #[instrument(level = Level::DEBUG, skip(self), ret)]
     fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID> {
         debug!("{}:", function_name!());
-        vec![]
+        self.associated_windows
+            .iter()
+            .find_map(|(id, associated)| (*id == window_id).then(|| associated.clone()))
+            .unwrap_or_default()
     }
 
     /// Always returns an empty vector, as present displays are mocked elsewhere.
