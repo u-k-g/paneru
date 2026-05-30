@@ -59,6 +59,7 @@ fn swipe_gesture(
         (Entity, &Position, Option<&mut Scrolling>),
         With<ActiveWorkspaceMarker>,
     >,
+    windows: Windows,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -107,11 +108,13 @@ fn swipe_gesture(
     }
 
     let (entity, position, scrolling) = &mut *active_workspace;
+    let focused_at_start = windows.focused().map(|(_, entity)| entity);
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.fingers_count = None;
+        scrolling.started_focused = focused_at_start;
         scrolling.last_event = Instant::now();
     }
 
@@ -144,6 +147,7 @@ fn swipe_gesture(
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
                 is_user_swiping: touchpad_down,
                 fingers_count,
+                started_focused: focused_at_start,
                 last_event: Instant::now(),
             });
         }
@@ -183,6 +187,7 @@ fn snap_three_finger_swipe(
         strip,
         position.0,
         scrolling.velocity,
+        scrolling.started_focused,
         &viewport,
         &windows,
         &config,
@@ -196,6 +201,7 @@ fn snap_three_finger_swipe(
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = false;
         scrolling.fingers_count = None;
+        scrolling.started_focused = None;
         commands.entity(strip_entity).remove::<Scrolling>();
         focus_entity(entity, true, &mut commands);
     }
@@ -205,6 +211,7 @@ fn three_finger_release_target(
     strip: &LayoutStrip,
     strip_position: IVec2,
     velocity: f64,
+    started_focused: Option<Entity>,
     viewport: &IRect,
     windows: &Windows,
     config: &Config,
@@ -218,6 +225,10 @@ fn three_finger_release_target(
         return Some(visible);
     }
 
+    let Some(started_focused) = started_focused.filter(|entity| strip.contains(*entity)) else {
+        return Some(visible);
+    };
+
     let direction_modifier = match config.swipe_gesture_direction() {
         SwipeGestureDirection::Natural => -1.0,
         SwipeGestureDirection::Reversed => 1.0,
@@ -227,20 +238,16 @@ fn three_finger_release_target(
     let projected_position = IVec2::new(projected_x.round() as i32, strip_position.y);
 
     let projected = most_visible_window(strip, projected_position, viewport, windows)?;
-    let target = if projected == visible {
-        visible
-    } else if let Some(right) = strip.right_neighbour(visible) {
-        if projected == right {
-            right
-        } else if let Some(left) = strip.left_neighbour(visible) {
-            left
-        } else {
-            visible
-        }
-    } else if let Some(left) = strip.left_neighbour(visible) {
-        if projected == left { left } else { visible }
-    } else {
-        visible
+    let start_index = strip.index_of(started_focused).ok()?;
+    let projected_index = strip.index_of(projected).ok()?;
+    let target = match projected_index.cmp(&start_index) {
+        std::cmp::Ordering::Less => strip
+            .left_neighbour(started_focused)
+            .unwrap_or(started_focused),
+        std::cmp::Ordering::Equal => started_focused,
+        std::cmp::Ordering::Greater => strip
+            .right_neighbour(started_focused)
+            .unwrap_or(started_focused),
     };
 
     Some(target)
