@@ -212,8 +212,10 @@ fn three_finger_release_target(
     const MOMENTUM_SECONDS: f64 = 0.20;
     const FLING_VELOCITY_THRESHOLD: f64 = 3.0;
 
+    let visible = most_visible_window(strip, strip_position, viewport, windows)?;
+
     if velocity.abs() < FLING_VELOCITY_THRESHOLD {
-        return most_visible_window(strip, strip_position, viewport, windows);
+        return Some(visible);
     }
 
     let direction_modifier = match config.swipe_gesture_direction() {
@@ -224,8 +226,24 @@ fn three_finger_release_target(
         + velocity * f64::from(viewport.width()) * direction_modifier * MOMENTUM_SECONDS;
     let projected_position = IVec2::new(projected_x.round() as i32, strip_position.y);
 
-    most_visible_window(strip, projected_position, viewport, windows)
-        .or_else(|| most_visible_window(strip, strip_position, viewport, windows))
+    let projected = most_visible_window(strip, projected_position, viewport, windows)?;
+    let target = if projected == visible {
+        visible
+    } else if let Some(right) = strip.right_neighbour(visible) {
+        if projected == right {
+            right
+        } else if let Some(left) = strip.left_neighbour(visible) {
+            left
+        } else {
+            visible
+        }
+    } else if let Some(left) = strip.left_neighbour(visible) {
+        if projected == left { left } else { visible }
+    } else {
+        visible
+    };
+
+    Some(target)
 }
 
 fn centered_strip_position(
