@@ -16,7 +16,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, MissionControlActive, Position, Scrolling, SendMessageTrigger,
-    focus_entity, reposition_entity,
+    focus_entity, snap_entity_position,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -196,7 +196,7 @@ fn snap_three_finger_swipe(
             centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
         {
             scrolling.position = f64::from(target.x);
-            reposition_entity(strip_entity, target, &mut commands);
+            snap_entity_position(strip_entity, target, &mut commands);
         }
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = false;
@@ -331,7 +331,7 @@ pub(super) fn swiping_timeout(
                     centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
             {
                 scroll.position = f64::from(target.x);
-                reposition_entity(strip_entity, target, &mut commands);
+                snap_entity_position(strip_entity, target, &mut commands);
                 commands.entity(strip_entity).remove::<Scrolling>();
             }
 

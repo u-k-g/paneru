@@ -492,6 +492,14 @@ pub fn reposition_entity(entity: Entity, origin: Origin, commands: &mut Commands
 }
 
 #[instrument(level = Level::TRACE, skip(commands))]
+pub fn snap_entity_position(entity: Entity, origin: Origin, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(Position(origin));
+        entity_commands.try_remove::<RepositionMarker>();
+    }
+}
+
+#[instrument(level = Level::TRACE, skip(commands))]
 pub fn resize_entity(entity: Entity, size: Size, commands: &mut Commands) {
     if size.x <= 0 || size.y <= 0 {
         return;

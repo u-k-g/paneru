@@ -21,7 +21,7 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Scrolling, SelectedVirtualMarker, SendMessageTrigger, StrayFocusEvent,
-    focus_entity, reposition_entity, reshuffle_around,
+    focus_entity, reposition_entity, reshuffle_around, snap_entity_position,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -168,7 +168,7 @@ fn autocenter_window_on_focus(
             && let Some(target) =
                 centered_strip_position(entity, &windows, &active_display, &config)
         {
-            reposition_entity(active_display.active_strip_entity(), target, &mut commands);
+            snap_entity_position(active_display.active_strip_entity(), target, &mut commands);
             return;
         }
 
