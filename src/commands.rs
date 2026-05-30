@@ -18,7 +18,7 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker,
     NativeFullscreenMarker, RetryFrontSwitch, SelectedVirtualMarker, SendMessageTrigger, Unmanaged,
-    ensure_visible, focus_entity, reposition_entity, reshuffle_around, resize_entity,
+    focus_entity, reposition_entity, reshuffle_around, resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
@@ -663,13 +663,12 @@ fn command_swap_focus(
         Some(current)
     };
 
-    // Keep the focused window on-screen, but don't anchor it: if its new
-    // layout slot is already visible with the strip where it is, the strip
-    // stays put and per-window animation slides the window into the slot.
-    // Only when the slot would fall off the edge does the strip scroll —
-    // and only by the shortfall.
-    if let Some(window) = handler() {
-        ensure_visible(window, &mut commands);
+    // Keyboard swaps should feel discrete and notchy: after moving the focused
+    // column, explicitly center it instead of merely ensuring it remains visible.
+    if handler().is_some() {
+        commands.trigger(SendMessageTrigger(Event::Command {
+            command: Command::Window(Operation::Center),
+        }));
     } else {
         debug!(
             "swap {direction:?}: handler returned None (focused={:?}, strip_len={})",

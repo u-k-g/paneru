@@ -16,7 +16,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, MissionControlActive, Position, Scrolling, SendMessageTrigger,
-    focus_entity,
+    focus_entity, reposition_entity,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -155,7 +155,7 @@ fn swipe_gesture(
 fn snap_three_finger_swipe(
     mut messages: MessageReader<Event>,
     active_workspace: Single<
-        (&LayoutStrip, &Position, &mut Scrolling),
+        (Entity, &LayoutStrip, &Position, &mut Scrolling),
         With<ActiveWorkspaceMarker>,
     >,
     active_display: ActiveDisplay,
@@ -170,7 +170,7 @@ fn snap_three_finger_swipe(
         return;
     }
 
-    let (strip, position, mut scrolling) = active_workspace.into_inner();
+    let (strip_entity, strip, position, mut scrolling) = active_workspace.into_inner();
     if scrolling.fingers_count != Some(3) {
         return;
     }
@@ -180,11 +180,42 @@ fn snap_three_finger_swipe(
         .actual_display_bounds(active_display.dock(), &config);
 
     if let Some(entity) = most_visible_window(strip, position.0, &viewport, &windows) {
+        if let Some(target) =
+            centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
+        {
+            scrolling.position = f64::from(target.x);
+            reposition_entity(strip_entity, target, &mut commands);
+        }
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = false;
         scrolling.fingers_count = None;
+        commands.entity(strip_entity).remove::<Scrolling>();
         focus_entity(entity, true, &mut commands);
     }
+}
+
+fn centered_strip_position(
+    entity: Entity,
+    strip: &LayoutStrip,
+    current_position: IVec2,
+    viewport: &IRect,
+    windows: &Windows,
+    config: &Config,
+) -> Option<IVec2> {
+    let layout = windows.layout_position(entity)?;
+    let frame = windows.moving_frame(entity)?;
+    let target_x = viewport.center().x - (layout.0.x + frame.width() / 2);
+    let get_window_frame = |entity| windows.moving_frame(entity);
+    let clamped_x = clamp_viewport_offset(
+        target_x,
+        strip,
+        windows,
+        &get_window_frame,
+        viewport,
+        config,
+    )?;
+
+    Some(IVec2::new(clamped_x, current_position.y))
 }
 
 fn most_visible_window(
@@ -214,8 +245,10 @@ fn most_visible_window(
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
-    strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
+    strips: Populated<(Entity, &LayoutStrip, &Position, &mut Scrolling), With<LayoutStrip>>,
     active_display: ActiveDisplay,
+    windows: Windows,
+    config: Res<Config>,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -225,12 +258,26 @@ pub(super) fn swiping_timeout(
     let dt = time.delta_secs_f64();
     let viewport_width = f64::from(active_display.bounds().width());
 
-    for (entity, mut scroll) in strips {
+    let viewport = active_display
+        .display()
+        .actual_display_bounds(active_display.dock(), &config);
+
+    for (strip_entity, strip, position, mut scroll) in strips {
         if scroll.last_event.elapsed() > FINGER_LIFT_THRESHOLD {
             scroll.is_user_swiping = false;
 
+            if config.auto_center()
+                && let Some(entity) = most_visible_window(strip, position.0, &viewport, &windows)
+                && let Some(target) =
+                    centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
+            {
+                scroll.position = f64::from(target.x);
+                reposition_entity(strip_entity, target, &mut commands);
+                commands.entity(strip_entity).remove::<Scrolling>();
+            }
+
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX {
-                commands.entity(entity).remove::<Scrolling>();
+                commands.entity(strip_entity).remove::<Scrolling>();
             }
             if let Some(point) = window_manager.cursor_position() {
                 commands.trigger(SendMessageTrigger(Event::MouseMoved {

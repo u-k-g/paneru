@@ -210,6 +210,7 @@ fn test_three_finger_swipe_release_focuses_most_visible_window() {
         .with_windows(3)
         .on_iteration(5, |world| {
             assert_focused!(world, 0);
+            assert_window_at!(world, 0, 312, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -330,8 +331,6 @@ fn test_window_swap_brings_focused_into_view() {
         .into();
 
     let centered = (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2;
-    let right_edge = TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH;
-
     TestHarness::new()
         .with_config(config)
         .with_windows(5)
@@ -339,13 +338,7 @@ fn test_window_swap_brings_focused_into_view() {
             assert_window_at!(world, 4, centered, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(2, move |world| {
-            assert_window_at!(world, 4, right_edge, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(
-                world,
-                0,
-                right_edge - TEST_WINDOW_WIDTH,
-                TEST_MENUBAR_HEIGHT
-            );
+            assert_window_at!(world, 4, centered, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 4);
         })
         .run(commands);
@@ -353,11 +346,8 @@ fn test_window_swap_brings_focused_into_view() {
 
 #[test]
 fn test_window_swap_keeps_strip_when_in_view() {
-    // Two windows fit the viewport. Swap(West) on the focused (right)
-    // window swaps the columns: both new layout slots are still inside the
-    // viewport with the strip where it is, so ensure_visible_in_strip does
-    // nothing. The per-window animation slides each window into the other's
-    // old position.
+    // Two windows fit the viewport. Swap(West) on the focused right window
+    // swaps the columns, then keyboard movement recenters the focused column.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -381,8 +371,9 @@ fn test_window_swap_keeps_strip_when_in_view() {
         .with_config(config)
         .with_windows(2)
         .on_iteration(2, |world| {
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+            let centered = (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2;
+            assert_window_at!(world, 0, centered, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, centered + TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 0);
         })
         .run(commands);

@@ -10,6 +10,7 @@ use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
+use bevy::math::IVec2;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, error, instrument, trace, warn};
@@ -162,14 +163,54 @@ fn autocenter_window_on_focus(
     }
     if config.auto_center()
         && let Some((_, _, None)) = windows.get_managed(entity)
-        && let Some(size) = windows.size(entity)
-        && let Some(mut origin) = windows.origin(entity)
     {
-        let center = active_display.bounds().center();
-        origin.x = center.x - size.x / 2;
-        reposition_entity(entity, origin, &mut commands);
+        if active_display.active_strip().contains(entity)
+            && let Some(target) =
+                centered_strip_position(entity, &windows, &active_display, &config)
+        {
+            reposition_entity(active_display.active_strip_entity(), target, &mut commands);
+            return;
+        }
+
+        if let Some(size) = windows.size(entity)
+            && let Some(mut origin) = windows.origin(entity)
+        {
+            let center = active_display.bounds().center();
+            origin.x = center.x - size.x / 2;
+            reposition_entity(entity, origin, &mut commands);
+        }
     }
     reshuffle_around(entity, &mut commands);
+}
+
+fn centered_strip_position(
+    entity: Entity,
+    windows: &Windows,
+    active_display: &ActiveDisplay,
+    config: &Config,
+) -> Option<IVec2> {
+    let strip = active_display.active_strip();
+    let layout = windows.layout_position(entity)?;
+    let size = windows.size(entity)?;
+    let viewport = active_display
+        .display()
+        .actual_display_bounds(active_display.dock(), config);
+    let target_x = viewport.center().x - (layout.0.x + size.x / 2);
+
+    let total_width = strip
+        .last()
+        .ok()
+        .and_then(|column| column.top())
+        .and_then(|last| windows.layout_position(last).zip(windows.size(last)))
+        .map(|(position, size)| position.0.x + size.x)?;
+
+    let x = if viewport.width() < total_width {
+        target_x.clamp(viewport.max.x - total_width, viewport.min.x)
+    } else {
+        target_x.clamp(viewport.min.x, viewport.max.x - total_width)
+    };
+
+    Some(IVec2::new(x, viewport.min.y))
 }
 
 #[allow(clippy::needless_pass_by_value)]

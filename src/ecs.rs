@@ -507,6 +507,7 @@ pub fn reshuffle_around(entity: Entity, commands: &mut Commands) {
 }
 
 #[instrument(level = Level::TRACE, skip(commands))]
+#[allow(dead_code)]
 pub fn ensure_visible(entity: Entity, commands: &mut Commands) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
         entity_commands.try_insert(EnsureVisibleMarker);
