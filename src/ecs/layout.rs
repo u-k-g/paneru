@@ -16,8 +16,9 @@ use tracing::{Level, instrument, trace};
 use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    Position, RepositionMarker, ReshuffleAroundMarker, Scrolling, reposition_entity,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
+    LayoutPosition, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
+    reposition_entity,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Window};
@@ -34,6 +35,7 @@ impl Plugin for LayoutEventsPlugin {
                 // sits in the active strip regardless of its real display.
                 (
                     layout_sizes_changed,
+                    sync_focused_tab_leader,
                     layout_strip_changed,
                     reshuffle_layout_strip,
                     ensure_visible_in_strip,
@@ -45,6 +47,23 @@ impl Plugin for LayoutEventsPlugin {
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[instrument(level = Level::TRACE, skip_all)]
+fn sync_focused_tab_leader(
+    focused: Query<Entity, With<FocusedMarker>>,
+    mut strips: Query<&mut LayoutStrip>,
+) {
+    let Ok(focused) = focused.single() else {
+        return;
+    };
+
+    for mut strip in &mut strips {
+        if strip.tabbed(focused) {
+            strip.move_to_front(focused);
+        }
     }
 }
 
@@ -532,6 +551,14 @@ impl LayoutStrip {
 
     pub fn get_column_mut(&mut self, index: usize) -> Option<&mut Column> {
         self.columns.get_mut(index)
+    }
+
+    pub fn move_to_front(&mut self, entity: Entity) {
+        if let Ok(index) = self.index_of(entity)
+            && let Some(column) = self.get_column_mut(index)
+        {
+            column.move_to_front(entity);
+        }
     }
 
     pub fn all_columns(&self) -> Vec<Entity> {
@@ -1341,6 +1368,23 @@ mod tests {
 
         let out = binpack_heights(&heights, MIN_HEIGHT, 390);
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn focused_native_tab_becomes_column_leader_before_layout() {
+        let (mut world, mut strip, entities) = setup_world_and_strip();
+        strip.convert_to_tabs(entities[0], entities[1]).unwrap();
+
+        world.entity_mut(entities[1]).insert(FocusedMarker);
+        world.spawn(strip);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_focused_tab_leader);
+        schedule.run(&mut world);
+
+        let mut strips = world.query::<&LayoutStrip>();
+        let strip = strips.single(&world).unwrap();
+        assert_eq!(strip.get(0).unwrap().top(), Some(entities[1]));
     }
 
     #[test]
