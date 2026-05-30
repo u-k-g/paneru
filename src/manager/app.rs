@@ -31,6 +31,7 @@ pub static AX_NOTIFICATIONS: LazyLock<Vec<&str>> = LazyLock::new(|| {
         accessibility_sys::kAXCreatedNotification,
         accessibility_sys::kAXFocusedWindowChangedNotification,
         accessibility_sys::kAXFocusedUIElementChangedNotification,
+        accessibility_sys::kAXMainWindowChangedNotification,
         accessibility_sys::kAXWindowMovedNotification,
         accessibility_sys::kAXWindowResizedNotification,
         accessibility_sys::kAXTitleChangedNotification,
@@ -380,7 +381,8 @@ impl ObserverContext {
         };
         let event = match notification {
             accessibility_sys::kAXFocusedWindowChangedNotification
-            | accessibility_sys::kAXFocusedUIElementChangedNotification => {
+            | accessibility_sys::kAXFocusedUIElementChangedNotification
+            | accessibility_sys::kAXMainWindowChangedNotification => {
                 Event::WindowFocused { window_id }
             }
             accessibility_sys::kAXWindowMovedNotification => Event::WindowMoved { window_id },

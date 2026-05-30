@@ -26,8 +26,9 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, LocateDockTrigger,
-    Position, RestoreWindowState, Scrolling, SendMessageTrigger, VerifyWindowPosition, WidthRatio,
-    WindowProperties, focus_entity, reposition_entity, reshuffle_around, resize_entity,
+    OsFocusReconcileReason, OsFocusState, OsFocusTarget, Position, RestoreWindowState, Scrolling,
+    SendMessageTrigger, VerifyWindowPosition, WidthRatio, WindowProperties, focus_entity,
+    reposition_entity, reshuffle_around, resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -107,6 +108,113 @@ fn normalize_focus_event_window_id(
         .unwrap_or(window_id)
 }
 
+fn schedule_focus_retry(commands: &mut Commands, app_entity: Option<Entity>) {
+    commands.spawn(RetryFrontSwitch::new(app_entity));
+}
+
+pub(super) fn reconcile_os_focus(
+    app_entity: Option<Entity>,
+    reason: OsFocusReconcileReason,
+    applications: &Query<(Entity, &Application)>,
+    windows: &Windows,
+    window_manager: &WindowManager,
+    config: &mut GlobalState,
+    mut os_focus: Option<&mut OsFocusState>,
+    commands: &mut Commands,
+    retry_on_ax_error: bool,
+) -> bool {
+    let resolved = app_entity
+        .and_then(|entity| applications.get(entity).ok())
+        .or_else(|| {
+            let mut frontmost = applications.iter().filter(|(_, app)| app.is_frontmost());
+            let first = frontmost.next()?;
+            frontmost.next().is_none().then_some(first)
+        });
+    let Some((app_entity, app)) = resolved else {
+        if let Some(os_focus) = os_focus.as_deref_mut() {
+            os_focus.reason = Some(reason);
+            os_focus.app_entity = None;
+            os_focus.pid = None;
+            os_focus.window_id = None;
+            os_focus.target = OsFocusTarget::UntrackedApp;
+        }
+        if retry_on_ax_error {
+            schedule_focus_retry(commands, None);
+        }
+        return false;
+    };
+
+    let Ok(focused_id) = normalize_focused_window_id(app_entity, app, windows).inspect_err(|err| {
+        warn!("can not get current focus during {reason:?}: {err}");
+    }) else {
+        if let Some(os_focus) = os_focus.as_deref_mut() {
+            os_focus.reason = Some(reason);
+            os_focus.app_entity = Some(app_entity);
+            os_focus.pid = Some(app.pid());
+            os_focus.window_id = None;
+            os_focus.target = OsFocusTarget::UntrackedWindow;
+        }
+        if retry_on_ax_error {
+            schedule_focus_retry(commands, Some(app_entity));
+        }
+        return false;
+    };
+
+    let Some((_, window_entity, _)) = windows.find_parent(focused_id) else {
+        if let Some(os_focus) = os_focus.as_deref_mut() {
+            os_focus.reason = Some(reason);
+            os_focus.app_entity = Some(app_entity);
+            os_focus.pid = Some(app.pid());
+            os_focus.window_id = Some(focused_id);
+            os_focus.target = OsFocusTarget::UntrackedWindow;
+        }
+        if retry_on_ax_error {
+            schedule_focus_retry(commands, Some(app_entity));
+        }
+        return false;
+    };
+
+    if let Some(os_focus) = os_focus.as_deref_mut() {
+        os_focus.reason = Some(reason);
+        os_focus.app_entity = Some(app_entity);
+        os_focus.pid = Some(app.pid());
+        os_focus.window_id = Some(focused_id);
+        os_focus.target = OsFocusTarget::ManagedWindow;
+    }
+
+    if let Some((_, _, Some(unmanaged))) = windows.get_managed(window_entity)
+        && !matches!(unmanaged, Unmanaged::Hidden)
+    {
+        if let Some(os_focus) = os_focus.as_deref_mut() {
+            os_focus.target = OsFocusTarget::UnmanagedWindow;
+        }
+        return true;
+    }
+
+    if let Some(point) = window_manager.cursor_position()
+        && window_manager
+            .find_window_at_point(&point)
+            .is_ok_and(|window_id| window_id != focused_id)
+    {
+        // Window got focus without mouse movement - probably Cmd-Tab, Dock,
+        // Raycast, file-open activation, or another external focus path.
+        config.set_skip_reshuffle(false);
+        config.set_ffm_flag(None);
+    }
+
+    if windows
+        .focused()
+        .is_some_and(|(_, focused_entity)| focused_entity == window_entity)
+    {
+        return true;
+    }
+
+    commands.trigger(SendMessageTrigger(Event::WindowFocused {
+        window_id: focused_id,
+    }));
+    true
+}
+
 /// Handles the event when an application switches to the front. It updates the focused window and PSN.
 ///
 /// # Arguments
@@ -125,16 +233,17 @@ pub(super) fn front_switched_trigger(
     windows: Windows,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
+    mut os_focus: Option<ResMut<OsFocusState>>,
     mut commands: Commands,
 ) {
-    const FRONT_SWITCH_RETRY_SEC: u64 = 2;
     for event in messages.read() {
-        let Some((app_entity, app, app_name)) = (match event {
-            Event::ApplicationFrontSwitched { psn } => {
-                let Some((BProcess(process), children)) =
-                    processes.iter().find(|process| &process.0.psn() == psn)
-                else {
-                    error!("Unable to find process with PSN {psn:?}");
+        let Some((app_entity, app_name, reason)) = (match event {
+            Event::ApplicationFrontSwitched { psn, pid } => {
+                let process = pid
+                    .and_then(|pid| processes.iter().find(|(process, _)| process.0.pid() == pid))
+                    .or_else(|| processes.iter().find(|process| &process.0.psn() == psn));
+                let Some((BProcess(process), children)) = process else {
+                    error!("Unable to find process with PSN {psn:?} or pid {pid:?}");
                     continue;
                 };
 
@@ -145,53 +254,58 @@ pub(super) fn front_switched_trigger(
                     error!("No application for process '{}'.", process.name());
                     continue;
                 };
-                let Some((_, app)) = applications.get(app_entity).ok() else {
+                let Some((_, _)) = applications.get(app_entity).ok() else {
                     error!("No application for process '{}'.", process.name());
                     continue;
                 };
 
-                Some((app_entity, app, process.name()))
+                Some((
+                    Some(app_entity),
+                    process.name(),
+                    OsFocusReconcileReason::FrontSwitched,
+                ))
             }
             Event::ApplicationActivated { pid } => applications
                 .iter()
                 .find(|(_, app)| app.pid() == *pid)
-                .map(|(app_entity, app)| (app_entity, app, app.name())),
+                .map(|(app_entity, app)| {
+                    (
+                        Some(app_entity),
+                        app.name(),
+                        OsFocusReconcileReason::AppActivated,
+                    )
+                }),
+            Event::ApplicationVisible { pid } => applications
+                .iter()
+                .find(|(_, app)| app.pid() == *pid)
+                .map(|(app_entity, app)| {
+                    (
+                        Some(app_entity),
+                        app.name(),
+                        OsFocusReconcileReason::AppVisible,
+                    )
+                }),
+            Event::WindowCreated { .. } => {
+                Some((None, "frontmost", OsFocusReconcileReason::WindowCreated))
+            }
             _ => continue,
         }) else {
-            warn!("Unable to find activated application.");
+            warn!("Unable to find application for OS focus event.");
             continue;
         };
 
         debug!("front switching process: {app_name}");
-
-        if let Ok(focused_id) =
-            normalize_focused_window_id(app_entity, app, &windows).inspect_err(|err| {
-                warn!("can not get current focus: {err}");
-            })
-        {
-            if let Some(point) = window_manager.cursor_position()
-                && window_manager
-                    .find_window_at_point(&point)
-                    .is_ok_and(|window_id| window_id != focused_id)
-            {
-                // Window got focus without mouse movement - probably with a Cmd-Tab.
-                // If so, bring it into view.
-                config.set_skip_reshuffle(false);
-                config.set_ffm_flag(None);
-            }
-            commands.trigger(SendMessageTrigger(Event::WindowFocused {
-                window_id: focused_id,
-            }));
-        } else {
-            // Transient AX error (e.g. kAXErrorCannotComplete during app transitions).
-            // Schedule a retry to query the focused window once the app is ready.
-            let timeout = Timeout::new(
-                Duration::from_secs(FRONT_SWITCH_RETRY_SEC),
-                Some(format!("Front switch retry for '{}' timed out.", app_name)),
-                &mut commands,
-            );
-            commands.spawn((timeout, RetryFrontSwitch(app_entity)));
-        }
+        reconcile_os_focus(
+            app_entity,
+            reason,
+            &applications,
+            &windows,
+            &window_manager,
+            &mut config,
+            os_focus.as_deref_mut(),
+            &mut commands,
+            true,
+        );
     }
 }
 

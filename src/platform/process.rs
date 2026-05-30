@@ -172,6 +172,9 @@ unsafe extern "C" {
     /// # Original signature
     /// GetNextProcess(ProcessSerialNumber * pPSN)
     fn GetNextProcess(psn: *mut ProcessSerialNumber) -> OSStatus;
+
+    /// Get the UNIX process ID corresponding to a process serial number.
+    fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *mut crate::platform::Pid) -> OSStatus;
 }
 
 /*
@@ -434,7 +437,13 @@ impl ProcessHandler {
             }),
             ProcessEventApp::Terminated => self.events.send(Event::ApplicationTerminated { psn }),
             ProcessEventApp::FrontSwitched => {
-                self.events.send(Event::ApplicationFrontSwitched { psn })
+                let mut pid: crate::platform::Pid = 0;
+                let pid = unsafe { GetProcessPID(&raw const psn, &raw mut pid) }
+                    .to_result(function_name!())
+                    .ok()
+                    .map(|()| pid);
+                self.events
+                    .send(Event::ApplicationFrontSwitched { psn, pid })
             }
             _ => {
                 error!("Unknown process event: {}", event as u32);

@@ -432,7 +432,7 @@ impl WindowApi for MockWindow {
         self.event_queue
             .write()
             .unwrap()
-            .push(Event::ApplicationFrontSwitched { psn });
+            .push(Event::ApplicationFrontSwitched { psn, pid: None });
         self.event_queue
             .write()
             .unwrap()

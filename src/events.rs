@@ -10,7 +10,7 @@ use crate::commands::Command;
 use crate::config::Config;
 use crate::ecs::state::StateQueryKind;
 use crate::errors::Result;
-use crate::platform::{Modifiers, ProcessSerialNumber, WinID, WorkspaceId, WorkspaceObserver};
+use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId, WorkspaceObserver};
 use crate::util::AXUIWrapper;
 
 /// `Event` represents various system-level and application-specific occurrences that the window manager reacts to.
@@ -37,7 +37,10 @@ pub enum Event {
     /// An application has terminated.
     ApplicationTerminated { psn: ProcessSerialNumber },
     /// The frontmost application has switched.
-    ApplicationFrontSwitched { psn: ProcessSerialNumber },
+    ApplicationFrontSwitched {
+        psn: ProcessSerialNumber,
+        pid: Option<Pid>,
+    },
     /// The application has been activated.
     ApplicationActivated { pid: i32 },
     /// The application has been deactivated.

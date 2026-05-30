@@ -31,7 +31,7 @@ use crate::manager::{
 };
 use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
-use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
+use crate::platform::{Modifiers, Pid, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
 pub mod focus;
@@ -343,10 +343,52 @@ impl Timeout {
 #[derive(Component)]
 pub struct StrayFocusEvent(pub WinID);
 
-/// Component used as a retry mechanism when `focused_window_id()` fails during
-/// an `ApplicationFrontSwitched` event (e.g. transient `kAXErrorCannotComplete`).
+#[derive(Clone, Copy, Debug)]
+pub enum OsFocusReconcileReason {
+    AppActivated,
+    FrontSwitched,
+    AppVisible,
+    WindowCreated,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OsFocusTarget {
+    #[default]
+    Unknown,
+    ManagedWindow,
+    UnmanagedWindow,
+    UntrackedWindow,
+    UntrackedApp,
+}
+
+#[derive(Default, Resource, Debug)]
+pub struct OsFocusState {
+    pub app_entity: Option<Entity>,
+    pub pid: Option<Pid>,
+    pub window_id: Option<WinID>,
+    pub reason: Option<OsFocusReconcileReason>,
+    pub target: OsFocusTarget,
+}
+
+/// Component used as a bounded retry mechanism when AX has not caught up with
+/// a macOS focus/app activation event yet.
 #[derive(Component)]
-pub struct RetryFrontSwitch(pub Entity);
+pub struct RetryFrontSwitch {
+    pub app_entity: Option<Entity>,
+    pub attempts_remaining: u8,
+    pub timer: Timer,
+}
+
+impl RetryFrontSwitch {
+    pub fn new(app_entity: Option<Entity>) -> Self {
+        Self {
+            app_entity,
+            attempts_remaining: 4,
+            timer: Timer::from_seconds(0.05, bevy::time::TimerMode::Repeating),
+        }
+    }
+}
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
@@ -496,6 +538,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             is_dark: crate::util::is_dark_mode(),
         })
         .insert_resource(MissionControlActive(false))
+        .init_resource::<OsFocusState>()
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(PollForNotifications)
         .insert_resource(Initializing)

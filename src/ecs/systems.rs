@@ -26,12 +26,12 @@ use super::{
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, Initializing,
-    LocateDockTrigger, LowPowerMode, MissionControlActive, Position, RestoreWindowState, Scrolling,
-    SelectedVirtualMarker, SendMessageTrigger, Unmanaged, WidthRatio, WindowProperties,
-    focus_entity,
+    LocateDockTrigger, LowPowerMode, MissionControlActive, OsFocusReconcileReason, OsFocusState,
+    Position, RestoreWindowState, Scrolling, SelectedVirtualMarker, SendMessageTrigger, Unmanaged,
+    WidthRatio, WindowProperties, focus_entity,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -467,38 +467,56 @@ pub(super) fn timeout_ticker(
 /// during `ApplicationFrontSwitched`. Runs each frame until success or timeout.
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn retry_front_switch(
-    retries: Populated<(Entity, &RetryFrontSwitch)>,
-    applications: Query<&Application>,
+    retries: Populated<(Entity, &mut RetryFrontSwitch)>,
+    applications: Query<(Entity, &Application)>,
     windows: Windows,
+    window_manager: Res<WindowManager>,
+    mut global_state: GlobalState,
+    mut os_focus: Option<ResMut<OsFocusState>>,
+    clock: Res<Time>,
     mut commands: Commands,
 ) {
-    for (entity, retry) in retries.iter() {
-        let Ok(app) = applications.get(retry.0) else {
-            // Application entity no longer exists, clean up.
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
-            }
+    for (entity, mut retry) in retries {
+        retry.timer.tick(clock.delta());
+        if !retry.timer.is_finished() {
             continue;
-        };
-        if !app.is_frontmost() {
-            // App is no longer frontmost — this retry is stale.
-            debug!("Discarding stale front switch retry (app no longer frontmost).");
+        }
+
+        if retry.attempts_remaining == 0 {
+            debug!("Discarding stale OS focus retry after exhausting attempts.");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
             continue;
         }
-        if let Ok(focused_id) = super::triggers::normalize_focused_window_id(retry.0, app, &windows)
+        retry.attempts_remaining -= 1;
+
+        if let Some(app_entity) = retry.app_entity
+            && !applications
+                .get(app_entity)
+                .is_ok_and(|(_, app)| app.is_frontmost())
         {
-            debug!("Front switch retry succeeded for window {focused_id}.");
-            commands.trigger(SendMessageTrigger(Event::WindowFocused {
-                window_id: focused_id,
-            }));
+            debug!("Discarding stale OS focus retry (app no longer frontmost).");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();
             }
+            continue;
         }
-        // Otherwise, let timeout_ticker handle expiry.
+
+        if super::triggers::reconcile_os_focus(
+            retry.app_entity,
+            OsFocusReconcileReason::Retry,
+            &applications,
+            &windows,
+            &window_manager,
+            &mut global_state,
+            os_focus.as_deref_mut(),
+            &mut commands,
+            false,
+        ) && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_despawn();
+        }
     }
 }
 
