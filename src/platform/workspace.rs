@@ -89,6 +89,21 @@ define_class!(
             _ = self.ivars().events.send(msg);
         }
 
+        /// Called when an application becomes active/frontmost.
+        ///
+        /// # Arguments
+        ///
+        /// * `notification` - The notification object containing application info.
+        #[unsafe(method(didActivateApplication:))]
+        fn application_activated(&self, notification: &NSObject) {
+            let pid = unsafe {
+                let user_info: &NSDictionary = msg_send![notification, userInfo];
+                let app: &NSRunningApplication =  msg_send![user_info, objectForKey: NSWorkspaceApplicationKey];
+                app.processIdentifier()
+            };
+            _ = self.ivars().events.send(Event::ApplicationActivated { pid });
+        }
+
         /// Called when the system wakes from sleep.
         ///
         /// # Arguments
@@ -245,6 +260,10 @@ impl WorkspaceObserver {
             (
                 sel!(didUnhideApplication:),
                 "NSWorkspaceDidUnhideApplicationNotification",
+            ),
+            (
+                sel!(didActivateApplication:),
+                "NSWorkspaceDidActivateApplicationNotification",
             ),
             (sel!(didWake:), "NSWorkspaceDidWakeNotification"),
         ];

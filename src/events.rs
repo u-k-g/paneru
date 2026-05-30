@@ -39,7 +39,7 @@ pub enum Event {
     /// The frontmost application has switched.
     ApplicationFrontSwitched { psn: ProcessSerialNumber },
     /// The application has been activated.
-    ApplicationActivated,
+    ApplicationActivated { pid: i32 },
     /// The application has been deactivated.
     ApplicationDeactivated,
     /// An application has become visible.

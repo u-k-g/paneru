@@ -121,7 +121,7 @@ fn normalize_focus_event_window_id(
 pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
-    applications: Query<&Application>,
+    applications: Query<(Entity, &Application)>,
     windows: Windows,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
@@ -129,30 +129,40 @@ pub(super) fn front_switched_trigger(
 ) {
     const FRONT_SWITCH_RETRY_SEC: u64 = 2;
     for event in messages.read() {
-        let Event::ApplicationFrontSwitched { psn } = event else {
+        let Some((app_entity, app, app_name)) = (match event {
+            Event::ApplicationFrontSwitched { psn } => {
+                let Some((BProcess(process), children)) =
+                    processes.iter().find(|process| &process.0.psn() == psn)
+                else {
+                    error!("Unable to find process with PSN {psn:?}");
+                    continue;
+                };
+
+                if children.len() > 1 {
+                    warn!("Multiple apps registered to process '{}'.", process.name());
+                }
+                let Some(&app_entity) = children.first() else {
+                    error!("No application for process '{}'.", process.name());
+                    continue;
+                };
+                let Some((_, app)) = applications.get(app_entity).ok() else {
+                    error!("No application for process '{}'.", process.name());
+                    continue;
+                };
+
+                Some((app_entity, app, process.name()))
+            }
+            Event::ApplicationActivated { pid } => applications
+                .iter()
+                .find(|(_, app)| app.pid() == *pid)
+                .map(|(app_entity, app)| (app_entity, app, app.name())),
+            _ => continue,
+        }) else {
+            warn!("Unable to find activated application.");
             continue;
         };
 
-        let Some((BProcess(process), children)) =
-            processes.iter().find(|process| &process.0.psn() == psn)
-        else {
-            error!("Unable to find process with PSN {psn:?}");
-            continue;
-        };
-
-        if children.len() > 1 {
-            warn!("Multiple apps registered to process '{}'.", process.name());
-        }
-        let Some(&app_entity) = children.first() else {
-            error!("No application for process '{}'.", process.name());
-            continue;
-        };
-        let Some(app) = applications.get(app_entity).ok() else {
-            error!("No application for process '{}'.", process.name());
-            continue;
-        };
-
-        debug!("front switching process: {}", process.name());
+        debug!("front switching process: {app_name}");
 
         if let Ok(focused_id) =
             normalize_focused_window_id(app_entity, app, &windows).inspect_err(|err| {
@@ -177,10 +187,7 @@ pub(super) fn front_switched_trigger(
             // Schedule a retry to query the focused window once the app is ready.
             let timeout = Timeout::new(
                 Duration::from_secs(FRONT_SWITCH_RETRY_SEC),
-                Some(format!(
-                    "Front switch retry for '{}' timed out.",
-                    process.name()
-                )),
+                Some(format!("Front switch retry for '{}' timed out.", app_name)),
                 &mut commands,
             );
             commands.spawn((timeout, RetryFrontSwitch(app_entity)));

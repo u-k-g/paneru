@@ -27,7 +27,6 @@ use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
-const RECONCILE_FRONTMOST_FREQ_MS: u64 = 250;
 
 #[derive(Default)]
 pub struct TierMemory {
@@ -100,8 +99,6 @@ impl Plugin for FocusEventsPlugin {
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
-                reconcile_frontmost_focus
-                    .run_if(on_timer(Duration::from_millis(RECONCILE_FRONTMOST_FREQ_MS))),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
@@ -328,45 +325,6 @@ fn recover_lost_focus(
     {
         focus_entity(entity, false, &mut commands);
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-#[instrument(level = Level::DEBUG, skip_all)]
-fn reconcile_frontmost_focus(
-    applications: Query<(Entity, &Application)>,
-    windows: Windows,
-    global_state: GlobalState,
-    mut commands: Commands,
-) {
-    if global_state.skip_reshuffle() || global_state.initializing() {
-        return;
-    }
-
-    let mut frontmost_apps = applications.iter().filter(|(_, app)| app.is_frontmost());
-    let Some((app_entity, app)) = frontmost_apps.next() else {
-        return;
-    };
-    if frontmost_apps.next().is_some() {
-        return;
-    }
-
-    let Ok(window_id) = super::triggers::normalize_focused_window_id(app_entity, app, &windows)
-    else {
-        return;
-    };
-    let Some((_, entity, _)) = windows.find_parent(window_id) else {
-        return;
-    };
-
-    if windows
-        .focused()
-        .is_some_and(|(_, focused_entity)| focused_entity == entity)
-    {
-        return;
-    }
-
-    debug!("reconciling focused marker to frontmost window {window_id}");
-    commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
 }
 
 #[allow(clippy::needless_pass_by_value)]
