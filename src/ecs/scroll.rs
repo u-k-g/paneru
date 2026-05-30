@@ -217,7 +217,7 @@ fn three_finger_release_target(
     config: &Config,
 ) -> Option<Entity> {
     const MOMENTUM_SECONDS: f64 = 0.20;
-    const FLING_VELOCITY_THRESHOLD: f64 = 3.0;
+    const FLING_VELOCITY_THRESHOLD: f64 = 2.2;
 
     let visible = most_visible_window(strip, strip_position, viewport, windows)?;
 
