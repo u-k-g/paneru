@@ -227,6 +227,7 @@ pub struct Scrolling {
     pub position: f64,
     /// When true, the user's fingers are on the trackpad.
     pub is_user_swiping: bool,
+    pub fingers_count: Option<usize>,
     /// Last time a physical swipe event was received.
     pub last_event: Instant,
 }
@@ -237,6 +238,7 @@ impl Default for Scrolling {
             velocity: 0.0,
             position: 0.0,
             is_user_swiping: false,
+            fingers_count: None,
             last_event: Instant::now(),
         }
     }

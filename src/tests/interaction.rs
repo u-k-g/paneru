@@ -193,6 +193,44 @@ fn test_scrolling() {
 }
 
 #[test]
+fn test_three_finger_swipe_release_focuses_most_visible_window() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::TouchpadDown,
+        Event::Swipe {
+            deltas: vec![0.2, 0.2, 0.2],
+        },
+        Event::TouchpadUp,
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(5, |world| {
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_four_finger_swipe_release_keeps_scrolling_behavior() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::TouchpadDown,
+        Event::Swipe {
+            deltas: vec![0.2, 0.2, 0.2, 0.2],
+        },
+        Event::TouchpadUp,
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(5, |world| {
+            assert_focused!(world, 2);
+        })
+        .run(commands);
+}
+
+#[test]
 #[allow(clippy::float_cmp)]
 fn test_scrolling_stop() {
     let commands = vec![

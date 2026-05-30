@@ -4,7 +4,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{Level, instrument};
@@ -16,6 +16,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, MissionControlActive, Position, Scrolling, SendMessageTrigger,
+    focus_entity,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -40,6 +41,7 @@ impl Plugin for ScrollEventsPlugin {
                     apply_snap_force,
                     scrolling_integrator,
                     apply_scrolling_constraints,
+                    snap_three_finger_swipe,
                     swiping_timeout,
                 )
                     .chain(),
@@ -63,6 +65,7 @@ fn swipe_gesture(
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
+    let mut fingers_count = None;
     let mut touchpad_down = false;
     let mut has_scroll_event = false;
 
@@ -83,6 +86,7 @@ fn swipe_gesture(
             }
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
+                fingers_count = None;
                 has_scroll_event = true;
             }
             Event::Swipe { deltas }
@@ -91,6 +95,7 @@ fn swipe_gesture(
                     .is_none_or(|fingers| deltas.len() == fingers) =>
             {
                 total_delta += deltas.iter().sum::<f64>();
+                fingers_count = Some(deltas.len());
                 has_scroll_event = true;
             }
             _ => (),
@@ -106,6 +111,7 @@ fn swipe_gesture(
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
+        scrolling.fingers_count = None;
         scrolling.last_event = Instant::now();
     }
 
@@ -127,6 +133,7 @@ fn swipe_gesture(
             // Smoothen velocity changes using EMA.
             scrolling.velocity = 0.3 * new_velocity + 0.7 * scrolling.velocity;
             scrolling.is_user_swiping = true;
+            scrolling.fingers_count = fingers_count;
             scrolling.last_event = Instant::now();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
@@ -136,10 +143,72 @@ fn swipe_gesture(
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
                 is_user_swiping: touchpad_down,
+                fingers_count,
                 last_event: Instant::now(),
             });
         }
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[instrument(level = Level::TRACE, skip_all)]
+fn snap_three_finger_swipe(
+    mut messages: MessageReader<Event>,
+    active_workspace: Single<
+        (&LayoutStrip, &Position, &mut Scrolling),
+        With<ActiveWorkspaceMarker>,
+    >,
+    active_display: ActiveDisplay,
+    windows: Windows,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if !messages
+        .read()
+        .any(|event| matches!(event, Event::TouchpadUp))
+    {
+        return;
+    }
+
+    let (strip, position, mut scrolling) = active_workspace.into_inner();
+    if scrolling.fingers_count != Some(3) {
+        return;
+    }
+
+    let viewport = active_display
+        .display()
+        .actual_display_bounds(active_display.dock(), &config);
+
+    if let Some(entity) = most_visible_window(strip, position.0, &viewport, &windows) {
+        scrolling.velocity = 0.0;
+        scrolling.is_user_swiping = false;
+        scrolling.fingers_count = None;
+        focus_entity(entity, true, &mut commands);
+    }
+}
+
+fn most_visible_window(
+    strip: &LayoutStrip,
+    strip_position: IVec2,
+    viewport: &IRect,
+    windows: &Windows,
+) -> Option<Entity> {
+    strip
+        .all_columns()
+        .into_iter()
+        .filter_map(|entity| {
+            let layout = windows.layout_position(entity)?;
+            let frame = windows.moving_frame(entity)?;
+            let visible_frame = IRect::from_corners(
+                layout.0 + strip_position,
+                layout.0 + strip_position + frame.size(),
+            );
+            let intersection = visible_frame.intersect(*viewport);
+            let area = intersection.width().max(0) * intersection.height().max(0);
+            (area > 0).then_some((entity, area))
+        })
+        .max_by_key(|(_, area)| *area)
+        .map(|(entity, _)| entity)
 }
 
 #[allow(clippy::needless_pass_by_value)]
