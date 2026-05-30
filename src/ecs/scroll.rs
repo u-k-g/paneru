@@ -179,7 +179,14 @@ fn snap_three_finger_swipe(
         .display()
         .actual_display_bounds(active_display.dock(), &config);
 
-    if let Some(entity) = most_visible_window(strip, position.0, &viewport, &windows) {
+    if let Some(entity) = three_finger_release_target(
+        strip,
+        position.0,
+        scrolling.velocity,
+        &viewport,
+        &windows,
+        &config,
+    ) {
         if let Some(target) =
             centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
         {
@@ -192,6 +199,33 @@ fn snap_three_finger_swipe(
         commands.entity(strip_entity).remove::<Scrolling>();
         focus_entity(entity, true, &mut commands);
     }
+}
+
+fn three_finger_release_target(
+    strip: &LayoutStrip,
+    strip_position: IVec2,
+    velocity: f64,
+    viewport: &IRect,
+    windows: &Windows,
+    config: &Config,
+) -> Option<Entity> {
+    const MOMENTUM_SECONDS: f64 = 0.20;
+    const FLING_VELOCITY_THRESHOLD: f64 = 3.0;
+
+    if velocity.abs() < FLING_VELOCITY_THRESHOLD {
+        return most_visible_window(strip, strip_position, viewport, windows);
+    }
+
+    let direction_modifier = match config.swipe_gesture_direction() {
+        SwipeGestureDirection::Natural => -1.0,
+        SwipeGestureDirection::Reversed => 1.0,
+    };
+    let projected_x = f64::from(strip_position.x)
+        + velocity * f64::from(viewport.width()) * direction_modifier * MOMENTUM_SECONDS;
+    let projected_position = IVec2::new(projected_x.round() as i32, strip_position.y);
+
+    most_visible_window(strip, projected_position, viewport, windows)
+        .or_else(|| most_visible_window(strip, strip_position, viewport, windows))
 }
 
 fn centered_strip_position(
