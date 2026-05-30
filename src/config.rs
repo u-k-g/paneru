@@ -297,6 +297,7 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
 
     let out = match cmd {
         "printstate" => Command::PrintState,
+        "app" => Command::App(argv.get(1).unwrap_or(&empty).to_string()),
         "window" => Command::Window(parse_operation(&argv[1..])?),
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
         "quit" => Command::Quit,
@@ -401,6 +402,14 @@ impl Config {
                 (bind.code == keycode && bind.modifiers.matches(mask))
                     .then_some(bind.command.clone())
             })
+    }
+
+    pub fn app_name(&self, key: &str) -> Option<String> {
+        self.inner()
+            .apps
+            .as_ref()
+            .and_then(|apps| apps.get(key))
+            .map(|app| app.name.clone())
     }
 
     /// Finds window properties for a given `title` and `bundle_id`.
@@ -868,6 +877,12 @@ struct InnerConfig {
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
+    apps: Option<HashMap<String, AppOptions>>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct AppOptions {
+    pub name: String,
 }
 
 impl InnerConfig {
@@ -1739,6 +1754,14 @@ fn test_parse_resize_commands() {
     assert!(matches!(
         parse_command(&["window", "shrink"]).unwrap(),
         Command::Window(Operation::Resize(ResizeDirection::Shrink))
+    ));
+}
+
+#[test]
+fn test_parse_app_command() {
+    assert!(matches!(
+        parse_command(&["app", "ghostty"]).unwrap(),
+        Command::App(app) if app == "ghostty"
     ));
 }
 
