@@ -3,7 +3,7 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With};
+use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{Commands, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
@@ -26,8 +26,8 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, LocateDockTrigger,
-    OsFocusReconcileReason, OsFocusState, OsFocusTarget, PendingCommandFocus, Position,
-    RestoreWindowState, Scrolling, SendMessageTrigger, VerifyWindowPosition, WidthRatio,
+    NativeTabAdoption, OsFocusReconcileReason, OsFocusState, OsFocusTarget, PendingCommandFocus,
+    Position, RestoreWindowState, Scrolling, SendMessageTrigger, VerifyWindowPosition, WidthRatio,
     WindowProperties, focus_entity, reposition_entity, reshuffle_around, resize_entity,
 };
 use crate::events::Event;
@@ -113,7 +113,7 @@ fn adopt_untracked_focused_native_tab(
     applications: &Query<(Entity, &Application)>,
     windows: &Windows,
     commands: &mut Commands,
-) -> Option<(WinID, Entity)> {
+) -> Option<Entity> {
     applications
         .iter()
         .filter(|(_, app)| app.is_frontmost())
@@ -128,13 +128,26 @@ fn adopt_untracked_focused_native_tab(
                 return None;
             }
 
-            let (_, entity) = windows.find(tracked_id)?;
-            let focused_window = app.focused_window().ok()?;
+            let (tracked_window, entity) = windows.find(tracked_id)?;
+            let mut focused_window = app.focused_window().ok()?;
+            focused_window.set_padding(WindowPadding::Horizontal(
+                tracked_window.horizontal_padding(),
+            ));
+            focused_window.set_padding(WindowPadding::Vertical(tracked_window.vertical_padding()));
             debug!(
                 "adopting untracked focused native tab {window_id} into tracked entity {entity} previously {tracked_id}"
             );
-            commands.entity(entity).try_insert(focused_window);
-            Some((tracked_id, entity))
+            commands
+                .entity(entity)
+                .try_insert(focused_window)
+                .try_insert(NativeTabAdoption);
+            if let Some(origin) = windows.origin(entity) {
+                reposition_entity(entity, origin, commands);
+            }
+            commands
+                .entity(entity)
+                .try_insert(VerifyWindowPosition::default());
+            Some(entity)
         })
 }
 
@@ -505,25 +518,20 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
-        let Some((window, entity, parent)) = windows
-            .find_parent(window_id)
-            .or_else(|| {
-                adopt_untracked_focused_native_tab(
-                    window_id,
-                    &applications,
-                    &windows,
-                    &mut commands,
-                )
-                .and_then(|(tracked_id, _)| windows.find_parent(tracked_id))
-            })
-            .or_else(|| {
-                let normalized =
-                    normalize_focus_event_window_id(window_id, &applications, &windows);
-                (normalized != window_id)
-                    .then(|| windows.find_parent(normalized))
-                    .flatten()
-            })
-        else {
+        if windows.find_parent(window_id).is_none()
+            && adopt_untracked_focused_native_tab(window_id, &applications, &windows, &mut commands)
+                .is_some()
+        {
+            commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
+            continue;
+        }
+
+        let Some((window, entity, parent)) = windows.find_parent(window_id).or_else(|| {
+            let normalized = normalize_focus_event_window_id(window_id, &applications, &windows);
+            (normalized != window_id)
+                .then(|| windows.find_parent(normalized))
+                .flatten()
+        }) else {
             let timeout = Timeout::new(
                 Duration::from_secs(STRAY_FOCUS_RETRY_SEC),
                 None,
@@ -541,7 +549,7 @@ pub(super) fn window_focused_trigger(
         if let Some(pending) = pending_command_focus.as_deref_mut() {
             if pending.target == entity {
                 commands.remove_resource::<PendingCommandFocus>();
-            } else if pending.source_tab_group.contains(&entity) {
+            } else if pending.source_entities.contains(&entity) {
                 pending.remaining_source_bounces =
                     pending.remaining_source_bounces.saturating_sub(1);
                 debug!(
@@ -1326,7 +1334,10 @@ pub(super) fn spawn_window_trigger(
 
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn apply_window_defaults(
-    added: Populated<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Added<Window>>,
+    added: Populated<
+        (&mut Window, &mut Position, &mut Bounds, &ChildOf),
+        (Added<Window>, Without<NativeTabAdoption>),
+    >,
     apps: Query<(Entity, &Application)>,
     active_display: ActiveDisplay,
     config: Res<Config>,
@@ -1388,7 +1399,7 @@ pub(super) fn apply_window_defaults(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
-    added: Populated<Entity, Added<Window>>,
+    added: Populated<Entity, (Added<Window>, Without<NativeTabAdoption>)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     windows: Windows,
     apps: Query<&Application>,

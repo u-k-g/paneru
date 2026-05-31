@@ -474,19 +474,22 @@ pub struct Initializing;
 #[derive(Resource)]
 pub struct PendingCommandFocus {
     pub target: Entity,
-    pub source_tab_group: Vec<Entity>,
+    pub source_entities: Vec<Entity>,
     pub remaining_source_bounces: u8,
 }
 
 impl PendingCommandFocus {
-    pub fn away_from_native_tabs(target: Entity, source_tab_group: Vec<Entity>) -> Self {
+    pub fn new(target: Entity, source_entities: Vec<Entity>) -> Self {
         Self {
             target,
-            source_tab_group,
+            source_entities,
             remaining_source_bounces: 3,
         }
     }
 }
+
+#[derive(Component)]
+pub struct NativeTabAdoption;
 
 /// Bevy event trigger for spawning new windows.
 #[derive(BevyEvent)]

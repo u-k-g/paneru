@@ -781,7 +781,13 @@ pub(super) fn window_resized_update_frame(
 pub(super) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: Query<
-        (&mut Window, &mut Position, &Bounds, Option<&Unmanaged>),
+        (
+            &mut Window,
+            &mut Position,
+            &Bounds,
+            Option<&RepositionMarker>,
+            Option<&Unmanaged>,
+        ),
         Without<LayoutStrip>,
     >,
 ) {
@@ -790,13 +796,16 @@ pub(super) fn window_moved_update_frame(
             continue;
         };
 
-        let Some((mut window, mut position, bounds, unmanaged)) = windows
+        let Some((mut window, mut position, bounds, reposition, unmanaged)) = windows
             .iter_mut()
             .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
+            continue;
+        }
+        if reposition.is_some() {
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {

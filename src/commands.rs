@@ -419,14 +419,12 @@ fn command_move_focus(
         });
 
     if let Some(entity) = candidate {
-        if let Some(source_tab_group) = active_strip.tab_group(focused_entity)
-            && source_tab_group.len() > 1
-            && !source_tab_group.contains(&entity)
-        {
-            commands.insert_resource(PendingCommandFocus::away_from_native_tabs(
-                entity,
-                source_tab_group,
-            ));
+        let source_entities = active_strip
+            .tab_group(focused_entity)
+            .filter(|group| group.len() > 1)
+            .unwrap_or_else(|| vec![focused_entity]);
+        if !source_entities.contains(&entity) {
+            commands.insert_resource(PendingCommandFocus::new(entity, source_entities));
         }
         focus_entity(entity, true, &mut commands);
         // Explicitly reshuffle so the target window is brought into view.

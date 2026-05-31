@@ -259,6 +259,14 @@ fn mouse_follows_focus(
             .map(Display::bounds)
     {
         let visible = display_bounds.intersect(frame);
+        let min_visible_width = (config.sliver_width() * 4).max(32);
+        if visible.width() < min_visible_width || visible.height() < 32 {
+            debug!(
+                "Suppressing center mouse for {}: visible frame too small {visible:?}",
+                window.id()
+            );
+            return;
+        }
         let origin = visible.center();
         debug!("centering on {} {origin}", window.id());
         window_manager.warp_mouse(origin);
