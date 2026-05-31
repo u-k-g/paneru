@@ -184,6 +184,11 @@ pub trait AXUIAttributes {
             .and_then(|focused| ax_window_id(focused.as_ptr()))
     }
 
+    fn focused_window(&self) -> Result<CFRetained<AXUIWrapper>> {
+        let axname = CFString::from_static_str(kAXFocusedWindowAttribute);
+        self.get_attribute::<AXUIWrapper>(&axname)
+    }
+
     fn windows(&self) -> Result<Vec<CFRetained<AXUIWrapper>>> {
         let axname = CFString::from_static_str(kAXWindowsAttribute);
         let array = self.get_attribute::<CFArray<AXUIWrapper>>(&axname)?;

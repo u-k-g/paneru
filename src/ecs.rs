@@ -471,6 +471,23 @@ pub struct PollForNotifications;
 #[derive(PartialEq, Resource)]
 pub struct Initializing;
 
+#[derive(Resource)]
+pub struct PendingCommandFocus {
+    pub target: Entity,
+    pub source_tab_group: Vec<Entity>,
+    pub remaining_source_bounces: u8,
+}
+
+impl PendingCommandFocus {
+    pub fn away_from_native_tabs(target: Entity, source_tab_group: Vec<Entity>) -> Self {
+        Self {
+            target,
+            source_tab_group,
+            remaining_source_bounces: 3,
+        }
+    }
+}
+
 /// Bevy event trigger for spawning new windows.
 #[derive(BevyEvent)]
 pub struct SpawnWindowTrigger(pub Vec<Window>);

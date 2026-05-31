@@ -64,6 +64,7 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// Returns an `Error` if the focused window cannot be determined.
     fn focused_window_id(&self) -> Result<WinID>;
+    fn focused_window(&self) -> Result<Window>;
     /// Returns a list of all windows belonging to this application.
     ///
     /// # Errors
@@ -222,6 +223,11 @@ impl ApplicationApi for ApplicationOS {
     /// `Ok(WinID)` with the focused window ID if successful, otherwise `Err(Error)`.
     fn focused_window_id(&self) -> Result<WinID> {
         self.element.focused_window_id()
+    }
+
+    fn focused_window(&self) -> Result<Window> {
+        let element = self.element.focused_window()?;
+        WindowOS::new(&element).map(|window| Window::new(Box::new(window)))
     }
 
     /// Retrieves a list of all windows associated with the application.

@@ -17,8 +17,9 @@ use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker,
-    NativeFullscreenMarker, RetryFrontSwitch, SelectedVirtualMarker, SendMessageTrigger, Unmanaged,
-    focus_entity, reposition_entity, reshuffle_around, resize_entity,
+    NativeFullscreenMarker, PendingCommandFocus, RetryFrontSwitch, SelectedVirtualMarker,
+    SendMessageTrigger, Unmanaged, focus_entity, reposition_entity, reshuffle_around,
+    resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
@@ -418,6 +419,15 @@ fn command_move_focus(
         });
 
     if let Some(entity) = candidate {
+        if let Some(source_tab_group) = active_strip.tab_group(focused_entity)
+            && source_tab_group.len() > 1
+            && !source_tab_group.contains(&entity)
+        {
+            commands.insert_resource(PendingCommandFocus::away_from_native_tabs(
+                entity,
+                source_tab_group,
+            ));
+        }
         focus_entity(entity, true, &mut commands);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle

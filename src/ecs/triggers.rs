@@ -26,9 +26,9 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, LocateDockTrigger,
-    OsFocusReconcileReason, OsFocusState, OsFocusTarget, Position, RestoreWindowState, Scrolling,
-    SendMessageTrigger, VerifyWindowPosition, WidthRatio, WindowProperties, focus_entity,
-    reposition_entity, reshuffle_around, resize_entity,
+    OsFocusReconcileReason, OsFocusState, OsFocusTarget, PendingCommandFocus, Position,
+    RestoreWindowState, Scrolling, SendMessageTrigger, VerifyWindowPosition, WidthRatio,
+    WindowProperties, focus_entity, reposition_entity, reshuffle_around, resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -106,6 +106,36 @@ fn normalize_focus_event_window_id(
                 .flatten()
         })
         .unwrap_or(window_id)
+}
+
+fn adopt_untracked_focused_native_tab(
+    window_id: WinID,
+    applications: &Query<(Entity, &Application)>,
+    windows: &Windows,
+    commands: &mut Commands,
+) -> Option<(WinID, Entity)> {
+    applications
+        .iter()
+        .filter(|(_, app)| app.is_frontmost())
+        .find_map(|(app_entity, app)| {
+            if !app.focused_window_id().is_ok_and(|focused_id| focused_id == window_id) {
+                return None;
+            }
+
+            let mut tracked_ids = windows.ids_for_parent(app_entity);
+            let tracked_id = tracked_ids.next()?;
+            if tracked_ids.next().is_some() {
+                return None;
+            }
+
+            let (_, entity) = windows.find(tracked_id)?;
+            let focused_window = app.focused_window().ok()?;
+            debug!(
+                "adopting untracked focused native tab {window_id} into tracked entity {entity} previously {tracked_id}"
+            );
+            commands.entity(entity).try_insert(focused_window);
+            Some((tracked_id, entity))
+        })
 }
 
 fn native_tab_entities(
@@ -463,6 +493,7 @@ pub(super) fn window_focused_trigger(
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
+    mut pending_command_focus: Option<ResMut<PendingCommandFocus>>,
     config: Res<Config>,
     global_state: GlobalState,
     mut commands: Commands,
@@ -473,9 +504,26 @@ pub(super) fn window_focused_trigger(
         let Event::WindowFocused { window_id } = *event else {
             continue;
         };
-        let window_id = normalize_focus_event_window_id(window_id, &applications, &windows);
 
-        let Some((window, entity, parent)) = windows.find_parent(window_id) else {
+        let Some((window, entity, parent)) = windows
+            .find_parent(window_id)
+            .or_else(|| {
+                adopt_untracked_focused_native_tab(
+                    window_id,
+                    &applications,
+                    &windows,
+                    &mut commands,
+                )
+                .and_then(|(tracked_id, _)| windows.find_parent(tracked_id))
+            })
+            .or_else(|| {
+                let normalized =
+                    normalize_focus_event_window_id(window_id, &applications, &windows);
+                (normalized != window_id)
+                    .then(|| windows.find_parent(normalized))
+                    .flatten()
+            })
+        else {
             let timeout = Timeout::new(
                 Duration::from_secs(STRAY_FOCUS_RETRY_SEC),
                 None,
@@ -489,6 +537,25 @@ pub(super) fn window_focused_trigger(
             warn!("Unable to get parent for window {}.", window.id());
             continue;
         };
+
+        if let Some(pending) = pending_command_focus.as_deref_mut() {
+            if pending.target == entity {
+                commands.remove_resource::<PendingCommandFocus>();
+            } else if pending.source_tab_group.contains(&entity) {
+                pending.remaining_source_bounces =
+                    pending.remaining_source_bounces.saturating_sub(1);
+                debug!(
+                    "Ignoring command-focus bounce back to native tab source {entity}; target={}",
+                    pending.target
+                );
+                if pending.remaining_source_bounces == 0 {
+                    commands.remove_resource::<PendingCommandFocus>();
+                }
+                continue;
+            } else {
+                commands.remove_resource::<PendingCommandFocus>();
+            }
+        }
 
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys

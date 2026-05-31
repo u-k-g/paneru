@@ -140,6 +140,16 @@ impl ApplicationApi for MockApplication {
         id
     }
 
+    fn focused_window(&self) -> Result<Window> {
+        let id = self.focused_window_id()?;
+        Ok(Window::new(Box::new(MockWindow::new(
+            id,
+            IRect::default(),
+            Arc::new(RwLock::new(Vec::new())),
+            self.clone(),
+        ))))
+    }
+
     fn window_list(&self) -> Vec<Window> {
         debug!("{}:", function_name!());
         self.inner
