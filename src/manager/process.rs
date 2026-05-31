@@ -248,9 +248,12 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    pub fn observe_finished_launching(&self) {
+    pub fn observe_finished_launching(&self) -> bool {
         if !self.observing_launched.swap(true, Ordering::Acquire) {
             self.observe("finishedLaunching");
+            true
+        } else {
+            false
         }
     }
 
@@ -271,9 +274,12 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    pub fn observe_activation_policy(&self) {
+    pub fn observe_activation_policy(&self) -> bool {
         if !self.observing_activated.swap(true, Ordering::Acquire) {
             self.observe("activationPolicy");
+            true
+        } else {
+            false
         }
     }
 
@@ -350,21 +356,23 @@ impl Process {
     /// - Adds or removes KVO observers based on the application's launch and activation state.
     pub fn ready(&mut self) -> bool {
         if !self.finished_launching() {
-            debug!(
-                "{} ({}) is not finished launching, subscribing to finishedLaunching changes",
-                self.name, self.pid
-            );
-            self.observe_finished_launching();
+            if self.observe_finished_launching() {
+                debug!(
+                    "{} ({}) is not finished launching, subscribing to finishedLaunching changes",
+                    self.name, self.pid
+                );
+            }
             return false;
         }
         self.unobserve_finished_launching();
 
         if !self.is_observable() {
-            debug!(
-                "{} ({}) is not observable, subscribing to activationPolicy changes",
-                self.name, self.pid
-            );
-            self.observe_activation_policy();
+            if self.observe_activation_policy() {
+                debug!(
+                    "{} ({}) is not observable, subscribing to activationPolicy changes",
+                    self.name, self.pid
+                );
+            }
             return false;
         }
         self.unobserve_activation_policy();

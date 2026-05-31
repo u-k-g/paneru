@@ -746,6 +746,73 @@ fn test_new_native_tab_focus_coalesces_from_existing_tab_association() {
 }
 
 #[test]
+fn test_non_empty_native_tab_transient_joins_existing_tab_group() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MenuClosed { window_id: 0 },
+    ];
+
+    let mut harness = TestHarness::new();
+    let mock_app = setup_process(harness.app.world_mut());
+    let focused_app = mock_app.clone();
+    let transient_app = mock_app.clone();
+    let internal_queue = harness.internal_queue.clone();
+    let wm = MockWindowManager {
+        windows: window_spawner(2, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(0, move |world| {
+            let tab0 = find_window_entity(0, world);
+            let tab1 = find_window_entity(1, world);
+            let mut active =
+                world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+            let mut strip = active.single_mut(world).expect("active strip");
+            strip.remove(tab1);
+            strip.convert_to_tabs(tab0, tab1).expect("tab group");
+
+            focused_app.inner.write().unwrap().focused_id = Some(2);
+            let origin = Origin::new(0, 0);
+            let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let mut window = MockWindow::new(
+                2,
+                IRect {
+                    min: origin,
+                    max: origin + size,
+                },
+                internal_queue.clone(),
+                transient_app.clone(),
+            );
+            window.title = "~/nc".to_string();
+            world.trigger(SpawnWindowTrigger(vec![Window::new(Box::new(window))]));
+        })
+        .on_iteration(1, |world| {
+            let tab0 = find_window_entity(0, world);
+            let tab1 = find_window_entity(1, world);
+            let tab2 = find_window_entity(2, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let owners = strips
+                .iter(world)
+                .filter(|strip| {
+                    strip.contains(tab0) || strip.contains(tab1) || strip.contains(tab2)
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(owners.len(), 1);
+            assert!(owners[0].tab_group(tab2).is_some_and(|tabs| {
+                tabs.len() == 3
+                    && tabs.contains(&tab0)
+                    && tabs.contains(&tab1)
+                    && tabs.contains(&tab2)
+            }));
+        })
+        .run(commands);
+}
+
+#[test]
 fn test_native_tab_focus_coalesces_when_inactive_tab_missing_from_ax_window_list() {
     let commands = vec![Event::WindowFocused { window_id: 1 }];
 

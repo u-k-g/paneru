@@ -129,26 +129,36 @@ fn adopt_untracked_focused_native_tab(
             }
 
             let (tracked_window, entity) = windows.find(tracked_id)?;
-            let mut focused_window = app.focused_window().ok()?;
-            focused_window.set_padding(WindowPadding::Horizontal(
-                tracked_window.horizontal_padding(),
-            ));
-            focused_window.set_padding(WindowPadding::Vertical(tracked_window.vertical_padding()));
+            let focused_window = app.focused_window().ok()?;
             debug!(
                 "adopting untracked focused native tab {window_id} into tracked entity {entity} previously {tracked_id}"
             );
-            commands
-                .entity(entity)
-                .try_insert(focused_window)
-                .try_insert(NativeTabAdoption);
-            if let Some(origin) = windows.origin(entity) {
-                reposition_entity(entity, origin, commands);
-            }
-            commands
-                .entity(entity)
-                .try_insert(VerifyWindowPosition::default());
+            replace_tracked_native_tab(entity, tracked_window, focused_window, windows, commands);
             Some(entity)
         })
+}
+
+fn replace_tracked_native_tab(
+    entity: Entity,
+    tracked_window: &Window,
+    mut replacement: Window,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
+    replacement.set_padding(WindowPadding::Horizontal(
+        tracked_window.horizontal_padding(),
+    ));
+    replacement.set_padding(WindowPadding::Vertical(tracked_window.vertical_padding()));
+    commands
+        .entity(entity)
+        .try_insert(NativeTabAdoption)
+        .try_insert(replacement);
+    if let Some(origin) = windows.origin(entity) {
+        reposition_entity(entity, origin, commands);
+    }
+    commands
+        .entity(entity)
+        .try_insert(VerifyWindowPosition::default());
 }
 
 fn native_tab_entities(
@@ -240,6 +250,41 @@ fn native_tab_entities(
             }
             entities
         })
+}
+
+fn provisional_native_tab_peer(
+    window: &Window,
+    entity: Entity,
+    parent: Entity,
+    app: &Application,
+    windows: &Windows,
+    workspaces: &mut Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+) -> Option<Entity> {
+    if !app.is_frontmost()
+        || !app
+            .focused_window_id()
+            .is_ok_and(|focused_id| focused_id == window.id())
+    {
+        return None;
+    }
+
+    let (_, focused_entity) = windows.focused()?;
+    let focused = windows.get(focused_entity)?;
+    let (_, peer, peer_parent) = windows.find_parent(focused.id())?;
+    if peer_parent != parent || peer == entity {
+        return None;
+    }
+
+    let title_empty = window.title().is_ok_and(|title| title.is_empty());
+    let peer_already_tabbed = workspaces.iter().any(|(strip, _)| strip.tabbed(peer));
+    if !title_empty && !peer_already_tabbed {
+        return None;
+    }
+
+    // Native tab creation can arrive before association APIs settle. Empty
+    // focused same-app windows are provisional surfaces; non-empty windows get
+    // the same treatment only once this app already has a known tab group.
+    Some(peer)
 }
 
 fn schedule_focus_retry(commands: &mut Commands, app_entity: Option<Entity>) {
@@ -1174,6 +1219,35 @@ pub(super) fn window_destroyed_trigger(
             error!("Window {} has no parent!", window.id());
             continue;
         };
+
+        let mut tracked_ids = windows.ids_for_parent(parent);
+        let only_tracked_app_window =
+            tracked_ids.next().is_some_and(|id| id == *window_id) && tracked_ids.next().is_none();
+        if only_tracked_app_window {
+            let replacement = app
+                .focused_window()
+                .ok()
+                .filter(|replacement| replacement.id() != *window_id)
+                .or_else(|| {
+                    app.window_list()
+                        .into_iter()
+                        .find(|replacement| replacement.id() != *window_id)
+                });
+
+            if let Some(replacement) = replacement {
+                let replacement_id = replacement.id();
+                debug!(
+                    "replacing destroyed native tab {window_id} in entity {entity} with {replacement_id}"
+                );
+                app.unobserve_window(window);
+                if app.observe_window(&replacement).is_err() {
+                    debug!("Error observing replacement native tab {replacement_id}.");
+                }
+                replace_tracked_native_tab(entity, window, replacement, &windows, &mut commands);
+                continue;
+            }
+        }
+
         app.unobserve_window(window);
 
         give_away_focus(
@@ -1454,31 +1528,17 @@ pub(super) fn apply_window_positions(
         if !already_inserted {
             let tab_entities =
                 native_tab_entities(window.id(), entity, parent, app, &windows, &window_manager);
-            let tab_peer = tab_entities
-                .into_iter()
-                .find(|tab| *tab != entity)
-                .or_else(|| {
-                    let title_empty = window.title().is_ok_and(|title| title.is_empty());
-                    let app_reports_new_window_focused = app
-                        .focused_window_id()
-                        .is_ok_and(|focused_id| focused_id == window.id());
-                    if !title_empty || !app_reports_new_window_focused {
-                        return None;
-                    }
-
-                    // Native tab creation can arrive before association APIs settle.
-                    // A focused, empty-title same-app window next to an already focused
-                    // same-app peer is likely the provisional tab surface; attach it
-                    // directly instead of briefly inserting it as a standalone column.
-                    windows.focused().and_then(|(_, focused_entity)| {
-                        windows
-                            .get(focused_entity)
-                            .and_then(|focused| windows.find_parent(focused.id()))
-                            .and_then(|(_, peer, peer_parent)| {
-                                (peer_parent == parent && peer != entity).then_some(peer)
-                            })
-                    })
-                });
+            let mut tab_peer = tab_entities.into_iter().find(|tab| *tab != entity);
+            if tab_peer.is_none() {
+                tab_peer = provisional_native_tab_peer(
+                    window,
+                    entity,
+                    parent,
+                    app,
+                    &windows,
+                    &mut workspaces,
+                );
+            }
             if let Some(tab_peer) = tab_peer
                 && let Some(mut strip) = workspaces
                     .iter_mut()
@@ -1619,9 +1679,15 @@ pub(super) fn refresh_configuration_trigger(
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
+    native_tab_adoptions: Query<(), With<NativeTabAdoption>>,
     mut workspaces: Query<&mut LayoutStrip>,
 ) {
     let entity = trigger.event().entity;
+
+    if native_tab_adoptions.get(entity).is_ok() {
+        debug!("Ignoring Window removal for native-tab adoption {entity}");
+        return;
+    }
 
     if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
         debug!(
@@ -1629,6 +1695,15 @@ pub(super) fn window_removal_trigger(
             strip.id()
         );
         strip.remove(entity);
+    }
+}
+
+pub(super) fn cleanup_native_tab_adoption(
+    adoptions: Query<Entity, With<NativeTabAdoption>>,
+    mut commands: Commands,
+) {
+    for entity in &adoptions {
+        commands.entity(entity).try_remove::<NativeTabAdoption>();
     }
 }
 

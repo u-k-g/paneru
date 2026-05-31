@@ -84,6 +84,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
         (
             triggers::apply_window_defaults,
             triggers::apply_window_positions,
+            triggers::cleanup_native_tab_adoption
+                .after(triggers::apply_window_defaults)
+                .after(triggers::apply_window_positions),
             (
                 systems::add_existing_process,
                 systems::add_existing_application,
