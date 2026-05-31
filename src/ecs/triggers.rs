@@ -1322,6 +1322,7 @@ pub(super) fn apply_window_positions(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
@@ -1355,21 +1356,36 @@ pub(super) fn apply_window_positions(
         }
 
         // During startup, the window is already inserted into some strip.
-        let allready_inserted = workspaces
-            .iter_mut()
-            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
+        let already_inserted = workspaces.iter().any(|(strip, _)| strip.contains(entity));
         let properties = WindowProperties::new(app, window, &config);
 
         if properties.floating() {
             // Avoid managing window if it's floating.
             commands.entity(entity).try_insert(Unmanaged::Floating);
-            if let Some(mut strip) = allready_inserted {
-                strip.remove(entity);
+            if already_inserted {
+                for (mut strip, _) in &mut workspaces {
+                    strip.remove(entity);
+                }
             }
             continue;
         }
 
-        if allready_inserted.is_none()
+        if !already_inserted {
+            let tab_entities =
+                native_tab_entities(window.id(), entity, parent, app, &windows, &window_manager);
+            let tab_peer = tab_entities.into_iter().find(|tab| *tab != entity);
+            if let Some(tab_peer) = tab_peer
+                && let Some(mut strip) = workspaces
+                    .iter_mut()
+                    .find_map(|(strip, _)| strip.contains(tab_peer).then_some(strip))
+            {
+                debug!("New native tab {entity} attaching to existing tab {tab_peer}");
+                _ = strip.convert_to_tabs(tab_peer, entity);
+                continue;
+            }
+        }
+
+        if !already_inserted
             && let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, active)| active.then_some(strip))
