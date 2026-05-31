@@ -163,6 +163,30 @@ fn native_tab_entities(
         associated_ids.push(missing_tracked_ids[0]);
     }
 
+    let focused_missing_from_ax_windows =
+        !current_app_window_ids.is_empty() && !current_app_window_ids.contains(&window_id);
+    if focused_missing_from_ax_windows {
+        let visible_tracked_ids: Vec<_> = windows
+            .ids_for_parent(parent)
+            .filter(|peer_id| {
+                *peer_id != window_id
+                    && !associated_ids.contains(peer_id)
+                    && current_app_window_ids.contains(peer_id)
+                    && windows.find(*peer_id).is_some_and(|(_, entity)| {
+                        windows
+                            .get_managed(entity)
+                            .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+                    })
+            })
+            .collect();
+
+        // Ghostty can also report the previously selected native tab in AXWindows
+        // while the focused newly-created tab is not in that list yet.
+        if visible_tracked_ids.len() == 1 {
+            associated_ids.push(visible_tracked_ids[0]);
+        }
+    }
+
     associated_ids
         .into_iter()
         .filter_map(|associated_id| windows.find(associated_id).map(|(_, entity)| entity))
