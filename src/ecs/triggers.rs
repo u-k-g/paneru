@@ -108,6 +108,42 @@ fn normalize_focus_event_window_id(
         .unwrap_or(window_id)
 }
 
+fn native_tab_entities(
+    window_id: WinID,
+    entity: Entity,
+    parent: Entity,
+    windows: &Windows,
+    window_manager: &WindowManager,
+) -> Vec<Entity> {
+    let mut associated_ids = window_manager.get_associated_windows(window_id);
+
+    // Newly-created native tabs can be visible from the existing tab's
+    // association list before the focused new tab reports the full group.
+    for peer_id in windows.ids_for_parent(parent) {
+        if peer_id == window_id || associated_ids.contains(&peer_id) {
+            continue;
+        }
+
+        if window_manager
+            .get_associated_windows(peer_id)
+            .contains(&window_id)
+        {
+            associated_ids.push(peer_id);
+        }
+    }
+
+    associated_ids
+        .into_iter()
+        .filter_map(|associated_id| windows.find(associated_id).map(|(_, entity)| entity))
+        .chain(std::iter::once(entity))
+        .fold(Vec::new(), |mut entities, entity| {
+            if !entities.contains(&entity) {
+                entities.push(entity);
+            }
+            entities
+        })
+}
+
 fn schedule_focus_retry(commands: &mut Commands, app_entity: Option<Entity>) {
     commands.spawn(RetryFrontSwitch::new(app_entity));
 }
@@ -433,17 +469,8 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        let mut native_tab_entities = window_manager
-            .get_associated_windows(window_id)
-            .into_iter()
-            .filter_map(|associated_id| windows.find(associated_id).map(|(_, entity)| entity))
-            .chain(std::iter::once(entity))
-            .fold(Vec::new(), |mut entities, entity| {
-                if !entities.contains(&entity) {
-                    entities.push(entity);
-                }
-                entities
-            });
+        let mut native_tab_entities =
+            native_tab_entities(window_id, entity, parent, &windows, &window_manager);
 
         // Handle tab switching: if the focused window is a tab, make it the leader.
         // Also reactivate the owning virtual strip before treating duplicate
