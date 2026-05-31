@@ -70,6 +70,37 @@ impl From<&PaneruActiveState> for FocusBroadcastSnapshot {
     }
 }
 
+fn provisional_empty_title_focus(state: &PaneruQueryState, focus: &FocusBroadcastSnapshot) -> bool {
+    let Some(window_id) = focus.window_id else {
+        return false;
+    };
+    let Some(bundle_id) = focus.bundle_id.as_deref() else {
+        return false;
+    };
+    if focus
+        .title
+        .as_deref()
+        .is_some_and(|title| !title.is_empty())
+    {
+        return false;
+    }
+
+    let Some(virtual_workspace_number) = focus.virtual_workspace_number else {
+        return false;
+    };
+
+    state
+        .virtual_workspaces
+        .iter()
+        .filter(|workspace| workspace.number == virtual_workspace_number)
+        .flat_map(|workspace| workspace.windows.iter())
+        .any(|window| {
+            window.window_id != window_id
+                && window.bundle_id == bundle_id
+                && !window.title.is_empty()
+        })
+}
+
 #[derive(Clone, Copy, Default)]
 struct StateBroadcastSignals {
     virtual_workspace_changed: bool,
@@ -199,7 +230,10 @@ fn collect_state_broadcast_events<'a>(
 
     if window_focused {
         let focus = FocusBroadcastSnapshot::from(&state.active);
-        if focus.window_id.is_some() && cache.focus.as_ref() != Some(&focus) {
+        if focus.window_id.is_some()
+            && cache.focus.as_ref() != Some(&focus)
+            && !provisional_empty_title_focus(state, &focus)
+        {
             outgoing.push(json!({
                 "event": "window_focused",
                 "window_id": focus.window_id,
@@ -454,5 +488,48 @@ mod tests {
         assert_eq!(outgoing[0]["window_id"], 26_262);
         assert_eq!(outgoing[0]["bundle_id"], "com.openai.codex");
         assert_eq!(outgoing[0]["title"], "Codex");
+    }
+
+    #[test]
+    fn test_state_broadcast_skips_same_app_empty_title_focus_transient() {
+        let mut cache = StateBroadcastCache::default();
+        let state = query_state_with_active_window(
+            923,
+            "com.example.NativeTabbedApp",
+            "",
+            1,
+            vec![569, 923],
+        );
+        let mut state = state;
+        state.virtual_workspaces[0].windows[0].title = "settled tab".to_string();
+
+        let outgoing = collect_state_broadcast_events(
+            [PaneruEvent::WindowFocused { window_id: 923 }].iter(),
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+
+        assert!(outgoing.is_empty());
+    }
+
+    #[test]
+    fn test_state_broadcast_keeps_empty_title_focus_without_same_app_peer() {
+        let mut cache = StateBroadcastCache::default();
+        let state =
+            query_state_with_active_window(923, "com.example.NativeTabbedApp", "", 1, vec![923]);
+
+        let outgoing = collect_state_broadcast_events(
+            [PaneruEvent::WindowFocused { window_id: 923 }].iter(),
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals::default(),
+        );
+
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0]["event"], "window_focused");
+        assert_eq!(outgoing[0]["window_id"], 923);
     }
 }

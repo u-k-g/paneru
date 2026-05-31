@@ -156,7 +156,7 @@ fn native_tab_entities(
             .collect()
     };
 
-    // Ghostty native tabs often expose only the selected tab via AXWindows.
+    // Native-tabbed apps may expose only the selected tab via AXWindows.
     // If there is exactly one tracked same-app managed window missing from the
     // current AX list, treat it as the inactive native tab for this focused tab.
     if missing_tracked_ids.len() == 1 {
@@ -180,8 +180,8 @@ fn native_tab_entities(
             })
             .collect();
 
-        // Ghostty can also report the previously selected native tab in AXWindows
-        // while the focused newly-created tab is not in that list yet.
+        // Native-tabbed apps can also report the previously selected native tab in
+        // AXWindows while the focused newly-created tab is not in that list yet.
         if visible_tracked_ids.len() == 1 {
             associated_ids.push(visible_tracked_ids[0]);
         }
@@ -567,10 +567,10 @@ pub(super) fn window_focused_trigger(
             }
 
             if let Ok((_, mut owner_strip, _)) = workspaces.get_mut(owner_entity) {
-                for tab_entity in native_tab_entities {
-                    if tab_entity != entity {
-                        owner_strip.remove(tab_entity);
-                        _ = owner_strip.convert_to_tabs(entity, tab_entity);
+                for tab_entity in &native_tab_entities {
+                    if *tab_entity != entity {
+                        owner_strip.remove(*tab_entity);
+                        _ = owner_strip.convert_to_tabs(entity, *tab_entity);
                     }
                 }
                 if let Ok(index) = owner_strip.index_of(entity)
@@ -599,6 +599,9 @@ pub(super) fn window_focused_trigger(
         }
 
         if already_focused {
+            if native_tab_entities.len() > 1 {
+                continue;
+            }
             if !global_state.skip_reshuffle() && !global_state.initializing() {
                 reshuffle_around(entity, &mut commands);
             }
@@ -1373,7 +1376,31 @@ pub(super) fn apply_window_positions(
         if !already_inserted {
             let tab_entities =
                 native_tab_entities(window.id(), entity, parent, app, &windows, &window_manager);
-            let tab_peer = tab_entities.into_iter().find(|tab| *tab != entity);
+            let tab_peer = tab_entities
+                .into_iter()
+                .find(|tab| *tab != entity)
+                .or_else(|| {
+                    let title_empty = window.title().is_ok_and(|title| title.is_empty());
+                    let app_reports_new_window_focused = app
+                        .focused_window_id()
+                        .is_ok_and(|focused_id| focused_id == window.id());
+                    if !title_empty || !app_reports_new_window_focused {
+                        return None;
+                    }
+
+                    // Native tab creation can arrive before association APIs settle.
+                    // A focused, empty-title same-app window next to an already focused
+                    // same-app peer is likely the provisional tab surface; attach it
+                    // directly instead of briefly inserting it as a standalone column.
+                    windows.focused().and_then(|(_, focused_entity)| {
+                        windows
+                            .get(focused_entity)
+                            .and_then(|focused| windows.find_parent(focused.id()))
+                            .and_then(|(_, peer, peer_parent)| {
+                                (peer_parent == parent && peer != entity).then_some(peer)
+                            })
+                    })
+                });
             if let Some(tab_peer) = tab_peer
                 && let Some(mut strip) = workspaces
                     .iter_mut()
