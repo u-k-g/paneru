@@ -112,6 +112,7 @@ fn native_tab_entities(
     window_id: WinID,
     entity: Entity,
     parent: Entity,
+    app: &Application,
     windows: &Windows,
     window_manager: &WindowManager,
 ) -> Vec<Entity> {
@@ -130,6 +131,36 @@ fn native_tab_entities(
         {
             associated_ids.push(peer_id);
         }
+    }
+
+    let current_app_window_ids: Vec<_> = app
+        .window_list()
+        .into_iter()
+        .map(|window| window.id())
+        .collect();
+    let missing_tracked_ids: Vec<_> = if current_app_window_ids.is_empty() {
+        Vec::new()
+    } else {
+        windows
+            .ids_for_parent(parent)
+            .filter(|peer_id| {
+                *peer_id != window_id
+                    && !associated_ids.contains(peer_id)
+                    && !current_app_window_ids.contains(peer_id)
+                    && windows.find(*peer_id).is_some_and(|(_, entity)| {
+                        windows
+                            .get_managed(entity)
+                            .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+                    })
+            })
+            .collect()
+    };
+
+    // Ghostty native tabs often expose only the selected tab via AXWindows.
+    // If there is exactly one tracked same-app managed window missing from the
+    // current AX list, treat it as the inactive native tab for this focused tab.
+    if missing_tracked_ids.len() == 1 {
+        associated_ids.push(missing_tracked_ids[0]);
     }
 
     associated_ids
@@ -470,7 +501,7 @@ pub(super) fn window_focused_trigger(
         }
 
         let mut native_tab_entities =
-            native_tab_entities(window_id, entity, parent, &windows, &window_manager);
+            native_tab_entities(window_id, entity, parent, app, &windows, &window_manager);
 
         // Handle tab switching: if the focused window is a tab, make it the leader.
         // Also reactivate the owning virtual strip before treating duplicate

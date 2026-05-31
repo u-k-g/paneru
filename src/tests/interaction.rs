@@ -746,6 +746,43 @@ fn test_new_native_tab_focus_coalesces_from_existing_tab_association() {
 }
 
 #[test]
+fn test_native_tab_focus_coalesces_when_inactive_tab_missing_from_ax_window_list() {
+    let commands = vec![Event::WindowFocused { window_id: 1 }];
+
+    let mut harness = TestHarness::new();
+    let mock_app = setup_process(harness.app.world_mut());
+    {
+        let mut inner = mock_app.inner.write().unwrap();
+        inner.focused_id = Some(1);
+        inner.current_window_ids = vec![1];
+    }
+    let wm = MockWindowManager {
+        windows: window_spawner(2, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(1, |world| {
+            assert_focused!(world, 1);
+
+            let tab0 = find_window_entity(0, world);
+            let tab1 = find_window_entity(1, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let owners = strips
+                .iter(world)
+                .filter(|strip| strip.contains(tab0) || strip.contains(tab1))
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1);
+            assert!(owners[0].tab_group(tab1).is_some_and(|tabs| {
+                tabs.len() == 2 && tabs.contains(&tab0) && tabs.contains(&tab1)
+            }));
+        })
+        .run(commands);
+}
+
+#[test]
 fn test_duplicate_virtual_workspaces_are_merged() {
     let commands = vec![Event::MenuOpened { window_id: 0 }];
 

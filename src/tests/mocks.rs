@@ -82,6 +82,7 @@ pub(crate) struct InnerMockApplication {
     pub(crate) psn: ProcessSerialNumber,
     pub(crate) pid: Pid,
     pub(crate) focused_id: Option<WinID>,
+    pub(crate) current_window_ids: Vec<WinID>,
     pub(crate) bundle_id: String,
 }
 
@@ -94,6 +95,7 @@ impl MockApplication {
                 psn,
                 pid,
                 focused_id: None,
+                current_window_ids: Vec::new(),
                 bundle_id,
             })),
             name: "test".to_string(),
@@ -138,10 +140,21 @@ impl ApplicationApi for MockApplication {
         id
     }
 
-    /// Always returns an empty vector of window lists for the mock application.
     fn window_list(&self) -> Vec<Window> {
         debug!("{}:", function_name!());
-        vec![]
+        self.inner
+            .force_read()
+            .current_window_ids
+            .iter()
+            .map(|id| {
+                Window::new(Box::new(MockWindow::new(
+                    *id,
+                    IRect::default(),
+                    Arc::new(RwLock::new(Vec::new())),
+                    self.clone(),
+                )))
+            })
+            .collect()
     }
 
     /// Always returns `Ok(true)` for observe operations on the mock application.
@@ -210,6 +223,7 @@ impl WindowManagerApi for MockWindowManager {
                 psn: process.psn(),
                 pid: process.pid(),
                 focused_id: None,
+                current_window_ids: Vec::new(),
                 bundle_id: "test".to_string(),
             })),
             name: "test".to_string(),
@@ -550,6 +564,7 @@ impl WindowManagerApi for TwoDisplayMock {
                 psn: process.psn(),
                 pid: process.pid(),
                 focused_id: None,
+                current_window_ids: Vec::new(),
                 bundle_id: "test".to_string(),
             })),
             name: "test".to_string(),
