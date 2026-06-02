@@ -657,6 +657,59 @@ fn test_application_activated_by_pid_normalizes_untracked_native_tab_focus() {
 }
 
 #[test]
+fn application_activation_adopts_untracked_focused_window() {
+    let commands = vec![Event::ApplicationActivated {
+        pid: TEST_PROCESS_ID,
+    }];
+
+    let mut harness = TestHarness::new();
+    let mock_app = setup_process(harness.app.world_mut());
+    mock_app.inner.write().unwrap().focused_id = Some(1);
+    let wm = MockWindowManager {
+        windows: window_spawner(0, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(0, |world| {
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn any_command_syncs_live_os_focus_before_handling() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    let mut harness = TestHarness::new();
+    let mock_app = setup_process(harness.app.world_mut());
+    let focused_app = mock_app.clone();
+    let wm = MockWindowManager {
+        windows: window_spawner(2, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(0, move |world| {
+            assert_focused!(world, 0);
+            focused_app.inner.write().unwrap().focused_id = Some(1);
+        })
+        .on_iteration(1, |world| {
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
 fn manage_command_uses_live_os_focus_when_ecs_focus_is_stale() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },

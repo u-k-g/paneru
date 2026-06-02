@@ -19,8 +19,8 @@ use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker,
     NativeFullscreenMarker, PendingCommandFocus, RetryFrontSwitch, SelectedVirtualMarker,
-    SendMessageTrigger, Unmanaged, focus_entity, reposition_entity, reshuffle_around,
-    resize_entity,
+    SendMessageTrigger, SpawnWindowTrigger, Unmanaged, focus_entity, reposition_entity,
+    reshuffle_around, resize_entity,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
@@ -135,7 +135,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
-            sync_os_focus_before_window_commands,
+            sync_os_focus_before_commands,
             (
                 command_quit_handler,
                 command_app_handler,
@@ -162,24 +162,29 @@ pub fn register_commands(app: &mut bevy::app::App) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn sync_os_focus_before_window_commands(
+fn sync_os_focus_before_commands(
     mut messages: MessageReader<Event>,
     applications: Query<(Entity, &Application)>,
     windows: Windows,
     mut commands: Commands,
 ) {
-    if !messages.read().any(|event| {
-        matches!(
-            event,
-            Event::Command {
-                command: Command::Window(_),
-            }
-        )
-    }) {
+    if !messages
+        .read()
+        .any(|event| matches!(event, Event::Command { .. }))
+    {
         return;
     }
 
-    let Some(entity) = os_focused_window_entity(&applications, &windows) else {
+    let Some((_, app)) = frontmost_app(&applications) else {
+        return;
+    };
+    let Ok(focused_id) = app.focused_window_id() else {
+        return;
+    };
+    let Some(entity) = windows.find_parent(focused_id).map(|(_, entity, _)| entity) else {
+        if let Ok(window) = app.focused_window() {
+            commands.trigger(SpawnWindowTrigger(vec![window]));
+        }
         return;
     };
     if windows
@@ -255,16 +260,19 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
     })
 }
 
+fn frontmost_app<'a>(
+    applications: &'a Query<(Entity, &Application)>,
+) -> Option<(Entity, &'a Application)> {
+    let mut frontmost = applications.iter().filter(|(_, app)| app.is_frontmost());
+    let first = frontmost.next()?;
+    frontmost.next().is_none().then_some(first)
+}
+
 fn os_focused_window_entity(
     applications: &Query<(Entity, &Application)>,
     windows: &Windows,
 ) -> Option<Entity> {
-    let mut frontmost = applications.iter().filter(|(_, app)| app.is_frontmost());
-    let (_, app) = frontmost.next()?;
-    if frontmost.next().is_some() {
-        return None;
-    }
-
+    let (_, app) = frontmost_app(applications)?;
     let focused_id = app.focused_window_id().ok()?;
     windows.find_parent(focused_id).map(|(_, entity, _)| entity)
 }

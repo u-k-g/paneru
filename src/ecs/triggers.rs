@@ -340,6 +340,10 @@ pub(super) fn reconcile_os_focus(
     };
 
     let Some((_, window_entity, _)) = windows.find_parent(focused_id) else {
+        if let Ok(window) = app.focused_window() {
+            debug!("adopting untracked focused window {focused_id} during {reason:?}");
+            commands.trigger(SpawnWindowTrigger(vec![window]));
+        }
         if let Some(os_focus) = os_focus.as_deref_mut() {
             os_focus.reason = Some(reason);
             os_focus.app_entity = Some(app_entity);
