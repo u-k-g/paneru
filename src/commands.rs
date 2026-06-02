@@ -3,6 +3,7 @@ use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, Query, Res, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
@@ -134,26 +135,62 @@ pub fn register_commands(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
-            command_quit_handler,
-            command_app_handler,
-            print_internal_state_handler,
-            mouse_to_next_display,
-            resize_window,
-            command_center_window,
-            full_width_window,
-            to_next_display,
-            equalize_column,
-            manage_window,
-            stack_windows_handler,
-            command_move_focus,
-            command_focus_unmanaged,
-            command_focus_managed,
-            command_raise_floating,
-            command_toggle_floating_layer,
-            command_swap_focus,
-            snap_window,
-        ),
+            sync_os_focus_before_window_commands,
+            (
+                command_quit_handler,
+                command_app_handler,
+                print_internal_state_handler,
+                mouse_to_next_display,
+                resize_window,
+                command_center_window,
+                full_width_window,
+                to_next_display,
+                equalize_column,
+                manage_window,
+                stack_windows_handler,
+                command_move_focus,
+                command_focus_unmanaged,
+                command_focus_managed,
+                command_raise_floating,
+                command_toggle_floating_layer,
+                command_swap_focus,
+                snap_window,
+            ),
+        )
+            .chain(),
     );
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn sync_os_focus_before_window_commands(
+    mut messages: MessageReader<Event>,
+    applications: Query<(Entity, &Application)>,
+    windows: Windows,
+    mut commands: Commands,
+) {
+    if !messages.read().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: Command::Window(_),
+            }
+        )
+    }) {
+        return;
+    }
+
+    let Some(entity) = os_focused_window_entity(&applications, &windows) else {
+        return;
+    };
+    if windows
+        .focused()
+        .is_some_and(|(_, focused)| focused == entity)
+    {
+        return;
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(FocusedMarker);
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -216,6 +253,28 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
             None
         }
     })
+}
+
+fn os_focused_window_entity(
+    applications: &Query<(Entity, &Application)>,
+    windows: &Windows,
+) -> Option<Entity> {
+    let mut frontmost = applications.iter().filter(|(_, app)| app.is_frontmost());
+    let (_, app) = frontmost.next()?;
+    if frontmost.next().is_some() {
+        return None;
+    }
+
+    let focused_id = app.focused_window_id().ok()?;
+    windows.find_parent(focused_id).map(|(_, entity, _)| entity)
+}
+
+fn command_target_window_entity(
+    applications: &Query<(Entity, &Application)>,
+    windows: &Windows,
+) -> Option<Entity> {
+    os_focused_window_entity(applications, windows)
+        .or_else(|| windows.focused().map(|(_, entity)| entity))
 }
 
 /// Retrieves a window `Entity` in a specified direction relative to a `current_window_id` within a `LayoutStrip`.
@@ -913,7 +972,12 @@ fn full_width_window(
 /// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
 /// * `commands` - Bevy commands to modify entities.
 #[allow(clippy::needless_pass_by_value)]
-fn manage_window(mut messages: MessageReader<Event>, windows: Windows, mut commands: Commands) {
+fn manage_window(
+    mut messages: MessageReader<Event>,
+    applications: Query<(Entity, &Application)>,
+    windows: Windows,
+    mut commands: Commands,
+) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Manage))
         .next()
         .is_none()
@@ -921,10 +985,11 @@ fn manage_window(mut messages: MessageReader<Event>, windows: Windows, mut comma
         return;
     }
 
-    let Some((window, entity, unmanaged)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
-    else {
+    let Some(entity) = command_target_window_entity(&applications, &windows) else {
+        return;
+    };
+
+    let Some((window, entity, unmanaged)) = windows.get_managed(entity) else {
         return;
     };
     debug!(
@@ -933,6 +998,7 @@ fn manage_window(mut messages: MessageReader<Event>, windows: Windows, mut comma
         unmanaged.is_some()
     );
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(FocusedMarker);
         if unmanaged.is_some() {
             entity_commands.try_remove::<Unmanaged>();
         } else {

@@ -657,6 +657,51 @@ fn test_application_activated_by_pid_normalizes_untracked_native_tab_focus() {
 }
 
 #[test]
+fn manage_command_uses_live_os_focus_when_ecs_focus_is_stale() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+    ];
+
+    let mut harness = TestHarness::new();
+    let mock_app = setup_process(harness.app.world_mut());
+    let focused_app = mock_app.clone();
+    let wm = MockWindowManager {
+        windows: window_spawner(2, harness.internal_queue.clone(), mock_app),
+        workspaces: vec![TEST_WORKSPACE_ID],
+        associated_windows: Vec::new(),
+    };
+
+    harness
+        .with_wm(wm)
+        .on_iteration(0, move |world| {
+            assert_focused!(world, 0);
+            focused_app.inner.write().unwrap().focused_id = Some(1);
+        })
+        .on_iteration(1, |world| {
+            assert_focused!(world, 1);
+
+            let mut windows = world.query::<(&Window, Option<&Unmanaged>)>();
+            let states = windows
+                .iter(world)
+                .map(|(window, unmanaged)| (window.id(), unmanaged.is_some()))
+                .collect::<Vec<_>>();
+
+            assert!(
+                states.iter().any(|(id, unmanaged)| *id == 1 && *unmanaged),
+                "live OS-focused window should be toggled unmanaged"
+            );
+            assert!(
+                states.iter().any(|(id, unmanaged)| *id == 0 && !*unmanaged),
+                "stale ECS-focused window should stay managed"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
 fn test_native_tab_focus_coalesces_tabs_into_one_virtual_workspace() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
