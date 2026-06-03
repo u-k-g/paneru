@@ -4,7 +4,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
-use bevy::math::{IRect, IVec2};
+use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{Level, instrument};
@@ -16,7 +16,6 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, MissionControlActive, Position, Scrolling, SendMessageTrigger,
-    focus_entity, snap_entity_position,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -41,7 +40,6 @@ impl Plugin for ScrollEventsPlugin {
                     apply_snap_force,
                     scrolling_integrator,
                     apply_scrolling_constraints,
-                    snap_three_finger_swipe,
                     swiping_timeout,
                 )
                     .chain(),
@@ -59,14 +57,12 @@ fn swipe_gesture(
         (Entity, &Position, Option<&mut Scrolling>),
         With<ActiveWorkspaceMarker>,
     >,
-    windows: Windows,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
-    let mut fingers_count = None;
     let mut touchpad_down = false;
     let mut has_scroll_event = false;
 
@@ -87,7 +83,6 @@ fn swipe_gesture(
             }
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
-                fingers_count = None;
                 has_scroll_event = true;
             }
             Event::Swipe { deltas }
@@ -96,7 +91,6 @@ fn swipe_gesture(
                     .is_none_or(|fingers| deltas.len() == fingers) =>
             {
                 total_delta += deltas.iter().sum::<f64>();
-                fingers_count = Some(deltas.len());
                 has_scroll_event = true;
             }
             _ => (),
@@ -108,13 +102,10 @@ fn swipe_gesture(
     }
 
     let (entity, position, scrolling) = &mut *active_workspace;
-    let focused_at_start = windows.focused().map(|(_, entity)| entity);
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
-        scrolling.fingers_count = None;
-        scrolling.started_focused = focused_at_start;
         scrolling.last_event = Instant::now();
     }
 
@@ -136,7 +127,6 @@ fn swipe_gesture(
             // Smoothen velocity changes using EMA.
             scrolling.velocity = 0.3 * new_velocity + 0.7 * scrolling.velocity;
             scrolling.is_user_swiping = true;
-            scrolling.fingers_count = fingers_count;
             scrolling.last_event = Instant::now();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
@@ -146,8 +136,6 @@ fn swipe_gesture(
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
                 is_user_swiping: touchpad_down,
-                fingers_count,
-                started_focused: focused_at_start,
                 last_event: Instant::now(),
             });
         }
@@ -156,158 +144,9 @@ fn swipe_gesture(
 
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
-fn snap_three_finger_swipe(
-    mut messages: MessageReader<Event>,
-    active_workspace: Single<
-        (Entity, &LayoutStrip, &Position, &mut Scrolling),
-        With<ActiveWorkspaceMarker>,
-    >,
-    active_display: ActiveDisplay,
-    windows: Windows,
-    config: Res<Config>,
-    mut commands: Commands,
-) {
-    if !messages
-        .read()
-        .any(|event| matches!(event, Event::TouchpadUp))
-    {
-        return;
-    }
-
-    let (strip_entity, strip, position, mut scrolling) = active_workspace.into_inner();
-    if scrolling.fingers_count != Some(3) {
-        return;
-    }
-
-    let viewport = active_display
-        .display()
-        .actual_display_bounds(active_display.dock(), &config);
-
-    if let Some(entity) = three_finger_release_target(
-        strip,
-        position.0,
-        scrolling.velocity,
-        scrolling.started_focused,
-        &viewport,
-        &windows,
-        &config,
-    ) {
-        if let Some(target) =
-            centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
-        {
-            scrolling.position = f64::from(target.x);
-            snap_entity_position(strip_entity, target, &mut commands);
-        }
-        scrolling.velocity = 0.0;
-        scrolling.is_user_swiping = false;
-        scrolling.fingers_count = None;
-        scrolling.started_focused = None;
-        commands.entity(strip_entity).remove::<Scrolling>();
-        focus_entity(entity, true, &mut commands);
-    }
-}
-
-fn three_finger_release_target(
-    strip: &LayoutStrip,
-    strip_position: IVec2,
-    velocity: f64,
-    started_focused: Option<Entity>,
-    viewport: &IRect,
-    windows: &Windows,
-    config: &Config,
-) -> Option<Entity> {
-    const MOMENTUM_SECONDS: f64 = 0.20;
-    const FLING_VELOCITY_THRESHOLD: f64 = 2.2;
-
-    let visible = most_visible_window(strip, strip_position, viewport, windows)?;
-
-    if velocity.abs() < FLING_VELOCITY_THRESHOLD {
-        return Some(visible);
-    }
-
-    let Some(started_focused) = started_focused.filter(|entity| strip.contains(*entity)) else {
-        return Some(visible);
-    };
-
-    let direction_modifier = match config.swipe_gesture_direction() {
-        SwipeGestureDirection::Natural => -1.0,
-        SwipeGestureDirection::Reversed => 1.0,
-    };
-    let projected_x = f64::from(strip_position.x)
-        + velocity * f64::from(viewport.width()) * direction_modifier * MOMENTUM_SECONDS;
-    let projected_position = IVec2::new(projected_x.round() as i32, strip_position.y);
-
-    let projected = most_visible_window(strip, projected_position, viewport, windows)?;
-    let start_index = strip.index_of(started_focused).ok()?;
-    let projected_index = strip.index_of(projected).ok()?;
-    let target = match projected_index.cmp(&start_index) {
-        std::cmp::Ordering::Less => strip
-            .left_neighbour(started_focused)
-            .unwrap_or(started_focused),
-        std::cmp::Ordering::Equal => started_focused,
-        std::cmp::Ordering::Greater => strip
-            .right_neighbour(started_focused)
-            .unwrap_or(started_focused),
-    };
-
-    Some(target)
-}
-
-fn centered_strip_position(
-    entity: Entity,
-    strip: &LayoutStrip,
-    current_position: IVec2,
-    viewport: &IRect,
-    windows: &Windows,
-    config: &Config,
-) -> Option<IVec2> {
-    let layout = windows.layout_position(entity)?;
-    let frame = windows.moving_frame(entity)?;
-    let target_x = viewport.center().x - (layout.0.x + frame.width() / 2);
-    let get_window_frame = |entity| windows.moving_frame(entity);
-    let clamped_x = clamp_viewport_offset(
-        target_x,
-        strip,
-        windows,
-        &get_window_frame,
-        viewport,
-        config,
-    )?;
-
-    Some(IVec2::new(clamped_x, current_position.y))
-}
-
-fn most_visible_window(
-    strip: &LayoutStrip,
-    strip_position: IVec2,
-    viewport: &IRect,
-    windows: &Windows,
-) -> Option<Entity> {
-    strip
-        .all_columns()
-        .into_iter()
-        .filter_map(|entity| {
-            let layout = windows.layout_position(entity)?;
-            let frame = windows.moving_frame(entity)?;
-            let visible_frame = IRect::from_corners(
-                layout.0 + strip_position,
-                layout.0 + strip_position + frame.size(),
-            );
-            let intersection = visible_frame.intersect(*viewport);
-            let area = intersection.width().max(0) * intersection.height().max(0);
-            (area > 0).then_some((entity, area))
-        })
-        .max_by_key(|(_, area)| *area)
-        .map(|(entity, _)| entity)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-#[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
-    strips: Populated<(Entity, &LayoutStrip, &Position, &mut Scrolling), With<LayoutStrip>>,
+    strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
     active_display: ActiveDisplay,
-    windows: Windows,
-    config: Res<Config>,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -317,26 +156,12 @@ pub(super) fn swiping_timeout(
     let dt = time.delta_secs_f64();
     let viewport_width = f64::from(active_display.bounds().width());
 
-    let viewport = active_display
-        .display()
-        .actual_display_bounds(active_display.dock(), &config);
-
-    for (strip_entity, strip, position, mut scroll) in strips {
+    for (entity, mut scroll) in strips {
         if scroll.last_event.elapsed() > FINGER_LIFT_THRESHOLD {
             scroll.is_user_swiping = false;
 
-            if config.auto_center()
-                && let Some(entity) = most_visible_window(strip, position.0, &viewport, &windows)
-                && let Some(target) =
-                    centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
-            {
-                scroll.position = f64::from(target.x);
-                snap_entity_position(strip_entity, target, &mut commands);
-                commands.entity(strip_entity).remove::<Scrolling>();
-            }
-
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX {
-                commands.entity(strip_entity).remove::<Scrolling>();
+                commands.entity(entity).remove::<Scrolling>();
             }
             if let Some(point) = window_manager.cursor_position() {
                 commands.trigger(SendMessageTrigger(Event::MouseMoved {

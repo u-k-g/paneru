@@ -10,7 +10,6 @@ use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
-use bevy::math::IVec2;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, error, instrument, trace, warn};
@@ -20,8 +19,8 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Scrolling, SelectedVirtualMarker, SendMessageTrigger, StrayFocusEvent,
-    focus_entity, reposition_entity, reshuffle_around, snap_entity_position,
+    ActiveWorkspaceMarker, Scrolling, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt,
+    StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -161,56 +160,19 @@ fn autocenter_window_on_focus(
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;
     }
+    if active_display.active_strip().tabbed(entity) {
+        return;
+    }
     if config.auto_center()
         && let Some((_, _, None)) = windows.get_managed(entity)
+        && let Some(size) = windows.size(entity)
+        && let Some(mut origin) = windows.origin(entity)
     {
-        if active_display.active_strip().contains(entity)
-            && let Some(target) =
-                centered_strip_position(entity, &windows, &active_display, &config)
-        {
-            snap_entity_position(active_display.active_strip_entity(), target, &mut commands);
-            return;
-        }
-
-        if let Some(size) = windows.size(entity)
-            && let Some(mut origin) = windows.origin(entity)
-        {
-            let center = active_display.bounds().center();
-            origin.x = center.x - size.x / 2;
-            reposition_entity(entity, origin, &mut commands);
-        }
+        let center = active_display.bounds().center();
+        origin.x = center.x - size.x / 2;
+        commands.reposition_entity(entity, origin);
     }
-    reshuffle_around(entity, &mut commands);
-}
-
-fn centered_strip_position(
-    entity: Entity,
-    windows: &Windows,
-    active_display: &ActiveDisplay,
-    config: &Config,
-) -> Option<IVec2> {
-    let strip = active_display.active_strip();
-    let layout = windows.layout_position(entity)?;
-    let size = windows.size(entity)?;
-    let viewport = active_display
-        .display()
-        .actual_display_bounds(active_display.dock(), config);
-    let target_x = viewport.center().x - (layout.0.x + size.x / 2);
-
-    let total_width = strip
-        .last()
-        .ok()
-        .and_then(|column| column.top())
-        .and_then(|last| windows.layout_position(last).zip(windows.size(last)))
-        .map(|(position, size)| position.0.x + size.x)?;
-
-    let x = if viewport.width() < total_width {
-        target_x.clamp(viewport.max.x - total_width, viewport.min.x)
-    } else {
-        target_x.clamp(viewport.min.x, viewport.max.x - total_width)
-    };
-
-    Some(IVec2::new(x, viewport.min.y))
+    commands.reshuffle_around(entity);
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -259,17 +221,13 @@ fn mouse_follows_focus(
             .map(Display::bounds)
     {
         let visible = display_bounds.intersect(frame);
-        let min_visible_width = (config.sliver_width() * 4).max(32);
-        if visible.width() < min_visible_width || visible.height() < 32 {
-            debug!(
-                "Suppressing center mouse for {}: visible frame too small {visible:?}",
-                window.id()
-            );
-            return;
+        // If the overlap is smaller than 50x50, the window is probably hidden
+        // off screen, so do not move the mouse.
+        if visible.size().length_squared() > 5000 {
+            let origin = visible.center();
+            debug!("centering on {} {origin}", window.id());
+            window_manager.warp_mouse(origin);
         }
-        let origin = visible.center();
-        debug!("centering on {} {origin}", window.id());
-        window_manager.warp_mouse(origin);
     }
 }
 
@@ -372,7 +330,7 @@ fn recover_lost_focus(
         .inspect_err(|err| error!("Unable to get current workspace: {err}"))
         && let Some(entity) = strip.first().ok().and_then(|col| col.top())
     {
-        focus_entity(entity, false, &mut commands);
+        commands.focus_entity(entity, false);
     }
 }
 

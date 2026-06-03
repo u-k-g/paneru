@@ -8,6 +8,7 @@ use bevy::ecs::component::Component;
 use bevy::math::IRect;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
+use mockall::automock;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanFalse, kCFBooleanTrue,
@@ -42,6 +43,7 @@ pub enum WindowPadding {
     Horizontal(i32),
 }
 
+#[automock]
 pub trait WindowApi: Send + Sync {
     fn id(&self) -> WinID;
     fn frame(&self) -> IRect;
@@ -528,7 +530,7 @@ impl WindowApi for WindowOS {
                 SLPSPostEventRecordTo(&focused_psn, event_bytes.as_ptr().cast());
             }
 
-            // Artificially delay the activation by 1ms. This is necessary because some
+            // Artificially delay the activation. This is necessary because some
             // applications appear to be confused if both of the events appear instantaneously.
             thread::sleep(Duration::from_millis(20));
 

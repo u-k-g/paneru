@@ -3,7 +3,7 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With, Without};
+use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::system::{Commands, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
@@ -22,13 +22,12 @@ use super::{
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, GlobalState, Windows};
+use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, LocateDockTrigger,
-    NativeTabAdoption, OsFocusReconcileReason, OsFocusState, OsFocusTarget, PendingCommandFocus,
-    Position, RestoreWindowState, Scrolling, SendMessageTrigger, VerifyWindowPosition, WidthRatio,
-    WindowProperties, focus_entity, reposition_entity, reshuffle_around, resize_entity,
+    Position, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    VerifyWindowPosition, WidthRatio, WindowProperties,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -42,360 +41,6 @@ use crate::util::symlink_target;
 fn update_passthrough(window: &Window, app: &Application, config: &Config) {
     let properties = WindowProperties::new(app, window, config);
     crate::platform::input::set_focused_passthrough(properties.passthrough_keys());
-}
-
-pub(super) fn normalize_focused_window_id(
-    app_entity: Entity,
-    app: &Application,
-    windows: &Windows,
-) -> crate::errors::Result<WinID> {
-    let focused_id = app.focused_window_id()?;
-    if windows
-        .find_parent(focused_id)
-        .is_some_and(|(_, _, parent)| parent == app_entity)
-    {
-        return Ok(focused_id);
-    }
-
-    let tracked_ids: Vec<_> = windows.ids_for_parent(app_entity).collect();
-    if tracked_ids.len() == 1 {
-        debug!(
-            "normalizing untracked focused window {focused_id} to only tracked app window {}",
-            tracked_ids[0]
-        );
-        return Ok(tracked_ids[0]);
-    }
-
-    let current_ids: Vec<_> = app
-        .window_list()
-        .into_iter()
-        .map(|window| window.id())
-        .collect();
-    let matching_ids: Vec<_> = tracked_ids
-        .iter()
-        .copied()
-        .filter(|id| current_ids.contains(id))
-        .collect();
-    if matching_ids.len() == 1 {
-        debug!(
-            "normalizing untracked focused window {focused_id} to current tracked app window {}",
-            matching_ids[0]
-        );
-        return Ok(matching_ids[0]);
-    }
-
-    Ok(focused_id)
-}
-
-fn normalize_focus_event_window_id(
-    window_id: WinID,
-    applications: &Query<(Entity, &Application)>,
-    windows: &Windows,
-) -> WinID {
-    if windows.find_parent(window_id).is_some() {
-        return window_id;
-    }
-
-    applications
-        .iter()
-        .filter(|(_, app)| app.is_frontmost())
-        .find_map(|(app_entity, app)| {
-            app.focused_window_id()
-                .is_ok_and(|focused_id| focused_id == window_id)
-                .then(|| normalize_focused_window_id(app_entity, app, windows).ok())
-                .flatten()
-        })
-        .unwrap_or(window_id)
-}
-
-fn adopt_untracked_focused_native_tab(
-    window_id: WinID,
-    applications: &Query<(Entity, &Application)>,
-    windows: &Windows,
-    commands: &mut Commands,
-) -> Option<Entity> {
-    applications
-        .iter()
-        .filter(|(_, app)| app.is_frontmost())
-        .find_map(|(app_entity, app)| {
-            if !app.focused_window_id().is_ok_and(|focused_id| focused_id == window_id) {
-                return None;
-            }
-
-            let mut tracked_ids = windows.ids_for_parent(app_entity);
-            let tracked_id = tracked_ids.next()?;
-            if tracked_ids.next().is_some() {
-                return None;
-            }
-
-            let (tracked_window, entity) = windows.find(tracked_id)?;
-            let focused_window = app.focused_window().ok()?;
-            debug!(
-                "adopting untracked focused native tab {window_id} into tracked entity {entity} previously {tracked_id}"
-            );
-            replace_tracked_native_tab(entity, tracked_window, focused_window, windows, commands);
-            Some(entity)
-        })
-}
-
-fn replace_tracked_native_tab(
-    entity: Entity,
-    tracked_window: &Window,
-    mut replacement: Window,
-    windows: &Windows,
-    commands: &mut Commands,
-) {
-    replacement.set_padding(WindowPadding::Horizontal(
-        tracked_window.horizontal_padding(),
-    ));
-    replacement.set_padding(WindowPadding::Vertical(tracked_window.vertical_padding()));
-    commands
-        .entity(entity)
-        .try_insert(NativeTabAdoption)
-        .try_insert(replacement);
-    if let Some(origin) = windows.origin(entity) {
-        reposition_entity(entity, origin, commands);
-    }
-    commands
-        .entity(entity)
-        .try_insert(VerifyWindowPosition::default());
-}
-
-fn native_tab_entities(
-    window_id: WinID,
-    entity: Entity,
-    parent: Entity,
-    app: &Application,
-    windows: &Windows,
-    window_manager: &WindowManager,
-) -> Vec<Entity> {
-    let mut associated_ids = window_manager.get_associated_windows(window_id);
-
-    // Newly-created native tabs can be visible from the existing tab's
-    // association list before the focused new tab reports the full group.
-    for peer_id in windows.ids_for_parent(parent) {
-        if peer_id == window_id || associated_ids.contains(&peer_id) {
-            continue;
-        }
-
-        if window_manager
-            .get_associated_windows(peer_id)
-            .contains(&window_id)
-        {
-            associated_ids.push(peer_id);
-        }
-    }
-
-    let current_app_window_ids: Vec<_> = app
-        .window_list()
-        .into_iter()
-        .map(|window| window.id())
-        .collect();
-    let missing_tracked_ids: Vec<_> = if current_app_window_ids.is_empty() {
-        Vec::new()
-    } else {
-        windows
-            .ids_for_parent(parent)
-            .filter(|peer_id| {
-                *peer_id != window_id
-                    && !associated_ids.contains(peer_id)
-                    && !current_app_window_ids.contains(peer_id)
-                    && windows.find(*peer_id).is_some_and(|(_, entity)| {
-                        windows
-                            .get_managed(entity)
-                            .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
-                    })
-            })
-            .collect()
-    };
-
-    // Native-tabbed apps may expose only the selected tab via AXWindows.
-    // If there is exactly one tracked same-app managed window missing from the
-    // current AX list, treat it as the inactive native tab for this focused tab.
-    if missing_tracked_ids.len() == 1 {
-        associated_ids.push(missing_tracked_ids[0]);
-    }
-
-    let focused_missing_from_ax_windows =
-        !current_app_window_ids.is_empty() && !current_app_window_ids.contains(&window_id);
-    if focused_missing_from_ax_windows {
-        let visible_tracked_ids: Vec<_> = windows
-            .ids_for_parent(parent)
-            .filter(|peer_id| {
-                *peer_id != window_id
-                    && !associated_ids.contains(peer_id)
-                    && current_app_window_ids.contains(peer_id)
-                    && windows.find(*peer_id).is_some_and(|(_, entity)| {
-                        windows
-                            .get_managed(entity)
-                            .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
-                    })
-            })
-            .collect();
-
-        // Native-tabbed apps can also report the previously selected native tab in
-        // AXWindows while the focused newly-created tab is not in that list yet.
-        if visible_tracked_ids.len() == 1 {
-            associated_ids.push(visible_tracked_ids[0]);
-        }
-    }
-
-    associated_ids
-        .into_iter()
-        .filter_map(|associated_id| windows.find(associated_id).map(|(_, entity)| entity))
-        .chain(std::iter::once(entity))
-        .fold(Vec::new(), |mut entities, entity| {
-            if !entities.contains(&entity) {
-                entities.push(entity);
-            }
-            entities
-        })
-}
-
-fn provisional_native_tab_peer(
-    window: &Window,
-    entity: Entity,
-    parent: Entity,
-    app: &Application,
-    windows: &Windows,
-    workspaces: &mut Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-) -> Option<Entity> {
-    if !app.is_frontmost()
-        || !app
-            .focused_window_id()
-            .is_ok_and(|focused_id| focused_id == window.id())
-    {
-        return None;
-    }
-
-    let (_, focused_entity) = windows.focused()?;
-    let focused = windows.get(focused_entity)?;
-    let (_, peer, peer_parent) = windows.find_parent(focused.id())?;
-    if peer_parent != parent || peer == entity {
-        return None;
-    }
-
-    let title_empty = window.title().is_ok_and(|title| title.is_empty());
-    let peer_already_tabbed = workspaces.iter().any(|(strip, _)| strip.tabbed(peer));
-    if !title_empty && !peer_already_tabbed {
-        return None;
-    }
-
-    // Native tab creation can arrive before association APIs settle. Empty
-    // focused same-app windows are provisional surfaces; non-empty windows get
-    // the same treatment only once this app already has a known tab group.
-    Some(peer)
-}
-
-fn schedule_focus_retry(commands: &mut Commands, app_entity: Option<Entity>) {
-    commands.spawn(RetryFrontSwitch::new(app_entity));
-}
-
-pub(super) fn reconcile_os_focus(
-    app_entity: Option<Entity>,
-    reason: OsFocusReconcileReason,
-    applications: &Query<(Entity, &Application)>,
-    windows: &Windows,
-    window_manager: &WindowManager,
-    config: &mut GlobalState,
-    mut os_focus: Option<&mut OsFocusState>,
-    commands: &mut Commands,
-    retry_on_ax_error: bool,
-) -> bool {
-    let resolved = app_entity
-        .and_then(|entity| applications.get(entity).ok())
-        .or_else(|| {
-            let mut frontmost = applications.iter().filter(|(_, app)| app.is_frontmost());
-            let first = frontmost.next()?;
-            frontmost.next().is_none().then_some(first)
-        });
-    let Some((app_entity, app)) = resolved else {
-        if let Some(os_focus) = os_focus.as_deref_mut() {
-            os_focus.reason = Some(reason);
-            os_focus.app_entity = None;
-            os_focus.pid = None;
-            os_focus.window_id = None;
-            os_focus.target = OsFocusTarget::UntrackedApp;
-        }
-        if retry_on_ax_error {
-            schedule_focus_retry(commands, None);
-        }
-        return false;
-    };
-
-    let Ok(focused_id) = normalize_focused_window_id(app_entity, app, windows).inspect_err(|err| {
-        warn!("can not get current focus during {reason:?}: {err}");
-    }) else {
-        if let Some(os_focus) = os_focus.as_deref_mut() {
-            os_focus.reason = Some(reason);
-            os_focus.app_entity = Some(app_entity);
-            os_focus.pid = Some(app.pid());
-            os_focus.window_id = None;
-            os_focus.target = OsFocusTarget::UntrackedWindow;
-        }
-        if retry_on_ax_error {
-            schedule_focus_retry(commands, Some(app_entity));
-        }
-        return false;
-    };
-
-    let Some((_, window_entity, _)) = windows.find_parent(focused_id) else {
-        if let Ok(window) = app.focused_window() {
-            debug!("adopting untracked focused window {focused_id} during {reason:?}");
-            commands.trigger(SpawnWindowTrigger(vec![window]));
-        }
-        if let Some(os_focus) = os_focus.as_deref_mut() {
-            os_focus.reason = Some(reason);
-            os_focus.app_entity = Some(app_entity);
-            os_focus.pid = Some(app.pid());
-            os_focus.window_id = Some(focused_id);
-            os_focus.target = OsFocusTarget::UntrackedWindow;
-        }
-        if retry_on_ax_error {
-            schedule_focus_retry(commands, Some(app_entity));
-        }
-        return false;
-    };
-
-    if let Some(os_focus) = os_focus.as_deref_mut() {
-        os_focus.reason = Some(reason);
-        os_focus.app_entity = Some(app_entity);
-        os_focus.pid = Some(app.pid());
-        os_focus.window_id = Some(focused_id);
-        os_focus.target = OsFocusTarget::ManagedWindow;
-    }
-
-    if let Some((_, _, Some(unmanaged))) = windows.get_managed(window_entity)
-        && !matches!(unmanaged, Unmanaged::Hidden)
-    {
-        if let Some(os_focus) = os_focus.as_deref_mut() {
-            os_focus.target = OsFocusTarget::UnmanagedWindow;
-        }
-        return true;
-    }
-
-    if let Some(point) = window_manager.cursor_position()
-        && window_manager
-            .find_window_at_point(&point)
-            .is_ok_and(|window_id| window_id != focused_id)
-    {
-        // Window got focus without mouse movement - probably Cmd-Tab, Dock,
-        // Raycast, file-open activation, or another external focus path.
-        config.set_skip_reshuffle(false);
-        config.set_ffm_flag(None);
-    }
-
-    if windows
-        .focused()
-        .is_some_and(|(_, focused_entity)| focused_entity == window_entity)
-    {
-        return true;
-    }
-
-    commands.trigger(SendMessageTrigger(Event::WindowFocused {
-        window_id: focused_id,
-    }));
-    true
 }
 
 /// Handles the event when an application switches to the front. It updates the focused window and PSN.
@@ -412,83 +57,67 @@ pub(super) fn reconcile_os_focus(
 pub(super) fn front_switched_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, &Children)>,
-    applications: Query<(Entity, &Application)>,
-    windows: Windows,
+    applications: Query<&Application>,
     window_manager: Res<WindowManager>,
     mut config: GlobalState,
-    mut os_focus: Option<ResMut<OsFocusState>>,
     mut commands: Commands,
 ) {
+    const FRONT_SWITCH_RETRY_SEC: u64 = 2;
     for event in messages.read() {
-        let Some((app_entity, app_name, reason)) = (match event {
-            Event::ApplicationFrontSwitched { psn, pid } => {
-                let process = pid
-                    .and_then(|pid| processes.iter().find(|(process, _)| process.0.pid() == pid))
-                    .or_else(|| processes.iter().find(|process| &process.0.psn() == psn));
-                let Some((BProcess(process), children)) = process else {
-                    error!("Unable to find process with PSN {psn:?} or pid {pid:?}");
-                    continue;
-                };
-
-                if children.len() > 1 {
-                    warn!("Multiple apps registered to process '{}'.", process.name());
-                }
-                let Some(&app_entity) = children.first() else {
-                    error!("No application for process '{}'.", process.name());
-                    continue;
-                };
-                let Some((_, _)) = applications.get(app_entity).ok() else {
-                    error!("No application for process '{}'.", process.name());
-                    continue;
-                };
-
-                Some((
-                    Some(app_entity),
-                    process.name(),
-                    OsFocusReconcileReason::FrontSwitched,
-                ))
-            }
-            Event::ApplicationActivated { pid } => applications
-                .iter()
-                .find(|(_, app)| app.pid() == *pid)
-                .map(|(app_entity, app)| {
-                    (
-                        Some(app_entity),
-                        app.name(),
-                        OsFocusReconcileReason::AppActivated,
-                    )
-                }),
-            Event::ApplicationVisible { pid } => applications
-                .iter()
-                .find(|(_, app)| app.pid() == *pid)
-                .map(|(app_entity, app)| {
-                    (
-                        Some(app_entity),
-                        app.name(),
-                        OsFocusReconcileReason::AppVisible,
-                    )
-                }),
-            Event::WindowCreated { .. } => {
-                Some((None, "frontmost", OsFocusReconcileReason::WindowCreated))
-            }
-            _ => continue,
-        }) else {
-            warn!("Unable to find application for OS focus event.");
+        let Event::ApplicationFrontSwitched { psn } = event else {
             continue;
         };
 
-        debug!("front switching process: {app_name}");
-        reconcile_os_focus(
-            app_entity,
-            reason,
-            &applications,
-            &windows,
-            &window_manager,
-            &mut config,
-            os_focus.as_deref_mut(),
-            &mut commands,
-            true,
-        );
+        let Some((BProcess(process), children)) =
+            processes.iter().find(|process| &process.0.psn() == psn)
+        else {
+            error!("Unable to find process with PSN {psn:?}");
+            continue;
+        };
+
+        if children.len() > 1 {
+            warn!("Multiple apps registered to process '{}'.", process.name());
+        }
+        let Some(&app_entity) = children.first() else {
+            error!("No application for process '{}'.", process.name());
+            continue;
+        };
+        let Some(app) = applications.get(app_entity).ok() else {
+            error!("No application for process '{}'.", process.name());
+            continue;
+        };
+
+        debug!("front switching process: {}", process.name());
+
+        if let Ok(focused_id) = app.focused_window_id().inspect_err(|err| {
+            warn!("can not get current focus: {err}");
+        }) {
+            if let Some(point) = window_manager.cursor_position()
+                && window_manager
+                    .find_window_at_point(&point)
+                    .is_ok_and(|window_id| window_id != focused_id)
+            {
+                // Window got focus without mouse movement - probably with a Cmd-Tab.
+                // If so, bring it into view.
+                config.set_skip_reshuffle(false);
+                config.set_ffm_flag(None);
+            }
+            commands.trigger(SendMessageTrigger(Event::WindowFocused {
+                window_id: focused_id,
+            }));
+        } else {
+            // Transient AX error (e.g. kAXErrorCannotComplete during app transitions).
+            // Schedule a retry to query the focused window once the app is ready.
+            let timeout = Timeout::new(
+                Duration::from_secs(FRONT_SWITCH_RETRY_SEC),
+                Some(format!(
+                    "Front switch retry for '{}' timed out.",
+                    process.name()
+                )),
+                &mut commands,
+            );
+            commands.spawn((timeout, RetryFrontSwitch(app_entity)));
+        }
     }
 }
 
@@ -550,12 +179,10 @@ pub(super) fn theme_change_trigger(
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
-    applications: Query<(Entity, &Application)>,
+    applications: Query<&Application>,
     windows: Windows,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
-    mut pending_command_focus: Option<ResMut<PendingCommandFocus>>,
     config: Res<Config>,
     global_state: GlobalState,
     mut commands: Commands,
@@ -567,20 +194,7 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
-        if windows.find_parent(window_id).is_none()
-            && adopt_untracked_focused_native_tab(window_id, &applications, &windows, &mut commands)
-                .is_some()
-        {
-            commands.trigger(SendMessageTrigger(Event::WindowFocused { window_id }));
-            continue;
-        }
-
-        let Some((window, entity, parent)) = windows.find_parent(window_id).or_else(|| {
-            let normalized = normalize_focus_event_window_id(window_id, &applications, &windows);
-            (normalized != window_id)
-                .then(|| windows.find_parent(normalized))
-                .flatten()
-        }) else {
+        let Some((window, entity, parent)) = windows.find_parent(window_id) else {
             let timeout = Timeout::new(
                 Duration::from_secs(STRAY_FOCUS_RETRY_SEC),
                 None,
@@ -590,29 +204,10 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
-        let Ok((_, app)) = applications.get(parent) else {
+        let Ok(app) = applications.get(parent) else {
             warn!("Unable to get parent for window {}.", window.id());
             continue;
         };
-
-        if let Some(pending) = pending_command_focus.as_deref_mut() {
-            if pending.target == entity {
-                commands.remove_resource::<PendingCommandFocus>();
-            } else if pending.source_entities.contains(&entity) {
-                pending.remaining_source_bounces =
-                    pending.remaining_source_bounces.saturating_sub(1);
-                debug!(
-                    "Ignoring command-focus bounce back to native tab source {entity}; target={}",
-                    pending.target
-                );
-                if pending.remaining_source_bounces == 0 {
-                    commands.remove_resource::<PendingCommandFocus>();
-                }
-                continue;
-            } else {
-                commands.remove_resource::<PendingCommandFocus>();
-            }
-        }
 
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys
@@ -648,9 +243,6 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        let mut native_tab_entities =
-            native_tab_entities(window_id, entity, parent, app, &windows, &window_manager);
-
         // Handle tab switching: if the focused window is a tab, make it the leader.
         // Also reactivate the owning virtual strip before treating duplicate
         // focus as a no-op; the focus marker can be stale on a hidden strip.
@@ -664,11 +256,6 @@ pub(super) fn window_focused_trigger(
                 active_workspace_id = Some(strip.id());
             }
             if owner.is_none() && strip.contains(entity) {
-                for tab_entity in strip.tab_group(entity).unwrap_or_default() {
-                    if !native_tab_entities.contains(&tab_entity) {
-                        native_tab_entities.push(tab_entity);
-                    }
-                }
                 if let Ok(index) = strip.index_of(entity)
                     && let Some(column) = strip.get_column_mut(index)
                 {
@@ -676,32 +263,6 @@ pub(super) fn window_focused_trigger(
                 }
                 owning_workspace_id = Some(strip.id());
                 owner = Some((strip_entity, active));
-            }
-        }
-
-        if native_tab_entities.len() > 1
-            && let Some((owner_entity, _)) = owner
-        {
-            for (strip_entity, mut strip, _) in &mut workspaces {
-                if strip_entity != owner_entity {
-                    for tab_entity in &native_tab_entities {
-                        strip.remove(*tab_entity);
-                    }
-                }
-            }
-
-            if let Ok((_, mut owner_strip, _)) = workspaces.get_mut(owner_entity) {
-                for tab_entity in &native_tab_entities {
-                    if *tab_entity != entity {
-                        owner_strip.remove(*tab_entity);
-                        _ = owner_strip.convert_to_tabs(entity, *tab_entity);
-                    }
-                }
-                if let Ok(index) = owner_strip.index_of(entity)
-                    && let Some(column) = owner_strip.get_column_mut(index)
-                {
-                    column.move_to_front(entity);
-                }
             }
         }
 
@@ -723,11 +284,8 @@ pub(super) fn window_focused_trigger(
         }
 
         if already_focused {
-            if native_tab_entities.len() > 1 {
-                continue;
-            }
             if !global_state.skip_reshuffle() && !global_state.initializing() {
-                reshuffle_around(entity, &mut commands);
+                commands.reshuffle_around(entity);
             }
             continue;
         }
@@ -1004,8 +562,8 @@ pub(super) fn window_unmanaged_trigger(
             let y = (f64::from(display_bounds.height()) * ry) as i32;
             let w = (f64::from(display_bounds.width()) * rw) as i32;
             let h = (f64::from(display_bounds.height()) * rh) as i32;
-            reposition_entity(entity, Origin::new(x, y), &mut commands);
-            resize_entity(entity, Size::new(w, h), &mut commands);
+            commands.reposition_entity(entity, Origin::new(x, y));
+            commands.resize_entity(entity, Size::new(w, h));
         } else if !properties.floating() {
             let max_width = display_bounds.width() * UNMANAGED_MAX_SCREEN_RATIO_NUM
                 / UNMANAGED_MAX_SCREEN_RATIO_DEN;
@@ -1022,14 +580,13 @@ pub(super) fn window_unmanaged_trigger(
                 offset_frame_within_bounds(target_frame, display_bounds, UNMANAGED_POP_OFFSET);
 
             if target_frame.size() != frame.size() {
-                resize_entity(
+                commands.resize_entity(
                     entity,
                     Size::new(target_frame.width(), target_frame.height()),
-                    &mut commands,
                 );
             }
             if target_frame.min != frame.min {
-                reposition_entity(entity, target_frame.min, &mut commands);
+                commands.reposition_entity(entity, target_frame.min);
             }
         }
     }
@@ -1130,7 +687,7 @@ pub(super) fn window_managed_trigger(
             let padded_width = display_bounds.width() - pad_left - pad_right;
             let width = (f64::from(padded_width) * width_ratio).round() as i32;
             let height = display_bounds.height();
-            resize_entity(entity, Size::new(width, height), &mut commands);
+            commands.resize_entity(entity, Size::new(width, height));
         }
 
         insert_at = properties.insertion().or(insert_at);
@@ -1175,13 +732,13 @@ pub(super) fn window_managed_trigger(
     }
 
     if let Some(origin) = windows.origin(entity) {
-        reposition_entity(entity, origin, &mut commands);
+        commands.reposition_entity(entity, origin);
     }
     commands
         .entity(entity)
         .try_insert(VerifyWindowPosition::default())
         .try_remove::<PreviousManagedStrip>();
-    reshuffle_around(entity, &mut commands);
+    commands.reshuffle_around(entity);
 }
 
 /// Handles the event when a window is destroyed. The windows itself is not removed from the layout
@@ -1223,35 +780,6 @@ pub(super) fn window_destroyed_trigger(
             error!("Window {} has no parent!", window.id());
             continue;
         };
-
-        let mut tracked_ids = windows.ids_for_parent(parent);
-        let only_tracked_app_window =
-            tracked_ids.next().is_some_and(|id| id == *window_id) && tracked_ids.next().is_none();
-        if only_tracked_app_window {
-            let replacement = app
-                .focused_window()
-                .ok()
-                .filter(|replacement| replacement.id() != *window_id)
-                .or_else(|| {
-                    app.window_list()
-                        .into_iter()
-                        .find(|replacement| replacement.id() != *window_id)
-                });
-
-            if let Some(replacement) = replacement {
-                let replacement_id = replacement.id();
-                debug!(
-                    "replacing destroyed native tab {window_id} in entity {entity} with {replacement_id}"
-                );
-                app.unobserve_window(window);
-                if app.observe_window(&replacement).is_err() {
-                    debug!("Error observing replacement native tab {replacement_id}.");
-                }
-                replace_tracked_native_tab(entity, window, replacement, &windows, &mut commands);
-                continue;
-            }
-        }
-
         app.unobserve_window(window);
 
         give_away_focus(
@@ -1318,7 +846,7 @@ fn give_away_focus(
         // window closed/hid, so window_focused_trigger's frontmost/focused
         // guards would reject a fabricated event. focus_entity calls the
         // AX API to raise the neighbour and inserts FocusedMarker directly.
-        focus_entity(neighbour, true, commands);
+        commands.focus_entity(neighbour, true);
     }
 }
 
@@ -1336,9 +864,9 @@ fn give_away_focus(
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn spawn_window_trigger(
     mut trigger: On<SpawnWindowTrigger>,
-    windows: Query<(&Window, Entity, &ChildOf)>,
+    windows: Query<&Window>,
     mut apps: Query<(Entity, &mut Application)>,
-    active_display: ActiveDisplayMut,
+    active_display: ActiveDisplay,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     mut commands: Commands,
@@ -1348,7 +876,7 @@ pub(super) fn spawn_window_trigger(
     while let Some(mut window) = new_windows.pop() {
         let window_id = window.id();
 
-        if windows.iter().any(|window| window.0.id() == window_id) {
+        if windows.iter().any(|window| window.id() == window_id) {
             continue;
         }
 
@@ -1361,26 +889,22 @@ pub(super) fn spawn_window_trigger(
             continue;
         };
 
-        debug!(
-            "created {} title: {} role: {} subrole: {} element: {}",
-            window_id,
-            window.title().unwrap_or_default(),
-            window.role().unwrap_or_default(),
-            window.subrole().unwrap_or_default(),
-            window
+        if tracing::enabled!(Level::DEBUG) {
+            let title = window.title().unwrap_or_default();
+            let role = window.role().unwrap_or_default();
+            let subrole = window.subrole().unwrap_or_default();
+            let element = window
                 .element()
                 .map(|element| format!("{element}"))
-                .unwrap_or_default(),
-        );
+                .unwrap_or_default();
+            debug!(
+                "created {window_id} title: {title} role: {role} subrole: {subrole} element: {element}",
+            );
+        }
 
         if app.observe_window(&window).is_err() {
             warn!("Error observing window {window_id}.");
         }
-        debug!(
-            "window {} title: {}",
-            window_id,
-            window.title().unwrap_or_default()
-        );
 
         // update_frame expands the OS rect by the per-window padding, so calling it *after*
         // set_padding produces the correct logical frame for the ECS components below.
@@ -1412,10 +936,7 @@ pub(super) fn spawn_window_trigger(
 
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn apply_window_defaults(
-    added: Populated<
-        (&mut Window, &mut Position, &mut Bounds, &ChildOf),
-        (Added<Window>, Without<NativeTabAdoption>),
-    >,
+    added: Populated<(&mut Window, &mut Position, &mut Bounds, &ChildOf), Added<Window>>,
     apps: Query<(Entity, &Application)>,
     active_display: ActiveDisplay,
     config: Res<Config>,
@@ -1477,11 +998,10 @@ pub(super) fn apply_window_defaults(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn apply_window_positions(
-    added: Populated<Entity, (Added<Window>, Without<NativeTabAdoption>)>,
+    added: Populated<Entity, Added<Window>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
-    window_manager: Res<WindowManager>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
@@ -1515,46 +1035,21 @@ pub(super) fn apply_window_positions(
         }
 
         // During startup, the window is already inserted into some strip.
-        let already_inserted = workspaces.iter().any(|(strip, _)| strip.contains(entity));
+        let allready_inserted = workspaces
+            .iter_mut()
+            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
         let properties = WindowProperties::new(app, window, &config);
 
         if properties.floating() {
             // Avoid managing window if it's floating.
             commands.entity(entity).try_insert(Unmanaged::Floating);
-            if already_inserted {
-                for (mut strip, _) in &mut workspaces {
-                    strip.remove(entity);
-                }
+            if let Some(mut strip) = allready_inserted {
+                strip.remove(entity);
             }
             continue;
         }
 
-        if !already_inserted {
-            let tab_entities =
-                native_tab_entities(window.id(), entity, parent, app, &windows, &window_manager);
-            let mut tab_peer = tab_entities.into_iter().find(|tab| *tab != entity);
-            if tab_peer.is_none() {
-                tab_peer = provisional_native_tab_peer(
-                    window,
-                    entity,
-                    parent,
-                    app,
-                    &windows,
-                    &mut workspaces,
-                );
-            }
-            if let Some(tab_peer) = tab_peer
-                && let Some(mut strip) = workspaces
-                    .iter_mut()
-                    .find_map(|(strip, _)| strip.contains(tab_peer).then_some(strip))
-            {
-                debug!("New native tab {entity} attaching to existing tab {tab_peer}");
-                _ = strip.convert_to_tabs(tab_peer, entity);
-                continue;
-            }
-        }
-
-        if !already_inserted
+        if allready_inserted.is_none()
             && let Some(mut strip) = workspaces
                 .iter_mut()
                 .find_map(|(strip, active)| active.then_some(strip))
@@ -1593,7 +1088,7 @@ pub(super) fn apply_window_positions(
                         "Not focusing new window {entity}, keeping focus on '{}'",
                         focus.title().unwrap_or_default()
                     );
-                    focus_entity(prev, true, &mut commands);
+                    commands.focus_entity(prev, true);
                 }
             } else {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");
@@ -1683,15 +1178,9 @@ pub(super) fn refresh_configuration_trigger(
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    native_tab_adoptions: Query<(), With<NativeTabAdoption>>,
     mut workspaces: Query<&mut LayoutStrip>,
 ) {
     let entity = trigger.event().entity;
-
-    if native_tab_adoptions.get(entity).is_ok() {
-        debug!("Ignoring Window removal for native-tab adoption {entity}");
-        return;
-    }
 
     if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
         debug!(
@@ -1699,15 +1188,6 @@ pub(super) fn window_removal_trigger(
             strip.id()
         );
         strip.remove(entity);
-    }
-}
-
-pub(super) fn cleanup_native_tab_adoption(
-    adoptions: Query<Entity, With<NativeTabAdoption>>,
-    mut commands: Commands,
-) {
-    for entity in &adoptions {
-        commands.entity(entity).try_remove::<NativeTabAdoption>();
     }
 }
 

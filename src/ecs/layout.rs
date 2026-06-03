@@ -6,19 +6,18 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Populated, Query, Res};
+use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
 use bevy::ecs::world::Ref;
 use bevy::math::IRect;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use stdext::function_name;
 use tracing::{Level, instrument, trace};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, FocusedMarker, Initializing,
-    LayoutPosition, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
-    reposition_entity,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
+    Position, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Window};
@@ -34,8 +33,8 @@ impl Plugin for LayoutEventsPlugin {
                 // Wait for finish_setup before tiling: until then every window
                 // sits in the active strip regardless of its real display.
                 (
+                    sync_tab_group_frames,
                     layout_sizes_changed,
-                    sync_focused_tab_leader,
                     layout_strip_changed,
                     reshuffle_layout_strip,
                     ensure_visible_in_strip,
@@ -47,23 +46,6 @@ impl Plugin for LayoutEventsPlugin {
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-#[instrument(level = Level::TRACE, skip_all)]
-fn sync_focused_tab_leader(
-    focused: Query<Entity, With<FocusedMarker>>,
-    mut strips: Query<&mut LayoutStrip>,
-) {
-    let Ok(focused) = focused.single() else {
-        return;
-    };
-
-    for mut strip in &mut strips {
-        if strip.tabbed(focused) {
-            strip.move_to_front(focused);
-        }
     }
 }
 
@@ -109,7 +91,7 @@ pub enum Column {
     Single(Entity),
     /// A panel containing a stack of items (windows or tabs), ordered from top to bottom.
     Stack(Vec<StackItem>),
-    /// A panel containing a group of native tabs, with the active "Leader" at the front.
+    /// A panel containing a group of native tabs.
     Tabs(Vec<Entity>),
     Fullscren(Entity),
 }
@@ -147,25 +129,14 @@ impl Column {
         }
     }
 
-    /// Moves the specified entity to the front of the vector (index 0).
-    /// This is used to change the Leader of a Tab group.
+    /// Moves the specified entity to the front of stack-local ordering.
+    /// Native tab ordering is stable; the focused tab is tracked by `FocusedMarker`.
     pub fn move_to_front(&mut self, entity: Entity) {
-        match self {
-            Column::Single(_) | Column::Fullscren(_) => {}
-            Column::Stack(stack) => {
-                if let Some(StackItem::Tabs(tabs)) =
-                    stack.iter_mut().find(|item| item.contains(entity))
-                    && let Some(pos) = tabs.iter().position(|&e| e == entity)
-                {
-                    tabs.swap(0, pos);
-                }
-            }
-            Column::Tabs(tabs) => {
-                if let Some(pos) = tabs.iter().position(|&e| e == entity) {
-                    tabs.swap(0, pos);
-                }
-            }
-        }
+        debug_assert!(match self {
+            Column::Single(id) | Column::Fullscren(id) => *id == entity,
+            Column::Stack(stack) => stack.iter().any(|item| item.contains(entity)),
+            Column::Tabs(tabs) => tabs.contains(&entity),
+        });
     }
 }
 
@@ -258,13 +229,57 @@ impl LayoutStrip {
         self.columns.push_back(Column::Single(entity));
     }
 
+    pub fn append_tab_group(&mut self, entities: &[Entity]) {
+        let mut group = Vec::new();
+        for entity in entities {
+            if !group.contains(entity) {
+                group.push(*entity);
+            }
+        }
+        if group.is_empty() {
+            return;
+        }
+
+        let index = group
+            .iter()
+            .filter_map(|entity| self.index_of(*entity).ok())
+            .min()
+            .unwrap_or(self.len());
+
+        for entity in &group {
+            self.remove(*entity);
+        }
+
+        let index = index.min(self.len());
+        if group.len() == 1 {
+            self.insert_at(index, group[0]);
+        } else if index >= self.len() {
+            self.columns.push_back(Column::Tabs(group));
+        } else {
+            self.columns.insert(index, Column::Tabs(group));
+        }
+    }
+
     /// Converts a column containing `leader` to a `Tabs` column and adds `follower`.
     pub fn convert_to_tabs(&mut self, leader: Entity, follower: Entity) -> Result<()> {
-        if leader == follower {
-            return Ok(());
+        // Validate that the leader exists before touching anything else.
+        let leader_index = self.index_of(leader)?;
+
+        // The follower may already live in its own column (e.g. when
+        // `detect_tabbed_windows` runs after `spawn_window_trigger` has
+        // already appended the new window). Drop that orphan column first
+        // so the follower isn't left in two places after the merge —
+        // otherwise `index_of(follower)` picks the Tabs column and
+        // `right_neighbour` returns the duplicate, self-looping focus.
+        if let Ok(follower_index) = self.index_of(follower)
+            && follower_index != leader_index
+        {
+            self.remove(follower);
         }
+
         let index = self.index_of(leader)?;
         let column = self.columns.remove(index).unwrap();
+        self.remove(follower);
         match column {
             Column::Single(id) | Column::Fullscren(id) => {
                 self.columns.insert(index, Column::Tabs(vec![id, follower]));
@@ -293,17 +308,6 @@ impl LayoutStrip {
             }
         }
         Ok(())
-    }
-
-    pub fn tab_group(&self, entity: Entity) -> Option<Vec<Entity>> {
-        self.columns.iter().find_map(|column| match column {
-            Column::Tabs(tabs) if tabs.contains(&entity) => Some(tabs.clone()),
-            Column::Stack(items) => items.iter().find_map(|item| match item {
-                StackItem::Tabs(tabs) if tabs.contains(&entity) => Some(tabs.clone()),
-                StackItem::Single(_) | StackItem::Tabs(_) => None,
-            }),
-            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => None,
-        })
     }
 
     /// Removes a window ID from the pane.
@@ -553,14 +557,6 @@ impl LayoutStrip {
         self.columns.get_mut(index)
     }
 
-    pub fn move_to_front(&mut self, entity: Entity) {
-        if let Ok(index) = self.index_of(entity)
-            && let Some(column) = self.get_column_mut(index)
-        {
-            column.move_to_front(entity);
-        }
-    }
-
     pub fn all_columns(&self) -> Vec<Entity> {
         self.columns.iter().filter_map(Column::top).collect()
     }
@@ -692,6 +688,19 @@ impl LayoutStrip {
             .is_ok_and(|t| t)
     }
 
+    pub fn tab_group(&self, entity: Entity) -> Option<Vec<Entity>> {
+        self.columns.iter().find_map(|column| match column {
+            Column::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => Some(tabs.clone()),
+            Column::Stack(items) => items.iter().find_map(|item| match item {
+                StackItem::Tabs(tabs) if tabs.contains(&entity) && tabs.len() > 1 => {
+                    Some(tabs.clone())
+                }
+                StackItem::Single(_) | StackItem::Tabs(_) => None,
+            }),
+            Column::Single(_) | Column::Fullscren(_) | Column::Tabs(_) => None,
+        })
+    }
+
     pub fn is_fullscreen(&self) -> bool {
         self.columns
             .front()
@@ -762,6 +771,47 @@ fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Optio
     }
 
     Some(output)
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn sync_tab_group_frames(
+    mut windows: ParamSet<(
+        Query<
+            (Entity, &Position, &Bounds),
+            (With<Window>, Or<(Changed<Bounds>, Changed<Position>)>),
+        >,
+        Query<(&mut Position, &mut Bounds), With<Window>>,
+    )>,
+    workspaces: Query<&LayoutStrip>,
+) {
+    let updates = windows
+        .p0()
+        .into_iter()
+        .filter_map(|(entity, Position(position), Bounds(bounds))| {
+            workspaces
+                .iter()
+                .find_map(|strip| strip.tab_group(entity))
+                .map(move |tab_group| {
+                    tab_group.into_iter().filter_map(move |sibling| {
+                        (sibling != entity).then_some((sibling, (*position, *bounds)))
+                    })
+                })
+        })
+        .flatten()
+        .collect::<HashMap<_, _>>();
+
+    for (entity, (source_position, source_bounds)) in updates {
+        let mut write_windows = windows.p1();
+        if let Ok((mut position, mut bounds)) = write_windows.get_mut(entity) {
+            if position.0 != source_position {
+                position.0 = source_position;
+            }
+            if bounds.0 != source_bounds {
+                bounds.0 = source_bounds;
+            }
+        }
+    }
 }
 
 /// Watches for size changes to windows and if they are changed, signals to the layout strip.
@@ -915,7 +965,7 @@ fn reshuffle_layout_strip(
         }
 
         trace!("reshuffle_layout_strip: triggered for entity {entity}, offset {strip_position}");
-        reposition_entity(strip_entity, strip_position, &mut commands);
+        commands.reposition_entity(strip_entity, strip_position);
     });
 }
 
@@ -964,7 +1014,7 @@ fn ensure_visible_in_strip(
         }
         let strip_target = (clamped_min - layout_position.0).with_y(strip_position.0.y);
         trace!("ensure_visible_in_strip: entity {entity}, scroll strip to {strip_target}");
-        reposition_entity(strip_entity, strip_target, &mut commands);
+        commands.reposition_entity(strip_entity, strip_target);
     }
 }
 
@@ -1233,7 +1283,7 @@ fn position_layout_windows(
                     entity_commands.try_remove::<RepositionMarker>();
                 }
             } else {
-                reposition_entity(entity, frame.min, &mut commands);
+                commands.reposition_entity(entity, frame.min);
             }
         }
     }
@@ -1368,23 +1418,6 @@ mod tests {
 
         let out = binpack_heights(&heights, MIN_HEIGHT, 390);
         assert_eq!(out, None);
-    }
-
-    #[test]
-    fn focused_native_tab_becomes_column_leader_before_layout() {
-        let (mut world, mut strip, entities) = setup_world_and_strip();
-        strip.convert_to_tabs(entities[0], entities[1]).unwrap();
-
-        world.entity_mut(entities[1]).insert(FocusedMarker);
-        world.spawn(strip);
-
-        let mut schedule = Schedule::default();
-        schedule.add_systems(sync_focused_tab_leader);
-        schedule.run(&mut world);
-
-        let mut strips = world.query::<&LayoutStrip>();
-        let strip = strips.single(&world).unwrap();
-        assert_eq!(strip.get(0).unwrap().top(), Some(entities[1]));
     }
 
     #[test]
@@ -1746,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_leader_rotation() {
+    fn test_tab_order_stays_stable_when_focus_changes() {
         let mut world = World::new();
         let e1 = world.spawn_empty().id();
         let e2 = world.spawn_empty().id();
@@ -1755,19 +1788,17 @@ mod tests {
         let mut column = Column::Tabs(vec![e1, e2, e3]);
         assert_eq!(column.top(), Some(e1));
 
-        // Move e2 to front (new leader)
         column.move_to_front(e2);
-        assert_eq!(column.top(), Some(e2));
+        assert_eq!(column.top(), Some(e1));
         match column {
-            Column::Tabs(ref tabs) => assert_eq!(tabs, &vec![e2, e1, e3]),
+            Column::Tabs(ref tabs) => assert_eq!(tabs, &vec![e1, e2, e3]),
             _ => panic!(),
         }
 
-        // Move e3 to front
         column.move_to_front(e3);
-        assert_eq!(column.top(), Some(e3));
+        assert_eq!(column.top(), Some(e1));
         match column {
-            Column::Tabs(ref tabs) => assert_eq!(tabs, &vec![e3, e1, e2]),
+            Column::Tabs(ref tabs) => assert_eq!(tabs, &vec![e1, e2, e3]),
             _ => panic!(),
         }
     }
@@ -1805,6 +1836,80 @@ mod tests {
     }
 
     #[test]
+    fn test_tab_group_returns_all_siblings() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let e3 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e1);
+        strip.convert_to_tabs(e1, e2).unwrap();
+        strip.append(e3);
+
+        assert_eq!(strip.tab_group(e1), Some(vec![e1, e2]));
+        assert_eq!(strip.tab_group(e2), Some(vec![e1, e2]));
+        assert_eq!(strip.tab_group(e3), None);
+    }
+
+    #[test]
+    fn test_append_tab_group_merges_existing_members_without_duplicate_columns() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let e3 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e2);
+        strip.append(e3);
+
+        strip.append_tab_group(&[e1, e2]);
+
+        assert_eq!(strip.len(), 2);
+        match strip.get(0).unwrap() {
+            Column::Tabs(tabs) => assert_eq!(tabs, vec![e1, e2]),
+            _ => panic!("Expected merged Tabs column"),
+        }
+        assert_eq!(strip.index_of(e1).unwrap(), 0);
+        assert_eq!(strip.index_of(e2).unwrap(), 0);
+        assert_eq!(strip.index_of(e3).unwrap(), 1);
+        assert_eq!(strip.all_windows(), vec![e1, e2, e3]);
+    }
+
+    #[test]
+    fn test_tab_relative_positions_use_stable_slot_representative() {
+        let mut world = World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(e1);
+        strip.convert_to_tabs(e1, e2).unwrap();
+        strip
+            .get_column_mut(0)
+            .expect("tab column")
+            .move_to_front(e2);
+
+        let get_window_frame = |entity| {
+            if entity == e1 {
+                Some(IRect::new(0, 0, 300, 600))
+            } else {
+                Some(IRect::new(900, 0, 1200, 400))
+            }
+        };
+
+        let out = strip
+            .relative_positions(600, &get_window_frame)
+            .collect::<Vec<_>>();
+
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter()
+                .all(|(_, frame)| *frame == IRect::new(0, 0, 300, 600))
+        );
+    }
+
+    #[test]
     fn test_overlapping_frame_strategy_simulation() {
         let mut world = World::new();
         let e1 = world.spawn_empty().id();
@@ -1827,5 +1932,82 @@ mod tests {
             Column::Tabs(tabs) => assert_eq!(tabs, vec![e1, e2]),
             _ => panic!(),
         }
+    }
+
+    // Mirrors the real `detect_tabbed_windows` flow: spawn_window_trigger
+    // appends the new window to the strip first, and only then does the
+    // tab detector merge it into the leader's column. Before the fix, the
+    // follower was left in both columns, and right_neighbour from the
+    // duplicated entity would self-loop because index_of returned the Tabs
+    // column index, while the column at the next index was the orphaned
+    // Single(follower).
+    #[test]
+    fn test_convert_to_tabs_removes_pre_existing_follower_column() {
+        let mut world = World::new();
+        let leader = world.spawn_empty().id();
+        let follower = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(leader);
+        strip.append(follower);
+
+        strip.convert_to_tabs(leader, follower).unwrap();
+
+        assert_eq!(
+            strip.len(),
+            1,
+            "follower must not remain in its own column after being tabbed onto leader",
+        );
+        match strip.get(0).unwrap() {
+            Column::Tabs(tabs) => assert_eq!(tabs, vec![leader, follower]),
+            other => panic!("expected Tabs column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_tabs_no_self_loop_on_neighbour() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let leader = world.spawn_empty().id();
+        let follower = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(a);
+        strip.append(leader);
+        strip.append(follower);
+        strip.append(b);
+
+        strip.convert_to_tabs(leader, follower).unwrap();
+
+        // Both leader-as-focus and follower-as-focus must navigate to `b`
+        // east, not back onto themselves.
+        assert_eq!(strip.right_neighbour(leader), Some(b));
+        assert_eq!(strip.right_neighbour(follower), Some(b));
+        assert_eq!(strip.left_neighbour(leader), Some(a));
+        assert_eq!(strip.left_neighbour(follower), Some(a));
+    }
+
+    #[test]
+    fn test_convert_to_tabs_handles_follower_left_of_leader() {
+        let mut world = World::new();
+        let follower = world.spawn_empty().id();
+        let leader = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append(follower);
+        strip.append(leader);
+        strip.append(b);
+
+        strip.convert_to_tabs(leader, follower).unwrap();
+
+        assert_eq!(strip.len(), 2);
+        match strip.get(0).unwrap() {
+            Column::Tabs(tabs) => assert_eq!(tabs, vec![leader, follower]),
+            other => panic!("expected Tabs column, got {other:?}"),
+        }
+        assert_eq!(strip.right_neighbour(leader), Some(b));
+        assert_eq!(strip.right_neighbour(follower), Some(b));
     }
 }

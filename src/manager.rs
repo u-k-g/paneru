@@ -3,6 +3,7 @@ use bevy::ecs::resource::Resource;
 use bevy::math::{IRect, IVec2};
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
+use mockall::automock;
 use notify::{RecursiveMode, Watcher};
 use objc2_core_foundation::{
     CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
@@ -10,7 +11,8 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
-    CGGetActiveDisplayList, CGWarpMouseCursorPosition,
+    CGGetActiveDisplayList, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo,
+    CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
 };
 use std::path::Path;
 use std::ptr::null_mut;
@@ -40,6 +42,11 @@ use skylight::{
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id};
 
+#[cfg(test)]
+pub use process::MockProcessApi;
+#[cfg(test)]
+pub use windows::MockWindowApi;
+
 pub(crate) mod app;
 mod display;
 mod process;
@@ -67,6 +74,7 @@ pub fn irect_from(rect: CGRect) -> IRect {
 }
 
 /// Defines the interface for a window manager, abstracting OS-specific operations.
+#[automock]
 pub trait WindowManagerApi: Send + Sync {
     /// Creates a new `Application` instance from a given `ProcessApi`.
     ///
@@ -170,6 +178,8 @@ pub trait WindowManagerApi: Send + Sync {
     fn cursor_position(&self) -> Option<CGPoint>;
 
     fn dim_windows(&self, windows: &[WinID], level: f32);
+
+    fn windows_on_screen(&self) -> Option<Vec<WinID>>;
 }
 
 /// `WindowManager` is a Bevy resource that holds a boxed `WindowManagerApi` trait object.
@@ -551,6 +561,22 @@ impl WindowManagerApi for WindowManagerOS {
         }
         .to_result(function_name!())
         .inspect_err(|err| debug!("{err}"));
+    }
+
+    fn windows_on_screen(&self) -> Option<Vec<WinID>> {
+        let options =
+            CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+        let window_list_info = CGWindowListCopyWindowInfo(options, kCGNullWindowID);
+        window_list_info.map(|window_info| {
+            let array = unsafe { window_info.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+            array
+                .iter()
+                .filter_map(|dict| {
+                    dict.get(unsafe { kCGWindowNumber })
+                        .and_then(|id| id.as_i32())
+                })
+                .collect::<Vec<_>>()
+        })
     }
 }
 

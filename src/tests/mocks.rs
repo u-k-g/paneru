@@ -1,660 +1,638 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use bevy::prelude::*;
-use objc2_core_foundation::{CFRetained, CGPoint};
+use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::CGDirectDisplayID;
-use stdext::function_name;
 use stdext::prelude::RwLockExt;
-use tracing::{Level, debug, instrument};
 
-use crate::errors::{Error, Result};
+use crate::errors::Error;
 use crate::events::Event;
+use crate::manager::app::MockApplicationApi;
 use crate::manager::{
-    Application, ApplicationApi, Display, Origin, ProcessApi, Size, Window, WindowApi,
-    WindowManagerApi,
+    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size, Window,
 };
-use crate::platform::{ConnID, Pid, WinID, WorkspaceId};
-use crate::{platform::ProcessSerialNumber, util::AXUIWrapper};
+use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
 use super::*;
 
-/// A mock implementation of the `ProcessApi` trait for testing purposes.
-#[derive(Debug)]
-pub(crate) struct MockProcess {
+/// Data for a mocked application.
+pub(crate) struct MockAppData {
     pub(crate) psn: ProcessSerialNumber,
-}
-
-impl ProcessApi for MockProcess {
-    /// Always returns `true`, indicating the mock process is observable.
-    #[instrument(level = Level::DEBUG, ret)]
-    fn is_observable(&mut self) -> bool {
-        debug!("{}:", function_name!());
-        true
-    }
-
-    /// Returns a static name for the mock process.
-    #[instrument(level = Level::DEBUG, ret)]
-    fn name(&self) -> &'static str {
-        "test"
-    }
-
-    /// Returns a predefined PID for the mock process.
-    #[instrument(level = Level::DEBUG, ret)]
-    fn pid(&self) -> Pid {
-        debug!("{}:", function_name!());
-        TEST_PROCESS_ID
-    }
-
-    /// Returns the `ProcessSerialNumber` of the mock process.
-    #[instrument(level = Level::TRACE, ret)]
-    fn psn(&self) -> ProcessSerialNumber {
-        debug!("{}: {:?}", function_name!(), self.psn);
-        self.psn
-    }
-
-    /// Always returns `None` for the `NSRunningApplication`.
-    #[instrument(level = Level::DEBUG, ret)]
-    fn application(&self) -> Option<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>> {
-        debug!("{}:", function_name!());
-        None
-    }
-
-    /// Always returns `true`, indicating the mock process is ready.
-    #[instrument(level = Level::DEBUG, ret)]
-    fn ready(&mut self) -> bool {
-        debug!("{}:", function_name!());
-        true
-    }
-}
-
-/// A mock implementation of the `ApplicationApi` trait for testing purposes.
-/// It internally holds an `InnerMockApplication` within an `Arc<RwLock>`.
-#[derive(Clone, Debug)]
-pub(crate) struct MockApplication {
-    pub(crate) inner: Arc<RwLock<InnerMockApplication>>,
-    pub(crate) name: String,
-}
-
-/// The inner state of `MockApplication`, containing process serial number, PID, and focused window ID.
-#[derive(Debug)]
-pub(crate) struct InnerMockApplication {
-    pub(crate) psn: ProcessSerialNumber,
-    pub(crate) pid: Pid,
-    pub(crate) focused_id: Option<WinID>,
-    pub(crate) current_window_ids: Vec<WinID>,
     pub(crate) bundle_id: String,
+    pub(crate) name: String,
+    pub(crate) focused_window_id: Option<WinID>,
+    pub(crate) is_frontmost: bool,
+    pub(crate) connection: Option<crate::platform::ConnID>,
 }
 
-impl MockApplication {
-    /// Creates a new `MockApplication` instance.
-    #[instrument(level = Level::DEBUG, ret)]
-    pub(crate) fn new(psn: ProcessSerialNumber, pid: Pid, bundle_id: String) -> Self {
-        MockApplication {
-            inner: Arc::new(RwLock::new(InnerMockApplication {
-                psn,
-                pid,
-                focused_id: None,
-                current_window_ids: Vec::new(),
-                bundle_id,
-            })),
-            name: "test".to_string(),
-        }
-    }
-}
-
-impl ApplicationApi for MockApplication {
-    /// Returns the PID of the mock application.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn pid(&self) -> Pid {
-        self.inner.force_read().pid
-    }
-
-    /// Returns the `ProcessSerialNumber` of the mock application.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn psn(&self) -> ProcessSerialNumber {
-        debug!("{}:", function_name!());
-        self.inner.force_read().psn
-    }
-
-    /// Always returns `Some(0)` for the connection ID.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn connection(&self) -> Option<ConnID> {
-        debug!("{}:", function_name!());
-        Some(0)
-    }
-
-    /// Returns the currently focused window ID for the mock application.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(WinID)` if a window is focused, otherwise `Err(Error::InvalidWindow)`.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn focused_window_id(&self) -> Result<WinID> {
-        let id = self
-            .inner
-            .force_read()
-            .focused_id
-            .ok_or(Error::InvalidWindow);
-        debug!("{}: {id:?}", function_name!());
-        id
-    }
-
-    fn focused_window(&self) -> Result<Window> {
-        let id = self.focused_window_id()?;
-        Ok(Window::new(Box::new(MockWindow::new(
-            id,
-            IRect::default(),
-            Arc::new(RwLock::new(Vec::new())),
-            self.clone(),
-        ))))
-    }
-
-    fn window_list(&self) -> Vec<Window> {
-        debug!("{}:", function_name!());
-        self.inner
-            .force_read()
-            .current_window_ids
-            .iter()
-            .map(|id| {
-                Window::new(Box::new(MockWindow::new(
-                    *id,
-                    IRect::default(),
-                    Arc::new(RwLock::new(Vec::new())),
-                    self.clone(),
-                )))
-            })
-            .collect()
-    }
-
-    /// Always returns `Ok(true)` for observe operations on the mock application.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn observe(&mut self) -> Result<bool> {
-        debug!("{}:", function_name!());
-        Ok(true)
-    }
-
-    /// Always returns `Ok(true)` for observe window operations on the mock application.
-    #[instrument(level = Level::DEBUG, skip_all, ret)]
-    fn observe_window(&mut self, _window: &Window) -> Result<bool> {
-        debug!("{}:", function_name!());
-        Ok(true)
-    }
-
-    /// Does nothing for unobserve window operations on the mock application.
-    #[instrument(level = Level::DEBUG, skip_all, ret)]
-    fn unobserve_window(&mut self, _window: &Window) {
-        debug!("{}:", function_name!());
-    }
-
-    /// Always returns `true`, indicating the mock application is frontmost.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn is_frontmost(&self) -> bool {
-        debug!("{}:", function_name!());
-        true
-    }
-
-    /// Returns the bundle identifier of the application.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn bundle_id(&self) -> Option<&str> {
-        debug!("{}:", function_name!());
-        // unsafe leak for testing.
-        Some(Box::leak(
-            self.inner.force_read().bundle_id.clone().into_boxed_str(),
-        ))
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-/// A mock implementation of the `WindowManagerApi` trait for testing purposes.
-pub(crate) struct MockWindowManager {
-    pub(crate) windows: TestWindowSpawner,
-    pub(crate) workspaces: Vec<WorkspaceId>,
-    pub(crate) associated_windows: Vec<(WinID, Vec<WinID>)>,
-}
-
-impl std::fmt::Debug for MockWindowManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MockWindowManager")
-            .field("windows", &"<closure>") // Placeholder text
-            .finish()
-    }
-}
-
-impl WindowManagerApi for MockWindowManager {
-    /// Creates a new mock application.
-    fn new_application(&self, process: &dyn ProcessApi) -> Result<Application> {
-        debug!("{}: from process {}", function_name!(), process.name());
-        Ok(Application::new(Box::new(MockApplication {
-            inner: Arc::new(RwLock::new(InnerMockApplication {
-                psn: process.psn(),
-                pid: process.pid(),
-                focused_id: None,
-                current_window_ids: Vec::new(),
-                bundle_id: "test".to_string(),
-            })),
-            name: "test".to_string(),
-        })))
-    }
-
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID> {
-        debug!("{}:", function_name!());
-        self.associated_windows
-            .iter()
-            .find_map(|(id, associated)| (*id == window_id).then(|| associated.clone()))
-            .unwrap_or_default()
-    }
-
-    /// Always returns an empty vector, as present displays are mocked elsewhere.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)> {
-        let display = Display::new(
-            TEST_DISPLAY_ID,
-            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
-            TEST_MENUBAR_HEIGHT,
-        );
-        vec![(display, self.workspaces.clone())]
-    }
-
-    /// Returns a predefined active display ID.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn active_display_id(&self) -> Result<u32> {
-        Ok(TEST_DISPLAY_ID)
-    }
-
-    /// Returns a predefined active display space ID.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId> {
-        Ok(TEST_WORKSPACE_ID)
-    }
-
-    fn is_fullscreen_space(&self, _display_id: CGDirectDisplayID) -> bool {
-        false
-    }
-
-    /// Does nothing, as mouse centering is not tested at this level.
-    #[instrument(level = Level::DEBUG, skip_all, ret)]
-    fn warp_mouse(&self, _origin: Origin) {
-        debug!("{}:", function_name!());
-    }
-
-    /// Always returns an empty vector of windows.
-    #[instrument(level = Level::DEBUG, skip_all)]
-    fn find_existing_application_windows(
-        &self,
-        app: &mut Application,
-        spaces: &[WorkspaceId],
-    ) -> Result<(Vec<Window>, Vec<WinID>)> {
-        debug!(
-            "{}: app {} spaces {:?}",
-            function_name!(),
-            app.pid(),
-            spaces
-        );
-
-        let windows = spaces
-            .iter()
-            .flat_map(|workspace_id| (self.windows)(*workspace_id))
-            .collect::<Vec<_>>();
-        Ok((windows, vec![]))
-    }
-
-    /// Always returns `Ok(0)`.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn find_window_at_point(&self, point: &CGPoint) -> Result<WinID> {
-        debug!("{}:", function_name!());
-        Ok(0)
-    }
-
-    /// Always returns an empty vector of window IDs.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn windows_in_workspace(&self, workspace_id: WorkspaceId) -> Result<Vec<WinID>> {
-        debug!("{}:", function_name!());
-        let ids = (self.windows)(workspace_id)
-            .iter()
-            .map(|window| window.id())
-            .collect();
-        Ok(ids)
-    }
-
-    /// Always returns `Ok(())`.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn quit(&self) -> Result<()> {
-        debug!("{}:", function_name!());
-        Ok(())
-    }
-
-    #[instrument(level = Level::DEBUG, skip(self))]
-    fn setup_config_watcher(&self, path: &std::path::Path) -> Result<Box<dyn notify::Watcher>> {
-        todo!()
-    }
-
-    fn cursor_position(&self) -> Option<CGPoint> {
-        None
-    }
-
-    #[instrument(level = Level::DEBUG, skip(self))]
-    fn dim_windows(&self, windows: &[WinID], level: f32) {}
-}
-
-/// A mock implementation of the `WindowApi` trait for testing purposes.
-#[derive(Debug)]
-pub(crate) struct MockWindow {
+/// Data for a mocked window.
+pub(crate) struct MockWindowData {
     pub(crate) id: WinID,
+    pub(crate) pid: Pid,
     pub(crate) frame: IRect,
-    pub(crate) horizontal_padding: i32,
-    pub(crate) vertical_padding: i32,
-    pub(crate) app: MockApplication,
-    pub(crate) event_queue: EventQueue,
-    pub(crate) minimized: bool,
     pub(crate) title: String,
-    pub(crate) identifier: String,
+    pub(crate) minimized: bool,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) visible: bool,
     pub(crate) role: String,
     pub(crate) subrole: String,
-    pub(crate) ignored_repositions: Arc<AtomicUsize>,
+    pub(crate) identifier: String,
+    pub(crate) is_full_screen: bool,
+    pub(crate) border_radius: Option<f64>,
+    pub(crate) horizontal_padding: i32,
+    pub(crate) vertical_padding: i32,
+    pub(crate) child_role: bool,
 }
 
-impl WindowApi for MockWindow {
-    /// Returns the ID of the mock window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn id(&self) -> WinID {
-        self.id
-    }
-
-    /// Returns the frame (`CGRect`) of the mock window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn frame(&self) -> IRect {
-        self.frame
-    }
-
-    /// Returns a dummy `CFRetained<AXUIWrapper>` for the mock window's accessibility element.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn element(&self) -> Option<CFRetained<AXUIWrapper>> {
-        debug!("{}:", function_name!());
-        None
-    }
-
-    /// Returns the title of the mock window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn title(&self) -> Result<String> {
-        Ok(self.title.clone())
-    }
-
-    /// Returns the identifier of the mock window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn identifier(&self) -> Result<String> {
-        Ok(self.identifier.clone())
-    }
-
-    /// Always returns `Ok(true)` for valid role.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn child_role(&self) -> Result<bool> {
-        debug!("{}:", function_name!());
-        Ok(true)
-    }
-
-    /// Returns the role of the mock window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn role(&self) -> Result<String> {
-        Ok(self.role.clone())
-    }
-
-    /// Returns the subrole of the mock window.
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn subrole(&self) -> Result<String> {
-        Ok(self.subrole.clone())
-    }
-
-    /// Repositions the mock window's frame to the given coordinates.
-    #[instrument(level = Level::DEBUG, skip(self))]
-    fn reposition(&mut self, origin: Origin) {
-        debug!("{}: id {} to {origin}", function_name!(), self.id);
-        if self.ignored_repositions.load(Ordering::SeqCst) > 0 {
-            self.ignored_repositions.fetch_sub(1, Ordering::SeqCst);
-            return;
-        }
-        let size = self.frame.size();
-        self.frame.min = origin;
-        self.frame.max = origin + size;
-    }
-
-    /// Resizes the mock window's frame to the given dimensions.
-    #[instrument(level = Level::DEBUG, skip(self))]
-    fn resize(&mut self, size: Size) {
-        debug!("{}: id {} to {size}", function_name!(), self.id);
-        self.frame.max = self.frame.min + size;
-    }
-
-    /// Always returns `Ok(())` for updating the frame.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn update_frame(&mut self) -> Result<IRect> {
-        debug!("{}:", function_name!());
-        Ok(self.frame)
-    }
-
-    /// Prints a debug message for focus without raise.
-    #[instrument(level = Level::DEBUG, skip_all)]
-    fn focus_without_raise(
-        &self,
-        _psn: ProcessSerialNumber,
-        currently_focused: &Window,
-        _ocused_psn: ProcessSerialNumber,
-    ) {
-        debug!(
-            "{}: id {} {}",
-            function_name!(),
-            self.id,
-            currently_focused.id()
-        );
-    }
-
-    /// Prints a debug message for focus with raise and updates the mock application's focused ID.
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn focus_with_raise(&self, psn: ProcessSerialNumber) {
-        debug!("{}: id {}", function_name!(), self.id);
-        self.event_queue
-            .write()
-            .unwrap()
-            .push(Event::ApplicationFrontSwitched { psn, pid: None });
-        self.event_queue
-            .write()
-            .unwrap()
-            .push(Event::WindowFocused { window_id: self.id });
-        self.app.inner.force_write().focused_id = Some(self.id);
-    }
-
-    #[instrument(level = Level::DEBUG, skip(self))]
-    fn raise_without_focus(&self) {
-        debug!("{}: id {}", function_name!(), self.id);
-    }
-
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn pid(&self) -> Result<Pid> {
-        Ok(TEST_PROCESS_ID)
-    }
-
-    #[instrument(level = Level::DEBUG, skip(self), ret)]
-    fn set_padding(&mut self, padding: crate::manager::WindowPadding) {
-        match padding {
-            crate::manager::WindowPadding::Vertical(padding) => {
-                let delta = padding - self.vertical_padding;
-                self.frame.min.y -= delta;
-                self.frame.max.y += delta;
-                self.vertical_padding = padding;
-            }
-            crate::manager::WindowPadding::Horizontal(padding) => {
-                let delta = padding - self.horizontal_padding;
-                self.frame.min.x -= delta;
-                self.frame.max.x += delta;
-                self.horizontal_padding = padding;
-            }
-        }
-    }
-
-    fn horizontal_padding(&self) -> i32 {
-        self.horizontal_padding
-    }
-
-    fn vertical_padding(&self) -> i32 {
-        self.vertical_padding
-    }
-
-    #[instrument(level = Level::TRACE, skip(self), ret)]
-    fn is_minimized(&self) -> bool {
-        self.minimized
-    }
-
-    fn is_full_screen(&self) -> bool {
-        false
-    }
-
-    fn border_radius(&self) -> Option<f64> {
-        None
-    }
-}
-
-impl MockWindow {
-    /// Creates a new `MockWindow` instance.
-    pub(crate) fn new(
-        id: WinID,
-        frame: IRect,
-        event_queue: EventQueue,
-        app: MockApplication,
-    ) -> Self {
-        MockWindow {
-            id,
-            frame,
-            horizontal_padding: 0,
-            vertical_padding: 0,
-            app,
-            event_queue,
-            minimized: false,
+impl Default for MockWindowData {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            pid: 0,
+            frame: IRect::default(),
             title: String::new(),
-            identifier: String::new(),
+            minimized: false,
+            workspace_id: 0,
+            visible: true,
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
-            ignored_repositions: Arc::default(),
+            identifier: "testid".to_string(),
+            is_full_screen: false,
+            border_radius: None,
+            horizontal_padding: 0,
+            vertical_padding: 0,
+            child_role: false,
         }
     }
-
-    pub(crate) fn with_ignored_repositions(
-        mut self,
-        ignored_repositions: Arc<AtomicUsize>,
-    ) -> Self {
-        self.ignored_repositions = ignored_repositions;
-        self
-    }
 }
 
-/// Mock window manager with two displays of different heights.
-pub(crate) struct TwoDisplayMock {
-    pub(crate) windows: TestWindowSpawner,
-    pub(crate) active_display: Arc<std::sync::atomic::AtomicU32>,
+/// Data for a mocked display.
+struct MockDisplayData {
+    id: u32,
+    bounds: IRect,
+    workspaces: Vec<WorkspaceId>,
 }
 
-impl std::fmt::Debug for TwoDisplayMock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TwoDisplayMock").finish()
-    }
+/// The internal state of our "Virtual macOS".
+struct MockStateInner {
+    apps: HashMap<Pid, MockAppData>,
+    windows: HashMap<WinID, MockWindowData>,
+    displays: HashMap<u32, MockDisplayData>,
+    active_display_id: u32,
+    event_queue: VecDeque<Event>,
 }
 
-pub(crate) const EXT_DISPLAY_ID: u32 = 2;
-pub(crate) const EXT_WORKSPACE_ID: u64 = 20;
-pub(crate) const EXT_DISPLAY_WIDTH: i32 = 1920;
-pub(crate) const EXT_DISPLAY_HEIGHT: i32 = 1200;
+#[derive(Clone)]
+pub struct MockState {
+    inner: Arc<RwLock<MockStateInner>>,
+}
 
-impl WindowManagerApi for TwoDisplayMock {
-    fn new_application(&self, process: &dyn ProcessApi) -> Result<Application> {
-        Ok(Application::new(Box::new(MockApplication {
-            inner: Arc::new(RwLock::new(InnerMockApplication {
-                psn: process.psn(),
-                pid: process.pid(),
-                focused_id: None,
-                current_window_ids: Vec::new(),
-                bundle_id: "test".to_string(),
+impl MockState {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(MockStateInner {
+                apps: HashMap::new(),
+                windows: HashMap::new(),
+                displays: HashMap::new(),
+                active_display_id: 0,
+                event_queue: VecDeque::new(),
             })),
-            name: "test".to_string(),
-        })))
-    }
-
-    fn get_associated_windows(&self, _window_id: WinID) -> Vec<WinID> {
-        vec![]
-    }
-
-    fn present_displays(&self) -> Vec<(Display, Vec<WorkspaceId>)> {
-        // External display sits above the internal one.
-        let ext = Display::new(
-            EXT_DISPLAY_ID,
-            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
-            TEST_MENUBAR_HEIGHT,
-        );
-        let int = Display::new(
-            TEST_DISPLAY_ID,
-            IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
-            TEST_MENUBAR_HEIGHT,
-        );
-        vec![
-            (ext, vec![EXT_WORKSPACE_ID]),
-            (int, vec![TEST_WORKSPACE_ID]),
-        ]
-    }
-
-    fn active_display_id(&self) -> Result<u32> {
-        Ok(self.active_display.load(Ordering::Relaxed))
-    }
-
-    fn active_display_space(&self, display_id: CGDirectDisplayID) -> Result<WorkspaceId> {
-        if display_id == EXT_DISPLAY_ID {
-            Ok(EXT_WORKSPACE_ID)
-        } else {
-            Ok(TEST_WORKSPACE_ID)
         }
     }
 
-    fn is_fullscreen_space(&self, _display_id: CGDirectDisplayID) -> bool {
-        false
+    pub(crate) fn window_visible(&self, window_id: WinID, visible: bool) {
+        let mut state = self.inner.force_write();
+        let window = state.windows.get_mut(&window_id).expect("finding window");
+        window.visible = visible;
     }
 
-    fn warp_mouse(&self, _origin: Origin) {}
+    // --- OS Behavior Methods ---
 
-    fn find_existing_application_windows(
+    pub fn spawn_app(&self, pid: Pid, bundle_id: &str, name: &str) {
+        let mut inner = self.inner.force_write();
+        inner.apps.insert(
+            pid,
+            MockAppData {
+                psn: ProcessSerialNumber {
+                    high: 0,
+                    low: pid as u32,
+                },
+                bundle_id: bundle_id.to_string(),
+                name: name.to_string(),
+                focused_window_id: None,
+                is_frontmost: true,
+                connection: Some(0),
+            },
+        );
+    }
+
+    pub fn spawn_window(
         &self,
-        _app: &mut Application,
-        spaces: &[WorkspaceId],
-    ) -> Result<(Vec<Window>, Vec<WinID>)> {
-        let windows = spaces
-            .iter()
-            .flat_map(|workspace_id| (self.windows)(*workspace_id))
-            .collect();
-        Ok((windows, vec![]))
+        pid: Pid,
+        workspace_id: WorkspaceId,
+        id: WinID,
+        frame: IRect,
+    ) -> Window {
+        let mut inner = self.inner.force_write();
+        inner.windows.insert(
+            id,
+            MockWindowData {
+                id,
+                pid,
+                frame,
+                title: format!("Window {id}"),
+                workspace_id,
+                ..default()
+            },
+        );
+        self.create_window(id)
     }
 
-    fn find_window_at_point(&self, _point: &CGPoint) -> Result<WinID> {
-        Ok(0)
+    pub fn focus_window(&self, id: WinID) {
+        let mut inner = self.inner.force_write();
+        if let Some(win) = inner.windows.get(&id) {
+            let pid = win.pid;
+            if let Some(app) = inner.apps.get_mut(&pid) {
+                app.focused_window_id = Some(id);
+                let psn = app.psn;
+                inner
+                    .event_queue
+                    .push_back(Event::ApplicationFrontSwitched { psn });
+                inner
+                    .event_queue
+                    .push_back(Event::WindowFocused { window_id: id });
+            }
+        }
     }
 
-    fn windows_in_workspace(&self, workspace_id: WorkspaceId) -> Result<Vec<WinID>> {
-        Ok((self.windows)(workspace_id)
-            .iter()
-            .map(|w| w.id())
-            .collect())
+    pub fn add_display(&mut self, id: u32, bounds: IRect, workspaces: Vec<WorkspaceId>) {
+        let mut inner = self.inner.force_write();
+        if inner.displays.is_empty() {
+            inner.active_display_id = id;
+        }
+        inner.displays.insert(
+            id,
+            MockDisplayData {
+                id,
+                bounds,
+                workspaces,
+            },
+        );
     }
 
-    fn quit(&self) -> Result<()> {
-        Ok(())
+    pub fn active_display(&self) -> CGDirectDisplayID {
+        self.inner.force_read().active_display_id
     }
 
-    fn setup_config_watcher(&self, _path: &std::path::Path) -> Result<Box<dyn notify::Watcher>> {
-        todo!()
+    pub fn drain_events(&self) -> Vec<Event> {
+        let mut inner = self.inner.force_write();
+        inner.event_queue.drain(..).collect()
     }
 
-    fn cursor_position(&self) -> Option<CGPoint> {
-        None
+    // --- State Mutation Methods ---
+
+    pub fn update_window<F>(&self, id: WinID, f: F)
+    where
+        F: FnOnce(&mut MockWindowData),
+    {
+        let mut inner = self.inner.force_write();
+        if let Some(w) = inner.windows.get_mut(&id) {
+            f(w);
+        }
     }
 
-    fn dim_windows(&self, _windows: &[WinID], _level: f32) {}
+    #[allow(unused)]
+    pub fn update_app(&self, pid: Pid, f: impl FnOnce(&mut MockAppData)) {
+        let mut inner = self.inner.force_write();
+        if let Some(a) = inner.apps.get_mut(&pid) {
+            f(a);
+        }
+    }
+
+    // --- OS Behavior Methods ---
+
+    #[allow(unused)]
+    pub fn os_move_window(&self, id: WinID, origin: Origin) {
+        let mut inner = self.inner.force_write();
+        if let Some(w) = inner.windows.get_mut(&id) {
+            let size = w.frame.size();
+            w.frame.min = origin;
+            w.frame.max = origin + size;
+            inner
+                .event_queue
+                .push_back(Event::WindowMoved { window_id: id });
+        }
+    }
+
+    #[allow(unused)]
+    pub fn os_resize_window(&self, id: WinID, size: Size) {
+        let mut inner = self.inner.force_write();
+        if let Some(w) = inner.windows.get_mut(&id) {
+            w.frame.max = w.frame.min + size;
+            inner
+                .event_queue
+                .push_back(Event::WindowResized { window_id: id });
+        }
+    }
+
+    #[allow(unused)]
+    pub fn os_minimize_window(&self, id: WinID, minimized: bool) {
+        let mut inner = self.inner.force_write();
+        if let Some(w) = inner.windows.get_mut(&id) {
+            w.minimized = minimized;
+            if minimized {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowMinimized { window_id: id });
+            } else {
+                inner
+                    .event_queue
+                    .push_back(Event::WindowDeminimized { window_id: id });
+            }
+        }
+    }
+
+    // --- Interaction Helpers ---
+
+    #[allow(unused)]
+    pub fn simulate_click(&self, point: Origin) {
+        let mut inner = self.inner.force_write();
+        let point = CGPoint::new(point.x.into(), point.y.into());
+        inner.event_queue.push_back(Event::MouseDown {
+            point,
+            modifiers: Modifiers::empty(),
+        });
+        inner.event_queue.push_back(Event::MouseUp {
+            point,
+            modifiers: Modifiers::empty(),
+        });
+    }
+
+    #[allow(unused)]
+    pub fn simulate_window_click(&self, id: WinID) {
+        let inner = self.inner.force_read();
+        if let Some(w) = inner.windows.get(&id) {
+            let center = w.frame.center();
+            drop(inner);
+            self.simulate_click(center);
+        }
+    }
+
+    #[allow(unused)]
+    pub fn simulate_drag(&self, start: Origin, end: Origin) {
+        let mut inner = self.inner.force_write();
+        let start_p = CGPoint::new(start.x.into(), start.y.into());
+        let end_p = CGPoint::new(end.x.into(), end.y.into());
+        inner.event_queue.push_back(Event::MouseDown {
+            point: start_p,
+            modifiers: Modifiers::empty(),
+        });
+        inner.event_queue.push_back(Event::MouseDragged {
+            point: end_p,
+            modifiers: Modifiers::empty(),
+        });
+        inner.event_queue.push_back(Event::MouseUp {
+            point: end_p,
+            modifiers: Modifiers::empty(),
+        });
+    }
+
+    // --- Mock Factory Methods ---
+
+    pub fn create_window(&self, id: WinID) -> Window {
+        let mut mw = MockWindowApi::new();
+
+        mw.expect_id().return_const(id);
+
+        let s = self.clone();
+        mw.expect_pid().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.pid)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
+        mw.expect_frame().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.frame)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        mw.expect_resize().returning(move |size| {
+            let mut inner = s.inner.force_write();
+            if let Some(w) = inner.windows.get_mut(&id) {
+                w.frame.max = w.frame.min + size;
+            }
+        });
+
+        let s_move = self.clone();
+        mw.expect_reposition().returning(move |origin| {
+            let mut inner = s_move.inner.force_write();
+            if let Some(w) = inner.windows.get_mut(&id) {
+                let size = w.frame.size();
+                w.frame.min = origin;
+                w.frame.max = origin + size;
+            }
+        });
+
+        let s = self.clone();
+        mw.expect_focus_with_raise().returning(move |_psn| {
+            s.focus_window(id);
+        });
+
+        let s = self.clone();
+        mw.expect_title().returning(move || {
+            Ok(s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.title.clone())
+                .unwrap_or_default())
+        });
+
+        let s = self.clone();
+        mw.expect_is_minimized().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.minimized)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        mw.expect_update_frame().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.frame)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
+        mw.expect_identifier().returning(move || {
+            Ok(s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.identifier.clone())
+                .unwrap_or_default())
+        });
+
+        let s = self.clone();
+        mw.expect_role().returning(move || {
+            Ok(s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.role.clone())
+                .unwrap_or_default())
+        });
+
+        let s = self.clone();
+        mw.expect_subrole().returning(move || {
+            Ok(s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.subrole.clone())
+                .unwrap_or_default())
+        });
+
+        let s = self.clone();
+        mw.expect_child_role().returning(move || {
+            Ok(s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.child_role)
+                .unwrap_or_default())
+        });
+
+        let s = self.clone();
+        mw.expect_horizontal_padding().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.horizontal_padding)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        mw.expect_vertical_padding().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.vertical_padding)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        mw.expect_is_full_screen().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .map(|w| w.is_full_screen)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        mw.expect_border_radius().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .and_then(|w| w.border_radius)
+        });
+
+        // Fill in remaining defaults
+        mw.expect_element().return_const(None);
+        mw.expect_raise_without_focus().return_const(());
+        mw.expect_focus_without_raise().return_const(());
+        mw.expect_set_padding().return_const(());
+
+        Window::new(Box::new(mw))
+    }
+
+    pub fn create_application(&self, pid: Pid) -> Application {
+        let mut ma = MockApplicationApi::new();
+        let s = self.clone();
+
+        ma.expect_pid().return_const(pid);
+        ma.expect_psn()
+            .returning(move || s.inner.force_read().apps.get(&pid).map(|a| a.psn).unwrap());
+
+        let s = self.clone();
+        ma.expect_focused_window_id().returning(move || {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .and_then(|a| a.focused_window_id)
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
+        ma.expect_bundle_id().returning(move || {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .map(|a| a.bundle_id.clone())
+        });
+
+        let name = self
+            .inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .map(|a| a.name.clone())
+            .unwrap();
+        ma.expect_name().return_const(name);
+
+        let s = self.clone();
+        ma.expect_is_frontmost().returning(move || {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .map(|a| a.is_frontmost)
+                .unwrap_or_default()
+        });
+
+        let s = self.clone();
+        ma.expect_connection().returning(move || {
+            s.inner
+                .force_read()
+                .apps
+                .get(&pid)
+                .and_then(|a| a.connection)
+        });
+
+        ma.expect_observe().returning(|| Ok(true));
+        ma.expect_observe_window().returning(|_| Ok(true));
+        ma.expect_unobserve_window().return_const(());
+
+        Application::new(Box::new(ma))
+    }
+
+    pub fn create_window_manager(&self) -> MockWindowManagerApi {
+        let mut wm = MockWindowManagerApi::new();
+
+        let s = self.clone();
+        wm.expect_active_display_id()
+            .returning(move || Ok(s.inner.force_read().active_display_id));
+
+        let s = self.clone();
+        wm.expect_active_display_space().returning(move |id| {
+            s.inner
+                .force_read()
+                .displays
+                .get(&id)
+                .map(|d| d.workspaces[0])
+                .ok_or(Error::InvalidWindow)
+        });
+
+        let s = self.clone();
+        wm.expect_present_displays().returning(move || {
+            s.inner
+                .force_read()
+                .displays
+                .values()
+                .map(|d| {
+                    (
+                        Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT),
+                        d.workspaces.clone(),
+                    )
+                })
+                .collect()
+        });
+
+        let s = self.clone();
+        wm.expect_find_existing_application_windows()
+            .returning(move |app, spaces| {
+                let pid = app.pid();
+                let windows = s
+                    .inner
+                    .force_read()
+                    .windows
+                    .values()
+                    .filter_map(|w| {
+                        (w.pid == pid && spaces.contains(&w.workspace_id))
+                            .then_some(s.create_window(w.id))
+                    })
+                    .collect::<Vec<_>>();
+                Ok((windows, vec![]))
+            });
+
+        let s = self.clone();
+        wm.expect_windows_in_workspace()
+            .returning(move |workspace_id| {
+                let mut windows = s
+                    .inner
+                    .force_read()
+                    .windows
+                    .values()
+                    .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
+                    .collect::<Vec<_>>();
+                // Sort the windows to keep the tests consistent
+                windows.sort();
+                Ok(windows)
+            });
+
+        let s = self.clone();
+        wm.expect_windows_on_screen().returning(move || {
+            let windows = s
+                .inner
+                .force_read()
+                .windows
+                .iter()
+                .filter_map(|(id, window)| window.visible.then_some(id))
+                .cloned()
+                .collect::<Vec<_>>();
+            Some(windows)
+        });
+
+        wm.expect_warp_mouse().return_const(());
+        wm.expect_cursor_position().return_const(None);
+        wm.expect_get_associated_windows().return_const(vec![]);
+        wm.expect_find_window_at_point().return_const(Ok(0));
+
+        wm
+    }
+
+    pub fn create_process(&self, pid: Pid) -> MockProcessApi {
+        let mut mp = MockProcessApi::new();
+        let s = self.clone();
+
+        let name = self
+            .inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .map(|a| a.name.clone())
+            .unwrap();
+        mp.expect_name().return_const(name);
+
+        mp.expect_pid().return_const(pid);
+        mp.expect_psn()
+            .returning(move || s.inner.force_read().apps.get(&pid).map(|a| a.psn).unwrap());
+        mp.expect_is_observable().returning(|| true);
+        mp.expect_application().return_const(None);
+        mp.expect_ready().return_const(true);
+
+        mp
+    }
 }

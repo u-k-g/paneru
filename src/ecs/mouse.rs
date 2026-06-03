@@ -12,8 +12,8 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling, focus_entity,
-    reposition_entity, reshuffle_around, resize_entity,
+    ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
+    SpawnCommandsExt,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, WindowManager, origin_from};
@@ -117,6 +117,14 @@ fn mouse_moved_trigger(
             trace!("ffm_window_id > 0");
             continue;
         }
+        let pointer = origin_from(*point);
+        if windows
+            .focused()
+            .is_some_and(|(window, _)| window.frame().contains(pointer))
+        {
+            trace!("pointer still inside focused window");
+            continue;
+        }
         let Ok(window_id) = window_manager.find_window_at_point(point) else {
             debug!("can not find window at point {point:?}");
             continue;
@@ -154,7 +162,7 @@ fn mouse_moved_trigger(
         // Do not reshuffle windows due to moved mouse focus.
         global_state.set_skip_reshuffle(true);
         global_state.set_ffm_flag(Some(window.id()));
-        focus_entity(entity, false, &mut commands);
+        commands.focus_entity(entity, false);
     }
 }
 
@@ -231,7 +239,7 @@ fn mouse_up_trigger(
         }
 
         for (held_entity, marker) in &mouse_held {
-            reshuffle_around(marker.0, &mut commands);
+            commands.reshuffle_around(marker.0);
             commands.entity(held_entity).despawn();
         }
     }
@@ -279,13 +287,15 @@ fn mouse_resize_trigger(
             continue;
         }
 
-        let Ok(window_id) = window_manager.find_window_at_point(point) else {
-            continue;
+        let window_id = if let Some(window_id) = state.window_id {
+            window_id
+        } else {
+            let Ok(window_id) = window_manager.find_window_at_point(point) else {
+                continue;
+            };
+            state.window_id = Some(window_id);
+            window_id
         };
-        if state.window_id.is_some_and(|id| window_id != id) {
-            continue;
-        }
-        state.window_id = Some(window_id);
 
         let Some((window, entity)) = windows.find(window_id) else {
             continue;
@@ -300,20 +310,20 @@ fn mouse_resize_trigger(
             if floating && let Some(mut origin) = windows.origin(entity) {
                 // For floating windows, move the window itself.
                 origin.x += dx;
-                reposition_entity(entity, origin, &mut commands);
+                commands.reposition_entity(entity, origin);
             } else {
                 // Resize Left Edge: increase/decrease width AND shift the strip so the right edge stays
                 // anchored.
                 let mut origin = strip_position.0;
                 origin.x += dx;
-                reposition_entity(strip_entity, origin, &mut commands);
+                commands.reposition_entity(strip_entity, origin);
             }
 
             frame.min.x += dx;
         } else {
             frame.max.x += dx;
         }
-        resize_entity(entity, frame.size(), &mut commands);
+        commands.resize_entity(entity, frame.size());
     }
 }
 

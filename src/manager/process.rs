@@ -1,3 +1,4 @@
+use mockall::automock;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 use objc2_core_foundation::{CFRetained, CFString};
@@ -68,6 +69,7 @@ unsafe extern "C" {
 }
 
 /// Defines the interface for interacting with a macOS process, abstracting OS-specific details.
+#[automock]
 pub trait ProcessApi: Send + Sync {
     /// Checks if the process is observable (i.e., has a regular activation policy).
     /// This typically means the application is a standard GUI application that can be managed by the window manager.
@@ -248,12 +250,9 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    pub fn observe_finished_launching(&self) -> bool {
+    pub fn observe_finished_launching(&self) {
         if !self.observing_launched.swap(true, Ordering::Acquire) {
             self.observe("finishedLaunching");
-            true
-        } else {
-            false
         }
     }
 
@@ -274,12 +273,9 @@ impl Process {
     /// # Side Effects
     ///
     /// - Adds a KVO observer to the `NSRunningApplication`.
-    pub fn observe_activation_policy(&self) -> bool {
+    pub fn observe_activation_policy(&self) {
         if !self.observing_activated.swap(true, Ordering::Acquire) {
             self.observe("activationPolicy");
-            true
-        } else {
-            false
         }
     }
 
@@ -356,23 +352,21 @@ impl Process {
     /// - Adds or removes KVO observers based on the application's launch and activation state.
     pub fn ready(&mut self) -> bool {
         if !self.finished_launching() {
-            if self.observe_finished_launching() {
-                debug!(
-                    "{} ({}) is not finished launching, subscribing to finishedLaunching changes",
-                    self.name, self.pid
-                );
-            }
+            debug!(
+                "{} ({}) is not finished launching, subscribing to finishedLaunching changes",
+                self.name, self.pid
+            );
+            self.observe_finished_launching();
             return false;
         }
         self.unobserve_finished_launching();
 
         if !self.is_observable() {
-            if self.observe_activation_policy() {
-                debug!(
-                    "{} ({}) is not observable, subscribing to activationPolicy changes",
-                    self.name, self.pid
-                );
-            }
+            debug!(
+                "{} ({}) is not observable, subscribing to activationPolicy changes",
+                self.name, self.pid
+            );
+            self.observe_activation_policy();
             return false;
         }
         self.unobserve_activation_policy();

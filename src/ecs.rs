@@ -4,11 +4,12 @@ use std::time::{Duration, Instant};
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{PostUpdate, PreUpdate, Startup};
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::Messages;
 use bevy::ecs::query::With;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Query, Res, SystemId};
+use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
@@ -23,6 +24,8 @@ use tracing::{Level, instrument};
 
 use crate::commands::register_commands;
 use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
+use crate::ecs::display::FloatingLayer;
+use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::PaneruState;
 use crate::errors::Result;
 use crate::events::{Event, EventSender};
@@ -31,7 +34,7 @@ use crate::manager::{
 };
 use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
-use crate::platform::{Modifiers, Pid, PlatformCallbacks, WinID, WorkspaceId};
+use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
 pub mod focus;
@@ -48,14 +51,12 @@ pub mod workspace;
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
-/// Systems that poll for notifications are conditionally run based on the `PollForNotifications` resource.
 ///
 /// # Arguments
 ///
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
-    const DISPLAY_CHANGE_CHECK_FREQ_MS: u64 = 1000;
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
@@ -70,6 +71,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     };
     let workspace_menu_status =
         |config: Option<Res<Config>>| config.is_some_and(|config| config.workspace_menu_status());
+    let native_tabs_enabled =
+        |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 
     app.add_systems(
         Startup,
@@ -77,16 +80,17 @@ pub fn register_systems(app: &mut bevy::app::App) {
     );
     app.add_systems(
         PreUpdate,
-        (systems::dispatch_toplevel_triggers, systems::pump_events),
+        (systems::window_creation_event, systems::pump_events),
     );
     app.add_systems(
         Update,
         (
-            triggers::apply_window_defaults,
-            triggers::apply_window_positions,
-            triggers::cleanup_native_tab_adoption
-                .after(triggers::apply_window_defaults)
-                .after(triggers::apply_window_positions),
+            (
+                triggers::apply_window_defaults,
+                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
+                triggers::apply_window_positions,
+            )
+                .chain(),
             (
                 systems::add_existing_process,
                 systems::add_existing_application,
@@ -113,17 +117,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
             state::periodic_state_save.run_if(on_timer(Duration::from_secs(300))),
             state::cleanup_on_exit,
         ),
-    );
-    app.add_systems(
-        Update,
-        (
-            systems::display_changes_watcher,
-            workspace::workspace_change_watcher,
-        )
-            .run_if(resource_exists::<PollForNotifications>)
-            .run_if(on_timer(Duration::from_millis(
-                DISPLAY_CHANGE_CHECK_FREQ_MS,
-            ))),
     );
     app.add_systems(
         PostUpdate,
@@ -230,8 +223,6 @@ pub struct Scrolling {
     pub position: f64,
     /// When true, the user's fingers are on the trackpad.
     pub is_user_swiping: bool,
-    pub fingers_count: Option<usize>,
-    pub started_focused: Option<Entity>,
     /// Last time a physical swipe event was received.
     pub last_event: Instant,
 }
@@ -242,8 +233,6 @@ impl Default for Scrolling {
             velocity: 0.0,
             position: 0.0,
             is_user_swiping: false,
-            fingers_count: None,
-            started_focused: None,
             last_event: Instant::now(),
         }
     }
@@ -350,52 +339,10 @@ impl Timeout {
 #[derive(Component)]
 pub struct StrayFocusEvent(pub WinID);
 
-#[derive(Clone, Copy, Debug)]
-pub enum OsFocusReconcileReason {
-    AppActivated,
-    FrontSwitched,
-    AppVisible,
-    WindowCreated,
-    Retry,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum OsFocusTarget {
-    #[default]
-    Unknown,
-    ManagedWindow,
-    UnmanagedWindow,
-    UntrackedWindow,
-    UntrackedApp,
-}
-
-#[derive(Default, Resource, Debug)]
-pub struct OsFocusState {
-    pub app_entity: Option<Entity>,
-    pub pid: Option<Pid>,
-    pub window_id: Option<WinID>,
-    pub reason: Option<OsFocusReconcileReason>,
-    pub target: OsFocusTarget,
-}
-
-/// Component used as a bounded retry mechanism when AX has not caught up with
-/// a macOS focus/app activation event yet.
+/// Component used as a retry mechanism when `focused_window_id()` fails during
+/// an `ApplicationFrontSwitched` event (e.g. transient `kAXErrorCannotComplete`).
 #[derive(Component)]
-pub struct RetryFrontSwitch {
-    pub app_entity: Option<Entity>,
-    pub attempts_remaining: u8,
-    pub timer: Timer,
-}
-
-impl RetryFrontSwitch {
-    pub fn new(app_entity: Option<Entity>) -> Self {
-        Self {
-            app_entity,
-            attempts_remaining: 4,
-            timer: Timer::from_seconds(0.05, bevy::time::TimerMode::Repeating),
-        }
-    }
-}
+pub struct RetryFrontSwitch(pub Entity);
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);
@@ -467,32 +414,8 @@ pub struct MissionControlActive(pub bool);
 #[derive(Resource)]
 pub struct FocusFollowsMouse(pub Option<WinID>);
 
-/// Resource to control whether the application should poll for notifications.
-#[derive(PartialEq, Resource)]
-pub struct PollForNotifications;
-
 #[derive(PartialEq, Resource)]
 pub struct Initializing;
-
-#[derive(Resource)]
-pub struct PendingCommandFocus {
-    pub target: Entity,
-    pub source_entities: Vec<Entity>,
-    pub remaining_source_bounces: u8,
-}
-
-impl PendingCommandFocus {
-    pub fn new(target: Entity, source_entities: Vec<Entity>) -> Self {
-        Self {
-            target,
-            source_entities,
-            remaining_source_bounces: 3,
-        }
-    }
-}
-
-#[derive(Component)]
-pub struct NativeTabAdoption;
 
 /// Bevy event trigger for spawning new windows.
 #[derive(BevyEvent)]
@@ -507,56 +430,95 @@ pub struct SendMessageTrigger(pub Event);
 #[derive(BevyEvent)]
 pub struct RestoreWindowState;
 
-#[instrument(level = Level::TRACE, skip(commands))]
-pub fn reposition_entity(entity: Entity, origin: Origin, commands: &mut Commands) {
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(RepositionMarker(origin));
-    }
+pub trait SpawnCommandsExt {
+    fn reposition_entity(&mut self, entity: Entity, origin: Origin);
+
+    fn resize_entity(&mut self, entity: Entity, size: Size);
+
+    fn reshuffle_around(&mut self, entity: Entity);
+
+    fn ensure_visible(&mut self, entity: Entity);
+
+    fn focus_entity(&mut self, entity: Entity, raise: bool);
+
+    fn flash_message(&mut self, message: String, duration: f32);
+
+    // Spawns a layout strip in a single place, to properly insert all components.
+    fn spawn_layout_strip(
+        &mut self,
+        layout_strip: LayoutStrip,
+        origin: Origin,
+        display_entity: Entity,
+        active: bool,
+    ) -> EntityCommands<'_>;
 }
 
-#[instrument(level = Level::TRACE, skip(commands))]
-pub fn snap_entity_position(entity: Entity, origin: Origin, commands: &mut Commands) {
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(Position(origin));
-        entity_commands.try_remove::<RepositionMarker>();
+impl SpawnCommandsExt for Commands<'_, '_> {
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn reposition_entity(&mut self, entity: Entity, origin: Origin) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(RepositionMarker(origin));
+        }
     }
-}
 
-#[instrument(level = Level::TRACE, skip(commands))]
-pub fn resize_entity(entity: Entity, size: Size, commands: &mut Commands) {
-    if size.x <= 0 || size.y <= 0 {
-        return;
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn resize_entity(&mut self, entity: Entity, size: Size) {
+        if size.x <= 0 || size.y <= 0 {
+            return;
+        }
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(ResizeMarker(size));
+        }
     }
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(ResizeMarker(size));
-    }
-}
 
-#[instrument(level = Level::TRACE, skip(commands))]
-pub fn reshuffle_around(entity: Entity, commands: &mut Commands) {
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(ReshuffleAroundMarker);
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn reshuffle_around(&mut self, entity: Entity) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(ReshuffleAroundMarker);
+        }
     }
-}
 
-#[instrument(level = Level::TRACE, skip(commands))]
-#[allow(dead_code)]
-pub fn ensure_visible(entity: Entity, commands: &mut Commands) {
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(EnsureVisibleMarker);
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn ensure_visible(&mut self, entity: Entity) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(EnsureVisibleMarker);
+        }
     }
-}
 
-pub fn focus_entity(entity: Entity, raise: bool, commands: &mut Commands) {
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(FocusedMarker);
-        commands.trigger(focus::FocusWindow { entity, raise });
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn focus_entity(&mut self, entity: Entity, raise: bool) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(FocusedMarker);
+            self.trigger(focus::FocusWindow { entity, raise });
+        }
     }
-}
 
-pub fn flash_message(message: String, duration: f32, commands: &mut Commands) {
-    let timeout = Timeout::new(Duration::from_secs_f32(duration), None, commands);
-    commands.spawn((timeout, FlashMessage(message)));
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn flash_message(&mut self, message: String, duration: f32) {
+        let timeout = Timeout::new(Duration::from_secs_f32(duration), None, self);
+        self.spawn((timeout, FlashMessage(message)));
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn spawn_layout_strip(
+        &mut self,
+        layout_strip: LayoutStrip,
+        origin: Origin,
+        display_entity: Entity,
+        active: bool,
+    ) -> EntityCommands<'_> {
+        let mut spawned = self.spawn((
+            layout_strip,
+            Position(origin),
+            SelectedVirtualMarker,
+            FloatingLayer::default(),
+            ChildOf(display_entity),
+        ));
+        if active {
+            spawned.insert(ActiveWorkspaceMarker);
+        }
+        spawned
+    }
 }
 
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
@@ -574,9 +536,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             is_dark: crate::util::is_dark_mode(),
         })
         .insert_resource(MissionControlActive(false))
-        .init_resource::<OsFocusState>()
         .insert_resource(FocusFollowsMouse(None))
-        .insert_resource(PollForNotifications)
         .insert_resource(Initializing)
         .insert_non_send_resource(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
@@ -619,7 +579,7 @@ impl WindowProperties {
     pub fn new(app: &Application, window: &Window, config: &Config) -> Self {
         let bundle_id = app.bundle_id().unwrap_or_default();
         let title = window.title().unwrap_or_default();
-        let params = config.find_window_properties(&title, bundle_id);
+        let params = config.find_window_properties(&title, &bundle_id);
         Self { params }
     }
 
