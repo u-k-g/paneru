@@ -415,12 +415,20 @@ impl WindowManagerApi for WindowManagerOS {
         spaces: &[WorkspaceId],
     ) -> Result<(Vec<Window>, Vec<WinID>)> {
         let global_window_list = existing_application_window_list(self.main_cid, app, spaces)?;
+        let found_windows = app.window_list();
         if global_window_list.is_empty() {
-            return Err(Error::InvalidInput(format!("No windows found for {app}")));
+            if found_windows.is_empty() {
+                return Err(Error::InvalidInput(format!("No windows found for {app}")));
+            }
+
+            debug!(
+                "{app} has no SkyLight windows, falling back to {} AX windows",
+                found_windows.len()
+            );
+            return Ok((found_windows, vec![]));
         }
         debug!("{app} has global windows: {global_window_list:?}");
 
-        let found_windows = app.window_list();
         if found_windows.len() == global_window_list.len() {
             debug!("All windows for {:?} are now resolved", app.psn());
             return Ok((found_windows, vec![]));
