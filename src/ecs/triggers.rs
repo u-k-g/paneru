@@ -232,10 +232,10 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        if matches!(
-            windows.get_managed(entity),
-            Some((_, _, Some(Unmanaged::Hidden)))
-        ) {
+        let managed = windows
+            .get_managed(entity)
+            .and_then(|(_, _, managed)| managed);
+        if matches!(managed, Some(Unmanaged::Hidden)) {
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<Unmanaged>();
             }
@@ -264,6 +264,11 @@ pub(super) fn window_focused_trigger(
                 owning_workspace_id = Some(strip.id());
                 owner = Some((strip_entity, active));
             }
+        }
+
+        if owner.is_none() && managed.is_none() {
+            // The window just spawned and has not yet been inserted into the strip.
+            continue;
         }
 
         if let Some((strip_entity, active)) = owner
