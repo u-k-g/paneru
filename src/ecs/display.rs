@@ -1,4 +1,4 @@
-use bevy::app::{App, Plugin, Update};
+use bevy::app::{App, Plugin, PreUpdate, Update};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -6,21 +6,25 @@ use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With};
-use bevy::ecs::system::{Commands, Local, Query, Res};
+use bevy::ecs::system::{Commands, Local, NonSend, Query, Res};
 use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
+use objc2_app_kit::NSScreen;
 use objc2_core_graphics::CGDirectDisplayID;
+use std::pin::Pin;
 use std::time::Duration;
 use tracing::{Level, debug, error, instrument};
 
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{
-    ActiveDisplayMarker, RefreshWindowSizes, SendMessageTrigger, SpawnCommandsExt, Timeout,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, ReadDisplayProperties, RefreshWindowSizes,
+    SendMessageTrigger, SpawnCommandsExt, Timeout,
 };
 use crate::events::Event;
-use crate::manager::{Display, WindowManager};
-use crate::platform::WorkspaceId;
+use crate::manager::{Display, WindowManager, irect_from};
+use crate::platform::{PlatformCallbacks, WorkspaceId};
+use crate::util::read_screen_property;
 
 const ORPHANED_SPACES_TIMEOUT_SEC: u64 = 30;
 
@@ -28,7 +32,9 @@ pub struct DisplayEventsPlugin;
 
 impl Plugin for DisplayEventsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (displays_rearranged, display_change_trigger))
+        app.add_systems(PreUpdate, display_change_handler);
+        app.add_systems(Update, reconcile_displays)
+            .add_observer(read_display_properties_trigger)
             .add_observer(cleanup_active_display_marker);
     }
 }
@@ -54,7 +60,7 @@ fn cleanup_active_display_marker(
 /// Handles display change events.
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn display_change_trigger(
+fn display_change_handler(
     mut messages: MessageReader<Event>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     window_manager: Res<WindowManager>,
@@ -85,45 +91,88 @@ fn display_change_trigger(
     commands.trigger(SendMessageTrigger(Event::SpaceChanged));
 }
 
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn displays_rearranged(
+/// Full reconciliation of the ECS display set against the OS truth.
+///
+/// Runs on events where the per-display add/remove/move flags are unreliable or
+/// absent: waking from sleep, resolution / arrangement changes, and configuration
+/// events. Rather than trust a single `display_id` flag, it diffs the live
+/// `present_displays()` list against the spawned `Display` entities and applies
+/// the same add / remove / move primitives the event handlers use. It also
+/// forces the active workspace to re-tile, because macOS relocates windows while
+/// asleep even when the display set is unchanged.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub(crate) fn reconcile_displays(
     mut messages: MessageReader<Event>,
     workspaces: Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
     mut displays: Query<(&mut Display, Entity)>,
+    active_strips: Query<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
-    config: Res<Config>,
     mut retries: Local<HashSet<CGDirectDisplayID>>,
     mut commands: Commands,
 ) {
-    for event in messages.read() {
-        match event {
-            Event::DisplayAdded { display_id } => {
-                add_display(
-                    *display_id,
-                    &workspaces,
-                    &window_manager,
-                    &config,
-                    &mut retries,
-                    &mut commands,
-                );
-            }
-            Event::DisplayRemoved { display_id } => {
-                remove_display(*display_id, &workspaces, &mut displays, &mut commands);
-            }
-            Event::DisplayMoved { display_id } => {
-                move_display(
-                    *display_id,
-                    &mut displays,
-                    &window_manager,
-                    &workspaces,
-                    &config,
-                    &mut commands,
-                );
-            }
-            _ => continue,
-        }
-        commands.trigger(SendMessageTrigger(Event::DisplayChanged));
+    let needs_reconcile = messages.read().any(|event| {
+        matches!(
+            event,
+            Event::SystemWoke { .. }
+                | Event::DisplayAdded { .. }
+                | Event::DisplayRemoved { .. }
+                | Event::DisplayMoved { .. }
+                | Event::DisplayResized { .. }
+                | Event::DisplayConfigured { .. }
+        )
+    });
+    if !needs_reconcile {
+        return;
     }
+
+    debug!("reconciling displays against OS after wake / resize / configure");
+
+    let present_ids: HashSet<CGDirectDisplayID> = window_manager
+        .0
+        .present_displays()
+        .iter()
+        .map(|(display, _)| display.id())
+        .collect();
+    let existing_ids: HashSet<CGDirectDisplayID> =
+        displays.iter().map(|(display, _)| display.id()).collect();
+
+    // Displays that vanished while we were away (e.g. unplugged during sleep).
+    for display_id in existing_ids.difference(&present_ids).copied() {
+        remove_display(display_id, &workspaces, &mut displays, &mut commands);
+    }
+
+    // Displays that appeared while we were away.
+    for display_id in present_ids.difference(&existing_ids).copied() {
+        add_display(
+            display_id,
+            &workspaces,
+            &window_manager,
+            &mut retries,
+            &mut commands,
+        );
+    }
+
+    // Displays that are still present: refresh their bounds (resolution or
+    // menubar may have changed) and re-home any workspaces that drifted.
+    for display_id in present_ids.intersection(&existing_ids).copied() {
+        move_display(
+            display_id,
+            &mut displays,
+            &window_manager,
+            &workspaces,
+            &mut commands,
+        );
+    }
+
+    // Re-tile the active workspace even when the topology is unchanged — the OS
+    // shuffles window frames across a sleep/wake cycle.
+    for entity in active_strips {
+        if let Ok(mut cmd) = commands.get_entity(entity) {
+            cmd.insert(RefreshWindowSizes::default());
+        }
+    }
+
+    commands.trigger(SendMessageTrigger(Event::DisplayChanged));
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(display_id))]
@@ -131,12 +180,11 @@ fn add_display(
     display_id: CGDirectDisplayID,
     existing_strips: &Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
     window_manager: &WindowManager,
-    config: &Config,
     retries: &mut HashSet<CGDirectDisplayID>,
     commands: &mut Commands,
 ) {
     debug!("Display Added: {display_id:?}");
-    let Some((mut display, workspace_ids)) = window_manager
+    let Some((display, workspace_ids)) = window_manager
         .0
         .present_displays()
         .into_iter()
@@ -156,9 +204,9 @@ fn add_display(
         return;
     };
 
-    display.set_menubar_height_override(config.menubar_height());
     let display_bounds = display.bounds();
     let display_entity = commands.spawn(display).id();
+    commands.trigger(ReadDisplayProperties(display_entity));
 
     reparent_existing_workspaces(
         &workspace_ids,
@@ -211,7 +259,7 @@ fn remove_display(
     }
 
     if let Ok(mut commands) = commands.get_entity(display_entity) {
-        commands.despawn();
+        commands.try_despawn();
     }
 }
 
@@ -221,7 +269,6 @@ fn move_display(
     displays: &mut Query<(&mut Display, Entity)>,
     window_manager: &Res<WindowManager>,
     existing_strips: &Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
-    config: &Config,
     commands: &mut Commands,
 ) {
     debug!("Display Moved: {display_id:?}");
@@ -241,7 +288,7 @@ fn move_display(
         return;
     };
     *display = moved_display;
-    display.set_menubar_height_override(config.menubar_height());
+    commands.trigger(ReadDisplayProperties(display_entity));
 
     reparent_existing_workspaces(
         &workspace_ids,
@@ -271,9 +318,9 @@ fn reparent_existing_workspaces(
                         debug!("reparenting workspace {id} to display {display_entity}");
                         cmd.try_remove::<Timeout>()
                             .try_remove::<ChildOf>()
-                            .insert(ChildOf(display_entity));
+                            .try_insert(ChildOf(display_entity));
 
-                        cmd.insert(RefreshWindowSizes::default());
+                        cmd.try_insert(RefreshWindowSizes::default());
                     }
                 }
             }
@@ -303,5 +350,50 @@ impl FloatingLayer {
             Self::Front => Self::Behind,
             Self::Behind => Self::Front,
         }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn read_display_properties_trigger(
+    trigger: On<ReadDisplayProperties>,
+    mut displays: Query<(&mut Display, Entity)>,
+    platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
+    config: Option<Res<Config>>,
+    mut commands: Commands,
+) {
+    let Ok((mut display, entity)) = displays.get_mut(trigger.event().0) else {
+        return;
+    };
+    let display_id = display.id();
+
+    // NSScreen::screen needs to run in the main thread, thus we run it in a NonSend trigger.
+    let Some(screens) = platform.map(|platform| NSScreen::screens(platform.main_thread_marker))
+    else {
+        return;
+    };
+
+    let notch = read_screen_property(&screens, display_id, |screen| {
+        let insets = screen.safeAreaInsets();
+        debug!("notch on display {display_id}: {insets:?}");
+        insets.top as i32
+    });
+    if let Some(height) = notch {
+        display.set_notch_height(height);
+    }
+
+    let dock = read_screen_property(&screens, display_id, |screen| {
+        let visible_frame = irect_from(screen.visibleFrame());
+        display.locate_dock(&visible_frame)
+    });
+    if let Some(dock) = dock {
+        debug!("dock on display {display_id}: {:?}", dock);
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(dock);
+        }
+    }
+
+    if let Some(config) = config {
+        let height = config.menubar_height();
+        display.set_menubar_height_override(height);
     }
 }

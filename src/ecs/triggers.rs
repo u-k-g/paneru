@@ -1,23 +1,21 @@
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
-use bevy::ecs::lifecycle::{Add, Remove};
+use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
-use bevy::ecs::system::{Commands, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
-use objc2_app_kit::NSScreen;
-use objc2_foundation::{NSNumber, NSString, ns_string};
-use std::pin::Pin;
+use std::cmp::Ordering;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SelectedVirtualMarker, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
+    Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -25,15 +23,15 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, LocateDockTrigger,
-    Position, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
+    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
     VerifyWindowPosition, WidthRatio, WindowProperties,
 };
 use crate::events::Event;
 use crate::manager::{
-    Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding, irect_from,
+    Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
-use crate::platform::{PlatformCallbacks, WinID};
+use crate::platform::WinID;
 use crate::util::symlink_target;
 
 /// Computes the passthrough keybinding set for the given window/app and
@@ -275,9 +273,7 @@ pub(super) fn window_focused_trigger(
             && !active
             && let Ok(mut entity_commands) = commands.get_entity(strip_entity)
         {
-            entity_commands
-                .try_insert(ActiveWorkspaceMarker)
-                .try_insert(SelectedVirtualMarker);
+            entity_commands.try_insert(ActiveWorkspaceMarker);
         }
 
         // Record before the already-focused short-circuit below: focus_entity
@@ -561,38 +557,35 @@ pub(super) fn window_unmanaged_trigger(
 
     // Skip the active-display reposition/resize during init; the strip
     // removal below still has to run.
-    if initializing.is_none() {
-        if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
-            let x = (f64::from(display_bounds.width()) * rx) as i32;
-            let y = (f64::from(display_bounds.height()) * ry) as i32;
-            let w = (f64::from(display_bounds.width()) * rw) as i32;
-            let h = (f64::from(display_bounds.height()) * rh) as i32;
-            commands.reposition_entity(entity, Origin::new(x, y));
-            commands.resize_entity(entity, Size::new(w, h));
-        } else if !properties.floating() {
-            let max_width = display_bounds.width() * UNMANAGED_MAX_SCREEN_RATIO_NUM
-                / UNMANAGED_MAX_SCREEN_RATIO_DEN;
-            let max_height = display_bounds.height() * UNMANAGED_MAX_SCREEN_RATIO_NUM
-                / UNMANAGED_MAX_SCREEN_RATIO_DEN;
-            let new_width = frame.width().min(max_width);
-            let new_height = frame.height().min(max_height);
+    if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
+        let x = (f64::from(display_bounds.width()) * rx) as i32;
+        let y = (f64::from(display_bounds.height()) * ry) as i32;
+        let w = (f64::from(display_bounds.width()) * rw) as i32;
+        let h = (f64::from(display_bounds.height()) * rh) as i32;
+        commands.reposition_entity(entity, Origin::new(x, y));
+        commands.resize_entity(entity, Size::new(w, h));
+    } else if initializing.is_none() && !properties.floating() {
+        let max_width = display_bounds.width() * UNMANAGED_MAX_SCREEN_RATIO_NUM
+            / UNMANAGED_MAX_SCREEN_RATIO_DEN;
+        let max_height = display_bounds.height() * UNMANAGED_MAX_SCREEN_RATIO_NUM
+            / UNMANAGED_MAX_SCREEN_RATIO_DEN;
+        let new_width = frame.width().min(max_width);
+        let new_height = frame.height().min(max_height);
 
-            let mut target_frame =
-                IRect::from_corners(frame.min, frame.min + Origin::new(new_width, new_height));
-            target_frame =
-                clamp_origin_to_bounds(target_frame, target_frame.size(), display_bounds);
-            target_frame =
-                offset_frame_within_bounds(target_frame, display_bounds, UNMANAGED_POP_OFFSET);
+        let mut target_frame =
+            IRect::from_corners(frame.min, frame.min + Origin::new(new_width, new_height));
+        target_frame = clamp_origin_to_bounds(target_frame, target_frame.size(), display_bounds);
+        target_frame =
+            offset_frame_within_bounds(target_frame, display_bounds, UNMANAGED_POP_OFFSET);
 
-            if target_frame.size() != frame.size() {
-                commands.resize_entity(
-                    entity,
-                    Size::new(target_frame.width(), target_frame.height()),
-                );
-            }
-            if target_frame.min != frame.min {
-                commands.reposition_entity(entity, target_frame.min);
-            }
+        if target_frame.size() != frame.size() {
+            commands.resize_entity(
+                entity,
+                Size::new(target_frame.width(), target_frame.height()),
+            );
+        }
+        if target_frame.min != frame.min {
+            commands.reposition_entity(entity, target_frame.min);
         }
     }
 
@@ -956,13 +949,12 @@ pub(super) fn apply_window_defaults(
         debug!("Applying window defaults for '{}'", window.id());
 
         let initializing = initializing.is_some();
-        let floating = properties.floating();
 
         // Do not add padding to floating windows.
-        if floating {
+        if properties.floating() {
             // Skip grid_ratios during init: we don't know this window's display.
             if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
-                let bounds = active_display.bounds();
+                let bounds = active_display.actual_bounds(&config);
                 let x = (f64::from(bounds.width()) * rx) as i32;
                 let y = (f64::from(bounds.height()) * ry) as i32;
                 let w = (f64::from(bounds.width()) * rw) as i32;
@@ -987,7 +979,7 @@ pub(super) fn apply_window_defaults(
         // window on an inactive display stays put.
         if let Some(width) = properties.width_ratio() {
             _ = window.update_frame().inspect_err(|err| error!("{err}"));
-            let bounds = active_display.bounds();
+            let bounds = active_display.actual_bounds(&config);
             let (_, pad_right, _, pad_left) = config.edge_padding();
             let padded_width = bounds.width() - pad_left - pad_right;
             let new_width = (f64::from(padded_width) * width).round() as i32;
@@ -1197,39 +1189,6 @@ pub(super) fn window_removal_trigger(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub(super) fn locate_dock_trigger(
-    trigger: On<LocateDockTrigger>,
-    displays: Query<(&mut Display, Entity)>,
-    platform: Option<NonSend<Pin<Box<PlatformCallbacks>>>>,
-    mut commands: Commands,
-) {
-    let Ok((display, entity)) = displays.get(trigger.event().0) else {
-        return;
-    };
-    let display_id = display.id();
-
-    // NSScreen::screen needs to run in the main thread, thus we run it in a NonSend trigger.
-    let screens = platform.map(|platform| NSScreen::screens(platform.main_thread_marker));
-    let dock = screens.as_ref().and_then(|screens| {
-        screens.iter().find_map(|screen| {
-            let dict = screen.deviceDescription();
-            let numbers = unsafe { dict.cast_unchecked::<NSString, NSNumber>() };
-            let id = numbers.objectForKey(ns_string!("NSScreenNumber"));
-            id.is_some_and(|id| id.as_u32() == display_id).then(|| {
-                let visible_frame = irect_from(screen.visibleFrame());
-                display.locate_dock(&visible_frame)
-            })
-        })
-    });
-    if let Some(dock) = dock {
-        debug!("dock on display {display_id}: {:?}", dock);
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(dock);
-        }
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
 pub(super) fn send_message_trigger(
     trigger: On<SendMessageTrigger>,
     mut messages: MessageWriter<Event>,
@@ -1249,5 +1208,98 @@ pub(super) fn cleanup_timeout_trigger(
         && let Some(system_id) = timeout.system_id
     {
         commands.unregister_system(system_id);
+    }
+}
+
+pub(super) fn window_resize_verifier(
+    mut removed: RemovedComponents<ResizeMarker>,
+    mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
+    layout_strips: Query<&LayoutStrip>,
+    mut commands: Commands,
+) {
+    use std::cmp::Ordering;
+    for entity in removed.read() {
+        let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
+            continue;
+        };
+        let Ok(frame) = window.update_frame() else {
+            continue;
+        };
+
+        let actual_size = frame.size();
+        let expected_size = bounds.0;
+
+        // note: macOS loves to make window sizes to even numbers, so we treat actual+1 as equal.
+        let width_ord = fuzzy_equal(actual_size.x, expected_size.x);
+        let height_ord = fuzzy_equal(actual_size.y, expected_size.y);
+
+        if width_ord == Ordering::Equal && height_ord == Ordering::Equal {
+            continue;
+        }
+        debug!(
+            "window '{}'({}) did not fully resized to {}, was {} instead",
+            window.title().unwrap_or_default(),
+            window.id(),
+            expected_size,
+            actual_size,
+        );
+        bounds.0 = actual_size;
+
+        // we may hitting minimum width constraint on this window or this window isn't resizable.
+        // if this window is a part of a column, other windows in the column might have resized(shrunk) successfully,
+        // which leaves an empty space next to those windows.
+        // try to expand those windows to fill the empty space. (it's free real estate after all)
+        //
+        // note that those windows might have max window constraints or isn't resiable.
+        // so we need to ignore cases where windows are failing to expand to the target.
+        if width_ord == Ordering::Less {
+            let Some(column) = layout_strips.iter().find_map(|strip| {
+                strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|idx| strip.get(idx).ok())
+            }) else {
+                continue;
+            };
+
+            let get_window_frame = |entity| {
+                windows
+                    .get(entity)
+                    .map(|(_, position, bounds)| {
+                        IRect::from_corners(position.0, position.0 + bounds.0)
+                    })
+                    .ok()
+            };
+
+            let Some(column_width) = column.width(&get_window_frame) else {
+                continue;
+            };
+
+            column
+                .window_iter()
+                .filter(|e| *e != entity)
+                .for_each(|entity| {
+                    if let Some(width) = get_window_frame(entity).as_ref().map(IRect::width)
+                        && width < column_width
+                    {
+                        commands.resize_entity(entity, Size::new(column_width, actual_size.y));
+                    }
+                });
+        }
+    }
+}
+
+fn fuzzy_equal<N>(actual_size: N, expected_size: N) -> Ordering
+where
+    N: std::ops::Sub<Output = N> + Ord + From<i8>,
+{
+    let diff = expected_size - actual_size;
+
+    if diff < N::from(-1) {
+        Ordering::Less
+    } else if diff > N::from(1) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
     }
 }

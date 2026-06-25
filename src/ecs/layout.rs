@@ -1,5 +1,5 @@
 use bevy::app::{App, Plugin, Update};
-use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut as _};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
@@ -7,7 +7,6 @@ use bevy::ecs::query::{Changed, Has, Or, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
-use bevy::ecs::world::Ref;
 use bevy::math::IRect;
 use std::collections::{HashMap, VecDeque};
 use stdext::function_name;
@@ -43,6 +42,7 @@ impl Plugin for LayoutEventsPlugin {
                 )
                     .chain()
                     .after(super::systems::finish_setup)
+                    .before(super::workspace::show_active_workspace)
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
@@ -75,11 +75,36 @@ impl StackItem {
         }
     }
 
-    /// Returns all window entities within the item.
-    pub fn all_windows(&self) -> Vec<Entity> {
+    /// Returns an iterator over all window entities in this stack item.
+    pub fn window_iter(&self) -> StackItemIter<'_> {
         match self {
-            StackItem::Single(id) => vec![*id],
-            StackItem::Tabs(tabs) => tabs.clone(),
+            StackItem::Single(entity) => StackItemIter::Single(std::iter::once(*entity)),
+            StackItem::Tabs(tabs) => StackItemIter::Tabs(tabs.iter().copied()),
+        }
+    }
+}
+
+pub enum StackItemIter<'a> {
+    Single(std::iter::Once<Entity>),
+    Tabs(std::iter::Copied<std::slice::Iter<'a, Entity>>),
+}
+
+impl Iterator for StackItemIter<'_> {
+    type Item = Entity;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            StackItemIter::Single(iter) => iter.next(),
+            StackItemIter::Tabs(iter) => iter.next(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for StackItemIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            StackItemIter::Single(iter) => iter.next_back(),
+            StackItemIter::Tabs(iter) => iter.next_back(),
         }
     }
 }
@@ -106,6 +131,29 @@ impl Column {
             Column::Stack(stack) => stack.first().and_then(StackItem::top),
             Column::Tabs(tabs) => tabs.first().copied(),
         }
+    }
+
+    /// Returns an iterator over all window entities in this column
+    pub fn window_iter(&self) -> ColumnWindowIter<'_> {
+        match self {
+            Column::Single(entity) | Column::Fullscren(entity) => {
+                ColumnWindowIter::Single(std::iter::once(*entity))
+            }
+            Column::Tabs(tabs) => ColumnWindowIter::Tabs(tabs.iter().copied()),
+            Column::Stack(items) => {
+                ColumnWindowIter::Stack(items.iter().flat_map(StackItem::window_iter))
+            }
+        }
+    }
+
+    pub fn width<W>(&self, get_window_frame: &W) -> Option<i32>
+    where
+        W: Fn(Entity) -> Option<IRect>,
+    {
+        self.window_iter()
+            .filter_map(get_window_frame)
+            .map(|frame| frame.width())
+            .max()
     }
 
     /// Returns the entity at the given index, or the last entity if the index exceeds the size.
@@ -147,6 +195,30 @@ impl Column {
                     tabs.swap(0, pos);
                 }
             }
+        }
+    }
+}
+
+pub enum ColumnWindowIter<'a> {
+    Single(std::iter::Once<Entity>),
+    Tabs(std::iter::Copied<std::slice::Iter<'a, Entity>>),
+    Stack(
+        std::iter::FlatMap<
+            std::slice::Iter<'a, StackItem>,
+            StackItemIter<'a>,
+            fn(&'a StackItem) -> StackItemIter<'a>,
+        >,
+    ),
+}
+
+impl Iterator for ColumnWindowIter<'_> {
+    type Item = Entity;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(iter) => iter.next(),
+            Self::Tabs(iter) => iter.next(),
+            Self::Stack(iter) => iter.next(),
         }
     }
 }
@@ -241,21 +313,30 @@ impl LayoutStrip {
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
-        let mut group = Vec::new();
-        for entity in entities {
-            if !group.contains(entity) {
-                group.push(*entity);
-            }
-        }
+        let group = dedup_entities(entities);
         if group.is_empty() {
             return;
         }
 
+        // Re-grouping existing members keeps them at their lowest current index;
+        // a foreign group lands at the end.
         let index = group
             .iter()
             .filter_map(|entity| self.index_of(*entity).ok())
             .min()
             .unwrap_or(self.len());
+
+        self.insert_tab_group_at(index, &group);
+    }
+
+    /// Inserts `entities` as a single column at `index` (clamped to the column
+    /// count), after removing any existing occurrences. A one-element group
+    /// becomes a `Single` column, more than one a `Tabs` column.
+    pub fn insert_tab_group_at(&mut self, index: usize, entities: &[Entity]) {
+        let group = dedup_entities(entities);
+        if group.is_empty() {
+            return;
+        }
 
         for entity in &group {
             self.remove(*entity);
@@ -543,7 +624,7 @@ impl LayoutStrip {
             .iter()
             .flat_map(|column| match column {
                 Column::Single(entity) | Column::Fullscren(entity) => vec![*entity],
-                Column::Stack(items) => items.iter().flat_map(StackItem::all_windows).collect(),
+                Column::Stack(items) => items.iter().flat_map(StackItem::window_iter).collect(),
                 Column::Tabs(ids) => ids.clone(),
             })
             .collect()
@@ -565,7 +646,7 @@ impl LayoutStrip {
         self.columns.iter()
     }
 
-    #[instrument(level = Level::TRACE, skip_all, fields(offset))]
+    #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
     pub fn relative_positions<W>(
         &self,
         layout_strip_height: i32,
@@ -595,11 +676,6 @@ impl LayoutStrip {
                 let heights =
                     binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
 
-                let column_width = items
-                    .first()
-                    .and_then(|item| item.top().and_then(get_window_frame))
-                    .map(|frame| frame.width())?;
-
                 let mut next_y = 0;
                 let frames = items
                     .into_iter()
@@ -607,8 +683,9 @@ impl LayoutStrip {
                     .filter_map(|(item, height)| {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
+                        let width = frame.width();
                         frame.min.x = position;
-                        frame.max.x = frame.min.x + column_width;
+                        frame.max.x = frame.min.x + width;
 
                         frame.min.y = next_y;
                         frame.max.y = frame.min.y + height;
@@ -616,11 +693,7 @@ impl LayoutStrip {
                         next_y = frame.max.y;
 
                         // Return ALL windows in the item with the same frame
-                        let results = item
-                            .all_windows()
-                            .into_iter()
-                            .map(|e| (e, frame))
-                            .collect::<Vec<_>>();
+                        let results = item.window_iter().map(|e| (e, frame)).collect::<Vec<_>>();
                         Some(results)
                     })
                     .flatten()
@@ -638,21 +711,15 @@ impl LayoutStrip {
     {
         let mut left_edge = 0;
 
-        self.all_columns()
-            .into_iter()
-            .filter_map(|entity| {
-                let frame = get_window_frame(entity);
-                let column = self
-                    .index_of(entity)
-                    .ok()
-                    .and_then(|index| self.columns.get(index));
-                column.zip(frame)
-            })
-            .map(move |(column, frame)| {
+        self.columns().filter_map(move |column| {
+            let width = column.width(get_window_frame);
+
+            width.map(|width| {
                 let temp = left_edge;
-                left_edge += frame.width();
+                left_edge += width;
                 (column, temp)
             })
+        })
     }
 
     pub fn above(&self, entity: Entity) -> Option<Entity> {
@@ -714,6 +781,16 @@ impl std::fmt::Display for LayoutStrip {
             .collect::<Vec<_>>();
         write!(f, "[{}]", out.join(", "))
     }
+}
+
+/// Deduplicates `entities`, preserving first-seen order.
+fn dedup_entities(entities: &[Entity]) -> Vec<Entity> {
+    let mut seen = EntityHashSet::default();
+    entities
+        .iter()
+        .copied()
+        .filter(|entity| seen.insert(*entity))
+        .collect()
 }
 
 fn binpack_heights(heights: &[i32], min_height: i32, total_height: i32) -> Option<Vec<i32>> {
@@ -905,11 +982,17 @@ fn layout_strip_changed(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn reshuffle_layout_strip(
-    markers: Populated<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
-    strips: Query<(&LayoutStrip, Entity, &Position, &ChildOf)>,
+    markers: Query<(Entity, &LayoutPosition), With<ReshuffleAroundMarker>>,
+    strips: Query<(
+        &LayoutStrip,
+        Entity,
+        &Position,
+        &ChildOf,
+        Option<Ref<ActiveWorkspaceMarker>>,
+    )>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     windows: Windows,
     config: Res<Config>,
@@ -919,11 +1002,16 @@ fn reshuffle_layout_strip(
         if let Ok(mut cmd) = commands.get_entity(entity) {
             cmd.try_remove::<ReshuffleAroundMarker>();
         }
-        let Some((_, strip_entity, active_strip, child)) =
+        let Some((_, strip_entity, active_strip, child, active_marker)) =
             strips.into_iter().find(|strip| strip.0.contains(entity))
         else {
             return;
         };
+
+        if active_marker.is_some_and(|m| m.is_added()) {
+            trace!("reshuffle_layout_strip: skipping newly active workspace {strip_entity}");
+            return;
+        }
         let Ok((active_display, dock)) = displays.get(child.parent()) else {
             return;
         };
@@ -971,11 +1059,17 @@ fn reshuffle_layout_strip(
 /// the per-window animator slides the entity into its slot. Only when the new
 /// slot would fall past an edge does the strip translate, and only by the
 /// shortfall — never to anchor the entity to a particular position.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_visible_in_strip(
-    markers: Populated<(Entity, &LayoutPosition), With<EnsureVisibleMarker>>,
-    strips: Query<(&LayoutStrip, Entity, &Position, &ChildOf)>,
+    markers: Query<(Entity, &LayoutPosition), With<EnsureVisibleMarker>>,
+    strips: Query<(
+        &LayoutStrip,
+        Entity,
+        &Position,
+        &ChildOf,
+        Option<Ref<ActiveWorkspaceMarker>>,
+    )>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     windows: Windows,
     config: Res<Config>,
@@ -985,11 +1079,16 @@ fn ensure_visible_in_strip(
         if let Ok(mut cmd) = commands.get_entity(entity) {
             cmd.try_remove::<EnsureVisibleMarker>();
         }
-        let Some((_, strip_entity, strip_position, child)) =
+        let Some((_, strip_entity, strip_position, child, active_marker)) =
             strips.into_iter().find(|s| s.0.contains(entity))
         else {
             return;
         };
+
+        if active_marker.is_some_and(|m| m.is_added()) {
+            trace!("ensure_visible_in_strip: skipping newly active workspace {strip_entity}");
+            return;
+        }
         let Ok((display, dock)) = displays.get(child.parent()) else {
             return;
         };
@@ -1035,9 +1134,6 @@ fn position_layout_strips(
 struct StripWindowContext {
     strip_position: Origin,
     swiping: bool,
-    // Cached per strip so parallel window updates keep the same snap/animate
-    // decision that would have been made while iterating the strip directly.
-    workspace_switching: bool,
     display_entity: Entity,
     stacked: bool,
 }
@@ -1047,7 +1143,6 @@ fn insert_strip_window_contexts(
     strip: &LayoutStrip,
     strip_position: Origin,
     swiping: bool,
-    workspace_switching: bool,
     display_entity: Entity,
 ) {
     for column in &strip.columns {
@@ -1056,7 +1151,6 @@ fn insert_strip_window_contexts(
             column,
             strip_position,
             swiping,
-            workspace_switching,
             display_entity,
             matches!(column, Column::Stack(_)),
         );
@@ -1068,7 +1162,6 @@ fn insert_column_window_contexts(
     column: &Column,
     strip_position: Origin,
     swiping: bool,
-    workspace_switching: bool,
     display_entity: Entity,
     stacked: bool,
 ) {
@@ -1079,7 +1172,6 @@ fn insert_column_window_contexts(
                 StripWindowContext {
                     strip_position,
                     swiping,
-                    workspace_switching,
                     display_entity,
                     stacked,
                 },
@@ -1092,7 +1184,6 @@ fn insert_column_window_contexts(
                     item,
                     strip_position,
                     swiping,
-                    workspace_switching,
                     display_entity,
                     stacked,
                 );
@@ -1105,7 +1196,6 @@ fn insert_column_window_contexts(
                     StripWindowContext {
                         strip_position,
                         swiping,
-                        workspace_switching,
                         display_entity,
                         stacked,
                     },
@@ -1120,7 +1210,6 @@ fn insert_stack_item_window_contexts(
     item: &StackItem,
     strip_position: Origin,
     swiping: bool,
-    workspace_switching: bool,
     display_entity: Entity,
     stacked: bool,
 ) {
@@ -1131,7 +1220,6 @@ fn insert_stack_item_window_contexts(
                 StripWindowContext {
                     strip_position,
                     swiping,
-                    workspace_switching,
                     display_entity,
                     stacked,
                 },
@@ -1144,7 +1232,6 @@ fn insert_stack_item_window_contexts(
                     StripWindowContext {
                         strip_position,
                         swiping,
-                        workspace_switching,
                         display_entity,
                         stacked,
                     },
@@ -1163,42 +1250,20 @@ fn position_layout_windows(
         (Entity, &Window, &LayoutPosition, &mut Position, &mut Bounds),
         (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
     >,
-    workspaces: Query<
-        (
-            &LayoutStrip,
-            &Position,
-            Has<Scrolling>,
-            Option<Ref<ActiveWorkspaceMarker>>,
-            &ChildOf,
-        ),
-        With<LayoutStrip>,
-    >,
+    workspaces: Query<(&LayoutStrip, &Position, Has<Scrolling>, &ChildOf), With<LayoutStrip>>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    const OFFSCREEN_THRESHOLD: i32 = 100;
     let offscreen_sliver_width = config.sliver_width();
     let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
-    for (layout_strip, Position(strip_position), swiping, marker, child_of) in &workspaces {
-        let display_bounds = displays
-            .get(child_of.parent())
-            .map(|(display, dock)| display.actual_display_bounds(dock, &config));
-        let moving_offscreen = display_bounds
-            .is_ok_and(|bounds| (bounds.max.y - OFFSCREEN_THRESHOLD) < strip_position.y);
-        // To detect whether a virtual workspace is being switched, we check whether it's being
-        // moved offscreen - e.g. it's being hidden.
-        // Or whether it has recently gotten an active marker insertion - e.g. it is being brought
-        // into view.
-        let workspace_switching =
-            moving_offscreen || marker.is_some_and(|marker| marker.is_added());
+    for (layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
         insert_strip_window_contexts(
             &mut strip_contexts,
             layout_strip,
             *strip_position,
             swiping,
-            workspace_switching,
             child_of.parent(),
         );
     }
@@ -1211,6 +1276,10 @@ fn position_layout_windows(
             return;
         };
         let viewport = display.actual_display_bounds(dock, &config);
+        // Gets 80% of the display height as threshold.
+        let Ok(vertical_move_threshold) = u32::try_from(viewport.height() * 8 / 10) else {
+            continue;
+        };
 
         // Account for per-window horizontal_padding: reposition() adds
         // h_pad to the virtual x, so subtract it here so the OS window
@@ -1261,19 +1330,17 @@ fn position_layout_windows(
 
         if position.0 != frame.min {
             // Direct-assign (snap) when:
-            //   - The user is actively swiping: windows must track the
-            //     finger in lockstep.
-            //   - A workspace switch just moved the strip: jumping the
-            //     full off-screen distance should be instantaneous.
-            // Otherwise (programmatic strip animation, or pure layout
-            // change), animate toward the new position so layout changes
-            // (swap/add/remove) slide instead of teleport. When the strip
-            // is also being animated, the per-window target is recomputed
-            // each tick from the strip's current position, so the two
-            // motions compose: e.g., on swap, the focused window's target
-            // converges back to its old visual position as the strip
-            // settles, while the other window slides past.
-            if context.swiping || context.workspace_switching {
+            //   - The user is actively swiping: windows must track the finger in lockstep.
+            //   - A workspace switch just moved the strip vertically: jumping the full off-screen
+            //   distance should be instantaneous.
+            // Otherwise (programmatic strip animation, or pure layout change), animate toward the
+            // new position so layout changes (swap/add/remove) slide instead of teleport. When the
+            // strip is also being animated, the per-window target is recomputed each tick from the
+            // strip's current position, so the two motions compose: e.g., on swap, the focused
+            // window's target converges back to its old visual position as the strip settles, while
+            // the other window slides past.
+            let offscreen_move = position.0.y.abs_diff(frame.min.y) > vertical_move_threshold;
+            if context.swiping || offscreen_move && !config.virtual_workspace_animations() {
                 position.0 = frame.min;
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_remove::<RepositionMarker>();
@@ -1327,14 +1394,7 @@ mod tests {
         let strip_position = Origin::new(10, 20);
         let mut contexts = EntityHashMap::default();
 
-        insert_strip_window_contexts(
-            &mut contexts,
-            &strip,
-            strip_position,
-            true,
-            false,
-            display_entity,
-        );
+        insert_strip_window_contexts(&mut contexts, &strip, strip_position, true, display_entity);
 
         let stacked_leader = contexts.get(&entities[0]).unwrap();
         let stacked_follower = contexts.get(&entities[1]).unwrap();
@@ -1343,7 +1403,6 @@ mod tests {
         assert_eq!(stacked_leader.strip_position, strip_position);
         assert_eq!(stacked_leader.display_entity, display_entity);
         assert!(stacked_leader.swiping);
-        assert!(!stacked_leader.workspace_switching);
         assert!(stacked_leader.stacked);
         assert!(stacked_follower.stacked);
         assert!(!single_window.stacked);
@@ -1504,17 +1563,6 @@ mod tests {
 
         let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
         assert_eq!(out.len(), 4);
-
-        // All stacked windows use the top window's width (400).
-        for &(e, ref f) in &out {
-            if e == entities[0] || e == entities[1] || e == entities[2] {
-                assert_eq!(
-                    f.width(),
-                    400,
-                    "stacked window should use top window's width"
-                );
-            }
-        }
 
         // Stacked heights should sum to viewport height.
         let stack_heights: i32 = out

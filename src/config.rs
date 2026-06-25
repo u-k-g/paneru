@@ -799,6 +799,21 @@ impl Config {
             .and_then(|decorations| decorations.workspace_popup_status)
             .is_none_or(|enabled| enabled)
     }
+
+    pub fn virtual_workspace_animations(&self) -> bool {
+        // Default is disabled
+        self.options()
+            .virtual_workspace_animations
+            .is_some_and(|enabled| enabled)
+    }
+
+    pub fn insert_windows_mid_strip(&self) -> bool {
+        // Default is disabled: appending to the end of the strip is the
+        // expected behaviour, especially when moving several windows.
+        self.options()
+            .insert_windows_mid_strip
+            .is_some_and(|enabled| enabled)
+    }
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
@@ -1064,6 +1079,17 @@ pub struct MainOptions {
     /// never auto-merged into a tab group with an existing same-app sibling.
     /// Default: false.
     pub disable_native_tabs: Option<bool>,
+
+    /// Enable animation of virtual workspace swaps.
+    /// Off by default, because people use virtual workspaces due to the slow animation of the
+    /// native macOS workspaces.
+    pub virtual_workspace_animations: Option<bool>,
+
+    /// When moving a window to another virtual workspace, insert it at the column
+    /// matching its current on-screen position (keeping it where you see it,
+    /// shifting the rest) instead of appending it to the end of the strip.
+    /// Off by default.
+    pub insert_windows_mid_strip: Option<bool>,
 }
 
 /// Returns a default set of column widths.
@@ -1913,7 +1939,7 @@ fn test_restore_config_defaults() {
     let config = Config::try_from("[options]\n\n[bindings]\n").expect("config should parse");
 
     assert!(config.restore_enabled());
-    assert_eq!(config.restore_startup_grace(), Duration::from_millis(2000));
+    assert_eq!(config.restore_startup_grace(), Duration::from_secs(2));
     assert_eq!(
         config.restore_missing_windows(),
         MissingWindowBehavior::Ignore

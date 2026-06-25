@@ -20,7 +20,7 @@ use crate::ecs::{
     NativeFullscreenMarker, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
+use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 
 /// Represents a cardinal or directional choice for window manipulation.
@@ -358,7 +358,7 @@ fn nearest_float_in_direction(
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    workspaces: Query<(&LayoutStrip, Option<&NativeFullscreenMarker>)>,
+    workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -372,15 +372,26 @@ fn command_move_focus(
     let active_strip = active_display.active_strip();
 
     // On a fullscreen space, swap to the last column in the workspace.
-    if let Some(fullscreen) = active_display.fullscreen()
+    if let Some(NativeFullscreenMarker {
+        layout_strip,
+        workspace_id,
+        index: _,
+    }) = active_display.fullscreen()
         && matches!(direction, Direction::West)
-        && let Some(entity) = workspaces
-            .into_iter()
-            .find_map(|(strip, _)| (strip.id() == fullscreen.previous_strip).then_some(strip))
-            .and_then(|strip| strip.last().ok().and_then(|col| col.top()))
     {
-        debug!("fullscreen: swap raising {entity}");
-        commands.focus_entity(entity, true);
+        let mut strip = workspaces
+            .into_iter()
+            .find_map(|(strip, entity, _)| (entity == *layout_strip).then_some(strip));
+        if strip.is_none() {
+            strip = workspaces
+                .into_iter()
+                .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip));
+        }
+
+        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
+            debug!("fullscreen: swap raising {entity}");
+            commands.focus_entity(entity, true);
+        }
         return;
     }
 
@@ -416,10 +427,10 @@ fn command_move_focus(
             .then(|| {
                 workspaces
                     .iter()
-                    .find(|(strip, fullscreen)| {
+                    .find(|(strip, _, fullscreen)| {
                         fullscreen.is_some() && strip.id() != active_strip.id()
                     })
-                    .and_then(|(strip, _)| strip.get(0).ok().and_then(|col| col.top()))
+                    .and_then(|(strip, _, _)| strip.get(0).ok().and_then(|col| col.top()))
             })
             .flatten()
         })
@@ -790,10 +801,8 @@ fn resize_window(
         cmds.try_remove::<FullWidthMarker>();
     }
 
-    let display_width = active_display.bounds().width();
-    let (_, pad_right, _, pad_left) = config.edge_padding();
-    let padded_width = display_width - pad_left - pad_right;
-    let current_ratio = f64::from(frame.width()) / f64::from(padded_width);
+    let viewport = active_display.actual_bounds(&config);
+    let current_ratio = f64::from(frame.width()) / f64::from(viewport.width());
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
@@ -823,14 +832,11 @@ fn resize_window(
             }),
     };
 
-    let new_width = (next_ratio * f64::from(padded_width)).round() as i32;
+    let new_width = (next_ratio * f64::from(viewport.width())).round() as i32;
     let size = Size::new(new_width, frame.height());
 
     let mut origin = IRect::from_center_size(frame.center(), size).min;
-    origin.x = origin.x.clamp(
-        active_display.bounds().min.x + pad_left,
-        active_display.bounds().max.x - pad_right - size.x,
-    );
+    origin.x = origin.x.clamp(viewport.min.x, viewport.max.x - size.x);
     commands.reposition_entity(entity, origin);
 
     // Resize all windows in the column so stacked siblings share the new width.
@@ -840,7 +846,7 @@ fn resize_window(
         .ok()
         .and_then(|idx| strip.get(idx).ok())
     {
-        for sibling in stack.iter().flat_map(StackItem::all_windows) {
+        for sibling in stack.iter().flat_map(StackItem::window_iter) {
             if sibling != entity
                 && let Some(size) = windows.size(sibling)
             {
@@ -872,14 +878,12 @@ fn full_width_window(
         return;
     };
 
-    let viewport = active_display
-        .display()
-        .actual_display_bounds(active_display.dock(), &config);
+    let viewport = active_display.actual_bounds(&config);
 
     if let Some(marker) = windows.full_width(entity) {
         commands.entity(entity).try_remove::<FullWidthMarker>();
         let w = (marker.width_ratio * f64::from(viewport.width())).round() as i32;
-        let bounds = active_display.bounds().size().with_x(w);
+        let bounds = active_display.actual_bounds(&config).size().with_x(w);
         commands.resize_entity(entity, bounds);
     } else {
         let strip = active_display.active_strip();
@@ -976,8 +980,8 @@ fn to_next_display(
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     mut other_workspaces: Query<
-        (&mut LayoutStrip, Has<SelectedVirtualMarker>),
-        Without<ActiveWorkspaceMarker>,
+        &mut LayoutStrip,
+        (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
     >,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
@@ -1043,9 +1047,9 @@ fn to_next_display(
 
     // Insert into the target display's selected strip.
     if let Ok(target_space_id) = window_manager.active_display_space(target_display_id)
-        && let Some((mut target_strip, _)) = other_workspaces
+        && let Some(mut target_strip) = other_workspaces
             .iter_mut()
-            .find(|(strip, selected)| *selected && strip.id() == target_space_id)
+            .find(|strip| strip.id() == target_space_id)
     {
         target_strip.append(entity);
         commands.reshuffle_around(entity);
@@ -1059,7 +1063,7 @@ fn mouse_to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     layout_strips: Query<(&LayoutStrip, Entity)>,
-    displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -1074,7 +1078,13 @@ fn mouse_to_next_display(
         return;
     }
 
-    let Some((other, _, _)) = displays.iter().find(|(_, _, active)| !*active) else {
+    let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
+        return;
+    };
+    let Some(other) = displays
+        .into_iter()
+        .find(|display| !display.bounds().contains(cursor_position))
+    else {
         debug!("no other display to move mouse to.");
         return;
     };
@@ -1100,6 +1110,7 @@ fn mouse_to_next_display(
         })
     else {
         debug!("no suitable windows on the other display to move the mouse.");
+        window_manager.warp_mouse(other.bounds().center());
         return;
     };
 
@@ -1117,6 +1128,7 @@ fn equalize_column(
     current_focus: Single<(&Window, Entity), With<FocusedMarker>>,
     windows: Windows,
     active_display: ActiveDisplay,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::Equalize))
@@ -1137,10 +1149,11 @@ fn equalize_column(
 
     if let Column::Stack(stack) = column {
         #[allow(clippy::cast_precision_loss)]
-        let equal_height = active_display.bounds().height() / i32::try_from(stack.len()).unwrap();
+        let equal_height =
+            active_display.actual_bounds(&config).height() / i32::try_from(stack.len()).unwrap();
 
         for item in &stack {
-            for entity in item.all_windows() {
+            for entity in item.window_iter() {
                 if let Some(size) = windows.size(entity) {
                     commands.resize_entity(entity, size.with_y(equal_height));
                 }
@@ -1178,9 +1191,7 @@ fn snap_window(
         return;
     };
 
-    let display_bounds = active_display
-        .display()
-        .actual_display_bounds(active_display.dock(), &config);
+    let display_bounds = active_display.actual_bounds(&config);
 
     // Clamp the frame into the display and reposition the *strip* (not the
     // window) so the layout stays consistent.

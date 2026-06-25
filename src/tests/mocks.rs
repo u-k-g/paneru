@@ -10,7 +10,8 @@ use crate::errors::Error;
 use crate::events::Event;
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
-    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size, Window,
+    Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
+    Window, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -27,6 +28,7 @@ pub(crate) struct MockAppData {
 }
 
 /// Data for a mocked window.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MockWindowData {
     pub(crate) id: WinID,
     pub(crate) pid: Pid,
@@ -80,6 +82,7 @@ struct MockStateInner {
     windows: HashMap<WinID, MockWindowData>,
     displays: HashMap<u32, MockDisplayData>,
     active_display_id: u32,
+    cursor_position: Origin,
     event_queue: VecDeque<Event>,
 }
 
@@ -96,6 +99,7 @@ impl MockState {
                 windows: HashMap::new(),
                 displays: HashMap::new(),
                 active_display_id: 0,
+                cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
             })),
         }
@@ -116,7 +120,7 @@ impl MockState {
             MockAppData {
                 psn: ProcessSerialNumber {
                     high: 0,
-                    low: pid as u32,
+                    low: pid.cast_unsigned(),
                 },
                 bundle_id: bundle_id.to_string(),
                 name: name.to_string(),
@@ -179,6 +183,15 @@ impl MockState {
                 workspaces,
             },
         );
+    }
+
+    #[allow(unused)]
+    pub fn remove_display(&self, id: u32) {
+        let mut inner = self.inner.force_write();
+        inner.displays.remove(&id);
+        if inner.active_display_id == id {
+            inner.active_display_id = inner.displays.keys().copied().next().unwrap_or(0);
+        }
     }
 
     pub fn active_display(&self) -> CGDirectDisplayID {
@@ -298,8 +311,13 @@ impl MockState {
         });
     }
 
+    pub fn cursor_position(&self) -> IVec2 {
+        self.inner.force_read().cursor_position
+    }
+
     // --- Mock Factory Methods ---
 
+    #[allow(clippy::too_many_lines)]
     pub fn create_window(&self, id: WinID) -> Window {
         let mut mw = MockWindowApi::new();
 
@@ -364,8 +382,7 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
-                .map(|w| w.minimized)
-                .unwrap_or_default()
+                .is_some_and(|w| w.minimized)
         });
 
         let s = self.clone();
@@ -414,8 +431,7 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
-                .map(|w| w.child_role)
-                .unwrap_or_default())
+                .is_some_and(|w| w.child_role))
         });
 
         let s = self.clone();
@@ -444,8 +460,7 @@ impl MockState {
                 .force_read()
                 .windows
                 .get(&id)
-                .map(|w| w.is_full_screen)
-                .unwrap_or_default()
+                .is_some_and(|w| w.is_full_screen)
         });
 
         let s = self.clone();
@@ -508,8 +523,7 @@ impl MockState {
                 .force_read()
                 .apps
                 .get(&pid)
-                .map(|a| a.is_frontmost)
-                .unwrap_or_default()
+                .is_some_and(|a| a.is_frontmost)
         });
 
         let s = self.clone();
@@ -588,7 +602,7 @@ impl MockState {
                     .filter_map(|w| (w.workspace_id == workspace_id).then_some(w.id))
                     .collect::<Vec<_>>();
                 // Sort the windows to keep the tests consistent
-                windows.sort();
+                windows.sort_unstable();
                 Ok(windows)
             });
 
@@ -600,13 +614,19 @@ impl MockState {
                 .windows
                 .iter()
                 .filter_map(|(id, window)| window.visible.then_some(id))
-                .cloned()
+                .copied()
                 .collect::<Vec<_>>();
             Some(windows)
         });
 
-        wm.expect_warp_mouse().return_const(());
-        wm.expect_cursor_position().return_const(None);
+        let s = self.clone();
+        wm.expect_warp_mouse()
+            .returning(move |origin| s.inner.force_write().cursor_position = origin);
+
+        let s = self.clone();
+        wm.expect_cursor_position()
+            .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
+
         wm.expect_get_associated_windows().return_const(vec![]);
         wm.expect_find_window_at_point().return_const(Ok(0));
 
