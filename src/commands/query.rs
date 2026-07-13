@@ -114,6 +114,9 @@ impl StateBroadcastIntent {
                             Operation::VirtualMove(_, _) | Operation::VirtualMoveNumber(_, _),
                         ),
                 } => intent.windows_changed = true,
+                Event::Command {
+                    command: Command::Window(Operation::Swap(_)),
+                } => intent.windows_changed = true,
                 Event::WindowFocused { .. } => intent.window_focused = true,
                 Event::WindowTitleChanged { window_id } => {
                     intent.title_changes.insert(*window_id);
