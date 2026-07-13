@@ -434,7 +434,7 @@ impl WindowManagerApi for WindowManagerOS {
                 return Err(Error::InvalidInput(format!("No windows found for {app}")));
             }
 
-            debug!(
+            warn!(
                 "{app} has no SkyLight windows, falling back to {} AX windows",
                 found_windows.len()
             );
