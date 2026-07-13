@@ -23,7 +23,7 @@ use crate::ecs::{
     SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
+use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 
 /// Represents a cardinal or directional choice for window manipulation.
