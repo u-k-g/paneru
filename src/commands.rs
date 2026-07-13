@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
@@ -16,8 +18,9 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker,
-    NativeFullscreenMarker, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
+    FullWidthMarker, NativeFullscreenMarker, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -78,6 +81,8 @@ pub enum Operation {
     ToNextDisplay(MoveFocus),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
+    /// Makes all columns in the active strip the same width as the focused window.
+    Balance,
     /// Toggles the managed state of the focused window.
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
@@ -124,6 +129,8 @@ pub enum Command {
     Quit,
     /// Opens or focuses an application by configured app key.
     App(String),
+    /// A command to restart the window manager service.
+    Restart,
     PrintState,
 }
 
@@ -134,6 +141,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
         (
             command_quit_handler,
             command_app_handler,
+            command_restart_handler,
             print_internal_state_handler,
             mouse_to_next_display,
             resize_window,
@@ -141,6 +149,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             full_width_window,
             to_next_display,
             equalize_column,
+            balance_strip,
             manage_window,
             stack_windows_handler,
             command_move_focus,
@@ -197,7 +206,7 @@ fn command_app_handler(
                 }
             }
             Err(err) => error!("Failed to open app '{app_name}': {err}"),
-        };
+        }
     }
 }
 
@@ -974,13 +983,13 @@ fn manage_window(
 /// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
 /// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
 /// * `commands` - Bevy commands to modify entities and trigger events.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     mut other_workspaces: Query<
-        &mut LayoutStrip,
+        (&mut LayoutStrip, &ChildOf),
         (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
     >,
     window_manager: Res<WindowManager>,
@@ -1047,12 +1056,33 @@ fn to_next_display(
 
     // Insert into the target display's selected strip.
     if let Ok(target_space_id) = window_manager.active_display_space(target_display_id)
-        && let Some(mut target_strip) = other_workspaces
+        && let Some((mut target_strip, child)) = other_workspaces
             .iter_mut()
-            .find(|strip| strip.id() == target_space_id)
+            .find(|(strip, _)| strip.id() == target_space_id)
     {
         target_strip.append(entity);
         commands.reshuffle_around(entity);
+
+        // Add a delayed refresh of the window size - because the otehr display can have different bounds.
+        let display_entity = child.parent();
+        let moved_window = entity;
+        let refresh_size = move |windows: Query<&Bounds, With<Window>>,
+                                 displays: Query<(&Display, Option<&DockPosition>)>,
+                                 mut commands: Commands,
+                                 config: Res<Config>| {
+            let viewport = displays
+                .get(display_entity)
+                .ok()
+                .map(|(display, dock)| display.actual_display_bounds(dock, &config));
+            if let Some(viewport_bounds) = viewport
+                && let Ok(Bounds(bounds)) = windows.get(moved_window)
+            {
+                debug!("Refreshing size of window {entity}");
+                commands.resize_entity(moved_window, bounds.with_y(viewport_bounds.height()));
+            }
+        };
+        let system_id = commands.register_system(refresh_size);
+        Timeout::callback(Duration::from_secs(1), system_id, &mut commands);
     }
 }
 
@@ -1162,6 +1192,51 @@ fn equalize_column(
     }
 }
 
+/// Makes all columns in the active strip the same width as the focused window.
+#[allow(clippy::needless_pass_by_value)]
+fn balance_strip(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Balance))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    let Some((_, focused_entity)) = windows.focused() else {
+        return;
+    };
+    let Some(focused_width) = windows.size(focused_entity).map(|s| s.x) else {
+        return;
+    };
+
+    let strip = active_display.active_strip();
+
+    for column in strip.columns() {
+        if matches!(column, Column::Fullscren(_)) {
+            continue;
+        }
+
+        for entity in column.window_iter() {
+            if windows.full_width(entity).is_some()
+                && let Ok(mut cmds) = commands.get_entity(entity)
+            {
+                cmds.try_remove::<FullWidthMarker>();
+            }
+
+            if let Some(size) = windows.size(entity) {
+                commands.resize_entity(entity, size.with_x(focused_width));
+            }
+        }
+    }
+
+    commands.reshuffle_around(focused_entity);
+}
+
 /// Slides the strip so the focused window is fully visible, snapping to the
 /// nearest edge: left-aligned when the window overflows left, right-aligned
 /// when it overflows right. No resize — the window keeps its current size.
@@ -1263,6 +1338,22 @@ pub fn command_quit_handler(
         )
     }) {
         _ = window_manager.quit();
+    }
+}
+
+#[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::needless_pass_by_value)]
+pub fn command_restart_handler(mut messages: MessageReader<Event>) {
+    if messages.read().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: Command::Restart
+            }
+        )
+    }) && let Err(err) = crate::platform::service::Service::request_restart()
+    {
+        error!("failed to restart service: {err}");
     }
 }
 

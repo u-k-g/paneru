@@ -1,4 +1,5 @@
-use bevy::app::{App, Plugin, PreUpdate, Update};
+use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -50,9 +51,8 @@ impl Plugin for WorkspaceEventsPlugin {
             (
                 renumber_virtual_indexes,
                 reap_empty_virtual_workspaces.run_if(reap_workspaces),
-                workspace_change_trigger,
-                workspace_created_trigger,
-                workspace_destroyed_trigger,
+                workspace_change_handler,
+                workspace_created_handler,
                 show_active_workspace,
                 handle_virtual_window_moves,
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
@@ -66,6 +66,7 @@ impl Plugin for WorkspaceEventsPlugin {
                     ))),
             ),
         );
+        app.add_systems(PostUpdate, workspace_destroyed_handler);
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
     }
@@ -86,7 +87,7 @@ pub(crate) struct PreviousStripPosition {
 
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn workspace_change_trigger(
+fn workspace_change_handler(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut workspaces: Query<(
@@ -172,7 +173,7 @@ fn workspace_change_trigger(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
@@ -180,6 +181,7 @@ fn detect_moved_windows(
     mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
     apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut ignored_windows: Local<HashSet<WinID>>,
     mut commands: Commands,
 ) {
@@ -219,7 +221,7 @@ fn detect_moved_windows(
         let retry_windows = apps
             .into_iter()
             .flat_map(|app| {
-                app.window_list()
+                app.window_list(&config)
                     .into_iter()
                     .filter(|window| unresolved_ids.contains(&window.id()))
             })
@@ -270,7 +272,7 @@ fn detect_moved_windows(
 
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn workspace_destroyed_trigger(
+fn workspace_destroyed_handler(
     mut messages: MessageReader<Event>,
     mut workspaces: Populated<(&mut LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     mut focus_history: ResMut<FocusHistory>,
@@ -328,7 +330,7 @@ fn workspace_destroyed_trigger(
 
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn workspace_created_trigger(
+fn workspace_created_handler(
     mut messages: MessageReader<Event>,
     active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
     workspaces: Query<&LayoutStrip>,
@@ -562,13 +564,16 @@ fn cleanup_selected_space_marker(
 )]
 fn handle_virtual_window_moves(
     moved_windows: Populated<(Entity, &VirtualMoveMarker), With<Window>>,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        &Position,
-        Has<ActiveWorkspaceMarker>,
-        Option<&mut PreviousStripPosition>,
-    )>,
+    mut workspaces: Query<
+        (
+            Entity,
+            &mut LayoutStrip,
+            &mut Position,
+            Has<ActiveWorkspaceMarker>,
+            Option<&mut PreviousStripPosition>,
+        ),
+        Without<Window>,
+    >,
     windows: Windows,
     mut scrollings: Query<&mut Scrolling>,
     active_display: Single<(Entity, &Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
@@ -710,7 +715,14 @@ fn handle_virtual_window_moves(
         if stay && let Some(neighbour) = source_neighbour {
             // Layout chain repositions the window offscreen with its hidden strip.
             commands.focus_entity(neighbour, false);
-            commands.reshuffle_around(neighbour);
+
+            // Force position change on the hidden strip, so it hides the moved window.
+            if let Ok(mut position) = workspaces
+                .get_mut(target_entity)
+                .map(|(_, _, pos, _, _)| pos)
+            {
+                position.set_changed();
+            }
         } else {
             let previous_position = workspaces
                 .get_mut(target_entity)
@@ -977,6 +989,13 @@ pub(crate) fn show_active_workspace(
             commands.reposition_entity(entity, bounds.max - 10);
         } else {
             position.0 = bounds.max - 10;
+        }
+        // Stop any in-flight animation and scroll state so the hidden strip
+        // doesn't continue moving off-screen and doesn't corrupt the saved
+        // position when it is restored.
+        if let Ok(mut cmd) = commands.get_entity(entity) {
+            cmd.try_remove::<Scrolling>()
+                .try_remove::<RepositionMarker>();
         }
     }
 
