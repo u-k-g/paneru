@@ -23,7 +23,7 @@ use crate::ecs::{
     SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 
 /// Represents a cardinal or directional choice for window manipulation.
@@ -127,8 +127,6 @@ pub enum Command {
     Mouse(MouseMove),
     /// A command to quit the window manager application.
     Quit,
-    /// Opens or focuses an application by configured app key.
-    App(String),
     /// A command to restart the window manager service.
     Restart,
     PrintState,
@@ -140,7 +138,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
         PreUpdate,
         (
             command_quit_handler,
-            command_app_handler,
             command_restart_handler,
             print_internal_state_handler,
             mouse_to_next_display,
@@ -161,53 +158,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
             snap_window,
         ),
     );
-}
-
-#[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::needless_pass_by_value)]
-fn command_app_handler(
-    mut messages: MessageReader<Event>,
-    config: Res<Config>,
-    applications: Query<(Entity, &Application)>,
-    mut commands: Commands,
-) {
-    let apps = messages
-        .read()
-        .filter_map(|event| {
-            if let Event::Command {
-                command: Command::App(app),
-            } = event
-            {
-                Some(app)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for app_key in apps {
-        let Some(app_name) = config.app_name(app_key) else {
-            error!("Unknown app binding '{app_key}'. Add it to [apps].");
-            continue;
-        };
-
-        let app_entity = applications.iter().find_map(|(entity, app)| {
-            (app.name() == app_name || app.bundle_id().is_some_and(|id| id == app_name))
-                .then_some(entity)
-        });
-
-        match std::process::Command::new("/usr/bin/open")
-            .args(["-a", app_name.as_str()])
-            .spawn()
-        {
-            Ok(_) => {
-                if let Some(app_entity) = app_entity {
-                    commands.spawn(crate::ecs::RetryFrontSwitch(app_entity));
-                }
-            }
-            Err(err) => error!("Failed to open app '{app_name}': {err}"),
-        }
-    }
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
