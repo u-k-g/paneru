@@ -24,6 +24,8 @@ use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::platform::Modifiers;
 
+const NX_DEVICEFNKEYMASK: u64 = 0x0080_0100;
+
 /// The currently active set of passthrough keybindings, shared lock-free with
 /// the `CGEvent` tap callback thread via `ArcSwap`.
 static FOCUSED_PASSTHROUGH: LazyLock<ArcSwap<Vec<(u8, Modifiers)>>> =
@@ -318,20 +320,20 @@ impl InputHandler {
         const NS_EVENT_PHASE_ENDED: usize = 1 << 3; // 8
         const NS_EVENT_PHASE_CANCELLED: usize = 1 << 4; // 16
 
+        let Some(configured_fingers) = self
+            .config
+            .swipe_gesture_fingers()
+            .filter(|fingers| *fingers >= GESTURE_MINIMAL_FINGERS)
+        else {
+            // No valid gesture is configured, so leave native macOS gestures alone.
+            return false;
+        };
+
         let Some(ns_event) = NSEvent::eventWithCGEvent(event) else {
             error!("{}: Unable to convert CGEvent to NSEvent", function_name!());
             return false;
         };
         if ns_event.r#type() != NSEventType::Gesture {
-            return false;
-        }
-
-        if self
-            .config
-            .swipe_gesture_fingers()
-            .is_some_and(|fingers| fingers < GESTURE_MINIMAL_FINGERS)
-        {
-            // Swipe is disabled, do not intercept the event.
             return false;
         }
 
@@ -345,6 +347,9 @@ impl InputHandler {
         }
 
         let fingers = ns_event.allTouches();
+        if !gesture_should_intercept(Some(configured_fingers), fingers.len()) {
+            return false;
+        }
         if fingers.iter().any(|f| f.phase() == NSTouchPhase::Began)
             && let Some(events) = &self.events
         {
@@ -456,6 +461,12 @@ impl InputHandler {
     }
 }
 
+fn gesture_should_intercept(configured_fingers: Option<usize>, actual_fingers: usize) -> bool {
+    configured_fingers.is_some_and(|configured| {
+        configured >= GESTURE_MINIMAL_FINGERS && configured == actual_fingers
+    })
+}
+
 fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
     const MODIFIER_MASKS: [(Modifiers, u64); 8] = [
         (Modifiers::LALT, 0x0000_0020),
@@ -467,13 +478,23 @@ fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
         (Modifiers::LCTRL, 0x0000_0001),
         (Modifiers::RCTRL, 0x0000_2000),
     ];
-    let mut mask = Modifiers::empty();
-    for (modifier, m) in MODIFIER_MASKS {
-        if eventflags.0 & m != 0 {
-            mask |= modifier;
-        }
+
+    // Fn key should be checked for separately, because pressing
+    // some keys (i.e. leftarrow) seems to inadvertently toggling it.
+    if eventflags.0 == NX_DEVICEFNKEYMASK {
+        tracing::debug!("event flags {:#x}", eventflags.0);
+        return Modifiers::FN;
     }
-    mask
+
+    MODIFIER_MASKS
+        .iter()
+        .fold(Modifiers::empty(), |modifiers, (modifier, mask)| {
+            if eventflags.0 & mask != 0 {
+                modifiers | *modifier
+            } else {
+                modifiers
+            }
+        })
 }
 
 #[cfg(test)]
@@ -492,6 +513,14 @@ mod tests {
     #[test]
     fn no_modifiers() {
         assert_eq!(get_modifiers(CGEventFlags(0)), Modifiers::empty());
+    }
+
+    #[test]
+    fn fn_modifier() {
+        assert_eq!(
+            get_modifiers(CGEventFlags(NX_DEVICEFNKEYMASK)),
+            Modifiers::FN
+        );
     }
 
     #[test]
@@ -562,5 +591,22 @@ mod tests {
     fn device_independent_flags_ignored() {
         let generic_alt: u64 = 0x0008_0000;
         assert_eq!(get_modifiers(CGEventFlags(generic_alt)), Modifiers::empty());
+    }
+    #[test]
+    fn secondary_fn_flag_is_not_ignored() {
+        // Ensure we don't accidentally filter out the fn mask as "device independent"
+        assert_eq!(
+            get_modifiers(CGEventFlags(NX_DEVICEFNKEYMASK)),
+            Modifiers::FN
+        );
+    }
+
+    #[test]
+    fn only_intercepts_the_explicitly_configured_gesture() {
+        assert!(!gesture_should_intercept(None, 3));
+        assert!(!gesture_should_intercept(Some(2), 2));
+        assert!(gesture_should_intercept(Some(3), 3));
+        assert!(!gesture_should_intercept(Some(4), 3));
+        assert!(gesture_should_intercept(Some(4), 4));
     }
 }

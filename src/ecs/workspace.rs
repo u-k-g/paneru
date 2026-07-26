@@ -85,6 +85,36 @@ pub(crate) struct PreviousStripPosition {
     pub focus: Option<Entity>,
 }
 
+fn fullscreen_window_in_strip(
+    workspace_id: WorkspaceId,
+    strip: &LayoutStrip,
+    windows: &Windows,
+    window_manager: &WindowManager,
+) -> Option<Entity> {
+    window_manager
+        .windows_in_workspace(workspace_id)
+        .ok()
+        .and_then(|window_ids| {
+            window_ids.into_iter().find_map(|window_id| {
+                windows
+                    .find_managed(window_id)
+                    .map(|(_, entity)| entity)
+                    .filter(|entity| strip.contains(*entity))
+            })
+        })
+        .or_else(|| {
+            windows.managed_iter().find_map(|(window, entity, _)| {
+                (strip.contains(entity) && window.is_full_screen()).then_some(entity)
+            })
+        })
+        .or_else(|| {
+            windows
+                .focused()
+                .map(|(_, entity)| entity)
+                .filter(|entity| strip.contains(*entity))
+        })
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn workspace_change_handler(
@@ -142,19 +172,21 @@ fn workspace_change_handler(
     if insert_into.is_none()
         && let Some(old_space) = remove_from
         && window_manager.is_fullscreen_space(active_display.id())
-        && let Some((_, focused)) = windows.focused()
         && let Ok((mut old_strip, old_strip_entity, _, _)) = workspaces.get_mut(old_space)
+        && let Some(fullscreen_window) =
+            fullscreen_window_in_strip(workspace_id, &old_strip, &windows, &window_manager)
+        && let Ok(original_index) = old_strip.index_of(fullscreen_window)
     {
         debug!("workspace_change: space={workspace_id} fullscreen");
 
         let fullscreen_marker = NativeFullscreenMarker {
             layout_strip: old_strip_entity,
             workspace_id: old_strip.id(),
-            index: old_strip.index_of(focused).unwrap_or(0),
+            index: original_index,
         };
-        old_strip.remove(focused);
+        old_strip.remove(fullscreen_window);
 
-        let fullscreen_strip = LayoutStrip::fullscreen(workspace_id, focused);
+        let fullscreen_strip = LayoutStrip::fullscreen(workspace_id, fullscreen_window);
         let entity = commands
             .spawn((
                 Position(active_display.bounds().min),
@@ -987,17 +1019,15 @@ pub(crate) fn show_active_workspace(
 
         let bounds = active_display.bounds();
 
+        if let Ok(mut cmd) = commands.get_entity(entity) {
+            cmd.try_remove::<Scrolling>()
+                .try_remove::<RepositionMarker>();
+        }
+
         if config.virtual_workspace_animations() {
             commands.reposition_entity(entity, bounds.max - 10);
         } else {
             position.0 = bounds.max - 10;
-        }
-        // Stop any in-flight animation and scroll state so the hidden strip
-        // doesn't continue moving off-screen and doesn't corrupt the saved
-        // position when it is restored.
-        if let Ok(mut cmd) = commands.get_entity(entity) {
-            cmd.try_remove::<Scrolling>()
-                .try_remove::<RepositionMarker>();
         }
     }
 
@@ -1014,12 +1044,10 @@ pub(crate) fn show_active_workspace(
         }
 
         if config.virtual_workspace_animations() {
-            // Focus on the previous window
             if let Some(entity) = focus
                 && strip.contains(*entity)
             {
                 commands.focus_entity(*entity, false);
-                commands.reshuffle_around(*entity);
             }
 
             commands.reposition_entity(*activated, *origin);

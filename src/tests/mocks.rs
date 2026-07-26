@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use bevy::prelude::*;
@@ -81,6 +81,7 @@ struct MockStateInner {
     apps: HashMap<Pid, MockAppData>,
     windows: HashMap<WinID, MockWindowData>,
     displays: HashMap<u32, MockDisplayData>,
+    fullscreen_spaces: HashSet<WorkspaceId>,
     active_display_id: u32,
     cursor_position: Origin,
     event_queue: VecDeque<Event>,
@@ -98,6 +99,7 @@ impl MockState {
                 apps: HashMap::new(),
                 windows: HashMap::new(),
                 displays: HashMap::new(),
+                fullscreen_spaces: HashSet::new(),
                 active_display_id: 0,
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
@@ -196,6 +198,28 @@ impl MockState {
 
     pub fn active_display(&self) -> CGDirectDisplayID {
         self.inner.force_read().active_display_id
+    }
+
+    pub(crate) fn activate_workspace(
+        &self,
+        display_id: u32,
+        workspace_id: WorkspaceId,
+        fullscreen: bool,
+    ) {
+        let mut inner = self.inner.force_write();
+        {
+            let display = inner
+                .displays
+                .get_mut(&display_id)
+                .expect("finding display");
+            display.workspaces.retain(|id| *id != workspace_id);
+            display.workspaces.insert(0, workspace_id);
+        }
+        if fullscreen {
+            inner.fullscreen_spaces.insert(workspace_id);
+        } else {
+            inner.fullscreen_spaces.remove(&workspace_id);
+        }
     }
 
     pub fn drain_events(&self) -> Vec<Event> {
@@ -561,6 +585,17 @@ impl MockState {
         });
 
         let s = self.clone();
+        wm.expect_is_fullscreen_space()
+            .returning(move |display_id| {
+                let inner = s.inner.force_read();
+                inner
+                    .displays
+                    .get(&display_id)
+                    .and_then(|display| display.workspaces.first())
+                    .is_some_and(|workspace_id| inner.fullscreen_spaces.contains(workspace_id))
+            });
+
+        let s = self.clone();
         wm.expect_present_displays().returning(move || {
             s.inner
                 .force_read()
@@ -579,7 +614,7 @@ impl MockState {
         wm.expect_find_existing_application_windows()
             .returning(move |app, spaces, _config| {
                 let pid = app.pid();
-                let windows = s
+                let mut windows = s
                     .inner
                     .force_read()
                     .windows
@@ -589,6 +624,7 @@ impl MockState {
                             .then_some(s.create_window(w.id))
                     })
                     .collect::<Vec<_>>();
+                windows.sort_unstable_by_key(|window| window.id());
                 Ok((windows, vec![]))
             });
 

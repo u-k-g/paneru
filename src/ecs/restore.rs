@@ -61,7 +61,7 @@ pub(super) fn tick_restore_grace(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct CurrentWindowIdentity {
     pub entity: Entity,
     pub window_id: WinID,
@@ -504,9 +504,27 @@ pub(super) fn restore_window_state(
             continue;
         };
 
-        let strip = layout_strip_from_plan(planned);
+        let mut strip = layout_strip_from_plan(planned);
         if strip.all_windows().is_empty() {
             continue;
+        }
+
+        // Keep unmatched startup windows on the same normal row. Fullscreen
+        // strips must remain single-column, so leave those rows separate.
+        if !strip.is_fullscreen()
+            && let Some((entity, mut existing, _, _)) =
+                workspaces.iter_mut().find(|(entity, existing, _, _)| {
+                    !emptied_existing_strips.contains(entity)
+                        && existing.id() == planned.workspace_id
+                        && existing.virtual_index == planned.virtual_index
+                        && !existing.is_fullscreen()
+                })
+        {
+            strip.append_strip(&mut existing);
+            emptied_existing_strips.insert(entity);
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
         }
 
         let is_active = plan

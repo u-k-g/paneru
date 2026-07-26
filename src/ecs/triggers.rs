@@ -566,8 +566,8 @@ pub(super) fn window_unmanaged_trigger(
     // Skip the active-display reposition/resize during init; the strip
     // removal below still has to run.
     if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
-        let x = (f64::from(display_bounds.width()) * rx) as i32;
-        let y = (f64::from(display_bounds.height()) * ry) as i32;
+        let x = display_bounds.min.x + (f64::from(display_bounds.width()) * rx) as i32;
+        let y = display_bounds.min.y + (f64::from(display_bounds.height()) * ry) as i32;
         let w = (f64::from(display_bounds.width()) * rw) as i32;
         let h = (f64::from(display_bounds.height()) * rh) as i32;
         commands.reposition_entity(entity, Origin::new(x, y));
@@ -604,6 +604,16 @@ pub(super) fn window_unmanaged_trigger(
     });
 }
 
+fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(PreviousManagedStrip {
+            workspace_id: strip.id(),
+            virtual_index: strip.virtual_index,
+            index: strip.index_of(entity).unwrap_or(strip.len()),
+        });
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
@@ -633,15 +643,7 @@ pub(super) fn window_minimized_trigger(
                 );
             }
             if strip.contains(entity) {
-                if let Ok(index) = strip.index_of(entity)
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
-                {
-                    entity_commands.try_insert(PreviousManagedStrip {
-                        workspace_id: strip.id(),
-                        virtual_index: strip.virtual_index,
-                        index,
-                    });
-                }
+                remember_managed_strip(entity, &strip, &mut commands);
                 strip.remove(entity);
             }
         }
@@ -966,8 +968,8 @@ pub(super) fn apply_window_defaults(
             // Skip grid_ratios during init: we don't know this window's display.
             if !initializing && let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
                 let bounds = active_display.actual_bounds(&config);
-                let x = (f64::from(bounds.width()) * rx) as i32;
-                let y = (f64::from(bounds.height()) * ry) as i32;
+                let x = bounds.min.x + (f64::from(bounds.width()) * rx) as i32;
+                let y = bounds.min.y + (f64::from(bounds.height()) * ry) as i32;
                 let w = (f64::from(bounds.width()) * rw) as i32;
                 let h = (f64::from(bounds.height()) * rh) as i32;
                 window.reposition(Origin::new(x, y));
@@ -1042,23 +1044,26 @@ pub(super) fn apply_window_positions(
             continue;
         }
 
-        // During startup, the window is already inserted into some strip.
-        let allready_inserted = workspaces
-            .iter_mut()
-            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
         let properties = WindowProperties::new(app, window, &config);
 
         if properties.floating() {
+            if let Some(mut strip) = workspaces
+                .iter_mut()
+                .find_map(|(strip, _)| strip.contains(entity).then_some(strip))
+            {
+                strip.remove(entity);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Unmanaged::Floating);
             }
-            if let Some(mut strip) = allready_inserted {
-                strip.remove(entity);
-            }
             continue;
         }
 
+        // During startup, the window is already inserted into some strip.
+        let allready_inserted = workspaces
+            .iter_mut()
+            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
         if allready_inserted.is_none()
             && let Some(mut strip) = workspaces
                 .iter_mut()

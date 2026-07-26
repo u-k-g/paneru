@@ -25,7 +25,6 @@ use tracing::{Level, instrument};
 
 use crate::commands::register_commands;
 use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
-use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::PaneruState;
 use crate::errors::Result;
@@ -85,8 +84,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || focus_lost.read().next().is_some()
                 || !focused_moved.is_empty()
         };
-    let workspace_menu_status =
-        |config: Option<Res<Config>>| config.is_some_and(|config| config.workspace_menu_status());
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 
@@ -157,7 +154,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_virtual_workspace_status_item.run_if(workspace_menu_status),
+            crate::menubar::update_menu_bar,
         ),
     );
 }
@@ -425,14 +422,14 @@ pub struct SkipReshuffle(pub bool);
 pub struct MouseHeldMarker(pub Entity);
 
 /// Resource indicating whether Mission Control is currently active.
-#[derive(PartialEq, Resource)]
+#[derive(Resource)]
 pub struct MissionControlActive(pub bool);
 
 /// Resource holding the `WinID` of a window that should gain focus when focus-follows-mouse is enabled.
 #[derive(Resource)]
 pub struct FocusFollowsMouse(pub Option<WinID>);
 
-#[derive(PartialEq, Resource)]
+#[derive(Resource)]
 pub struct Initializing;
 
 /// Bevy event trigger for spawning new windows.
@@ -525,12 +522,7 @@ impl SpawnCommandsExt for Commands<'_, '_> {
         display_entity: Entity,
         active: bool,
     ) -> EntityCommands<'_> {
-        let mut spawned = self.spawn((
-            layout_strip,
-            Position(origin),
-            FloatingLayer::default(),
-            ChildOf(display_entity),
-        ));
+        let mut spawned = self.spawn((layout_strip, Position(origin), ChildOf(display_entity)));
         if active {
             spawned.insert(ActiveWorkspaceMarker);
         } else {
@@ -566,12 +558,13 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
+    let menu_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
-    let menu_bar_manager = MenuBarManager::new(mtm);
+    let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send_resource(platform_callbacks)
         .insert_non_send_resource(overlay_manager)
         .insert_non_send_resource(flash_message_manager)

@@ -19,10 +19,20 @@ use crate::ecs::{
     Position, RepositionMarker, ReshuffleAroundMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
-use crate::manager::{Display, Origin, Window};
+use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WorkspaceId;
 
 pub struct LayoutEventsPlugin;
+
+/// Clamp a window origin to the range where it still touches both viewport
+/// edges. For an oversized window this range is reversed: from right-aligned
+/// to left-aligned, which lets the strip pan across the hidden content.
+pub(crate) fn clamp_origin_to_viewport(origin: Origin, size: Size, viewport: IRect) -> Origin {
+    let far_edge = viewport.max - size;
+    let minimum = viewport.min.min(far_edge);
+    let maximum = viewport.min.max(far_edge);
+    origin.clamp(minimum, maximum)
+}
 
 impl Plugin for LayoutEventsPlugin {
     fn build(&self, app: &mut App) {
@@ -310,6 +320,10 @@ impl LayoutStrip {
             return;
         }
         self.columns.push_back(Column::Single(entity));
+    }
+
+    pub(crate) fn append_strip(&mut self, other: &mut Self) {
+        self.columns.append(&mut other.columns);
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
@@ -676,6 +690,17 @@ impl LayoutStrip {
                 let heights =
                     binpack_heights(&current_heights, MIN_WINDOW_HEIGHT, layout_strip_height)?;
 
+                // Every window in a column shares the master's (top item's)
+                // width, so a window stacked onto a master of a different width
+                // resizes to match it instead of keeping its own width. This
+                // also matches the column slot width from column_positions,
+                // which is the widest member.
+                let column_width = items
+                    .first()
+                    .and_then(StackItem::top)
+                    .and_then(&get_window_frame)
+                    .map(|frame| frame.width())?;
+
                 let mut next_y = 0;
                 let frames = items
                     .into_iter()
@@ -683,9 +708,8 @@ impl LayoutStrip {
                     .filter_map(|(item, height)| {
                         let entity = item.top()?;
                         let mut frame = get_window_frame(entity)?;
-                        let width = frame.width();
                         frame.min.x = position;
-                        frame.max.x = frame.min.x + width;
+                        frame.max.x = frame.min.x + column_width;
 
                         frame.min.y = next_y;
                         frame.max.y = frame.min.y + height;
@@ -1002,7 +1026,7 @@ fn reshuffle_layout_strip(
         if let Ok(mut cmd) = commands.get_entity(entity) {
             cmd.try_remove::<ReshuffleAroundMarker>();
         }
-        let Some((_, strip_entity, active_strip, child, active_marker)) =
+        let Some((strip, strip_entity, active_strip, child, active_marker)) =
             strips.into_iter().find(|strip| strip.0.contains(entity))
         else {
             return;
@@ -1024,12 +1048,38 @@ fn reshuffle_layout_strip(
         let visible_width = display_bounds.intersect(frame).width();
 
         // Expose the window by clamping it into the viewport.
-        frame.min = frame
-            .min
-            .clamp(display_bounds.min, display_bounds.max - size);
+        frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
         frame.max = frame.min + size;
 
-        let strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
+        let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
+
+        // Enforce the edge invariant when auto-center is off: the leftmost
+        // window must touch the left edge and the rightmost the right edge
+        // if more than 1 windows in workspace.
+        if !config.auto_center()
+            && !config.continuous_swipe()
+            && let Some(total_strip_width) = strip
+                .last()
+                .ok()
+                .and_then(|column| column.top())
+                .and_then(|last| {
+                    windows
+                        .layout_position(last)
+                        .map(|position| position.0.x)
+                        .zip(windows.moving_frame(last).map(|frame| frame.width()))
+                })
+                .map(|(last_x, last_width)| last_x + last_width)
+        {
+            strip_position.x = if display_bounds.width() < total_strip_width {
+                strip_position.x.clamp(
+                    display_bounds.max.x - total_strip_width,
+                    display_bounds.min.x,
+                )
+            } else {
+                // Strip fits entirely: pin the leftmost window to the left edge.
+                display_bounds.min.x
+            };
+        }
 
         // Check how much of the window is hidden. Slivers don't count as
         // meaningfully visible, so subtract sliver_width from the visible
@@ -1101,9 +1151,7 @@ fn ensure_visible_in_strip(
         let candidate_min = layout_position.0 + strip_position.0;
         // Clamp into the viewport. If already on-screen, this is a no-op and
         // the strip target equals its current position — no movement.
-        //let clamped_min = candidate_min.clamp(viewport.min, viewport.max - size);
-        let clamped_min =
-            candidate_min.clamp(viewport.min, (viewport.max - size).max(viewport.min));
+        let clamped_min = clamp_origin_to_viewport(candidate_min, size, viewport);
         if clamped_min == candidate_min {
             return;
         }
@@ -1357,6 +1405,36 @@ mod tests {
     use super::*;
     use bevy::prelude::*;
 
+    #[test]
+    fn clamp_origin_supports_oversized_windows() {
+        let viewport = IRect::new(0, 20, 1024, 768);
+        let size = Size::new(2048, 748);
+
+        assert_eq!(
+            clamp_origin_to_viewport(Origin::new(300, 20), size, viewport),
+            Origin::new(0, 20)
+        );
+        assert_eq!(
+            clamp_origin_to_viewport(Origin::new(-1600, 20), size, viewport),
+            Origin::new(-1024, 20)
+        );
+        assert_eq!(
+            clamp_origin_to_viewport(Origin::new(-600, 20), size, viewport),
+            Origin::new(-600, 20)
+        );
+    }
+
+    #[test]
+    fn clamp_origin_keeps_regular_windows_inside_viewport() {
+        let viewport = IRect::new(0, 20, 1024, 768);
+        let size = Size::new(400, 300);
+
+        assert_eq!(
+            clamp_origin_to_viewport(Origin::new(-100, 900), size, viewport),
+            Origin::new(0, 468)
+        );
+    }
+
     fn setup_world_and_strip() -> (World, LayoutStrip, Vec<Entity>) {
         let mut world = World::new();
         let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
@@ -1550,10 +1628,12 @@ mod tests {
         strip.stack(entities[1]).unwrap();
         strip.stack(entities[2]).unwrap();
 
-        // Give different heights; top window (e0) is 400px wide, others 300px.
+        // Give the master (e0) a distinct width so we can verify children
+        // adopt it. Here e0 is 500px while its stacked children are 300px;
+        // children must widen to the master's 500, not keep their own width.
         let get_window_frame = |e: Entity| {
             if e == entities[0] {
-                Some(IRect::new(0, 0, 400, 200))
+                Some(IRect::new(0, 0, 500, 200))
             } else if e == entities[1] || e == entities[2] {
                 Some(IRect::new(0, 0, 300, 200))
             } else {
@@ -1563,6 +1643,16 @@ mod tests {
 
         let out: Vec<_> = strip.relative_positions(600, &get_window_frame).collect();
         assert_eq!(out.len(), 4);
+
+        // Every window in the stacked column must adopt the master's width.
+        for e in [entities[0], entities[1], entities[2]] {
+            let frame = out.iter().find(|(entity, _)| *entity == e).unwrap().1;
+            assert_eq!(
+                frame.width(),
+                500,
+                "stacked window must share the master's (top) width"
+            );
+        }
 
         // Stacked heights should sum to viewport height.
         let stack_heights: i32 = out

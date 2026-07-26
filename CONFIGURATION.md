@@ -21,7 +21,7 @@ General behavior settings for the window manager.
 | `mouse_follows_focus` | Boolean | `true` | If enabled, the mouse cursor will warp to the center of the focused window when focus changes via keyboard. |
 | `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
-| `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the screen width used by the `window_resize` command to cycle sizes. |
+| `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
@@ -58,7 +58,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | :--- | :--- | :--- | :--- |
 | `sensitivity` | Float (0.1–2.0) | `0.35` | Multiplier for swipe distance. |
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
-| `continuous` | Boolean | `true` | If enabled, the swipe gesture moves windows smoothly with the fingers. If disabled, it snaps to windows as you swipe. |
+| `continuous` | Boolean | `true` | If `true`, the windows are allowed to fully move across the desktop, potentially exposing the empty desktop space. If `false`, the window strip will not move further than the left or right most window. This also affects the windows during keyboard focus - if `false` the left or right most windows will snap to the edge of display. |
 
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |
@@ -66,6 +66,8 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `fingers_count` | Integer | *None* | Number of fingers for the swipe gesture. Set to 3 or more to enable. |
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
+
+When `fingers_count` is omitted or set below 3, Paneru does not intercept native macOS gestures. If macOS uses three-finger horizontal swipes for Spaces, prefer `[swipe.scroll]` with a modifier or configure a different finger count.
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |
@@ -114,11 +116,21 @@ opacity_night = -0.25
 ## 5. Keybindings (`[bindings]`)
 
 Bindings map a key combination to an action. A binding can be a single string or an array of strings.
-Format: `"[modifiers-]key"`. Available modifiers are:
+
+Format: `"[modifiers-]key"`. For example `alt + cmd - j` and `cmd - j`.
+
+Available modifiers are:
 - `alt`, `lalt`, `ralt`
 - `ctrl`, `lctrl`, `rctrl`
 - `cmd`, `lcmd`, `rcmd`
 - `shift`, `lshift`, `rshift`
+- `fn`
+
+For a full list of parseable keys (i.e. `leftarrow`) check the source:
+https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcccc/src/config.rs#L1466-L1601
+
+
+### Window commands
 
 | Action | Description |
 | :--- | :--- |
@@ -229,7 +241,7 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | `manage` | Boolean | Force Paneru to manage this app/window even if macOS reports the app as unobservable or the window has a non-standard role/subrole. |
 | `index` | Integer | Preferred position in the strip when spawned. |
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
-| `width` | Float (0.0–1.0) | Initial width ratio for the window. |
+| `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
 | `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. |
 | `horizontal_padding` | Integer | Gaps to the left/right of this window. |
 | `vertical_padding` | Integer | Gaps to the top/bottom of this window. |

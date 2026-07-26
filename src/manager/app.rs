@@ -337,6 +337,7 @@ impl ApplicationApi for ApplicationOS {
 /// An enum representing the type of observer being used.
 /// `Application` refers to an observer for application-level events.
 /// `Window(WinID)` refers to an observer for a specific window, identified by its `WinID`.
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ObserverType {
     Application,
     Window(WinID),
@@ -505,12 +506,7 @@ impl AxObserverHandler {
         which: ObserverType,
     ) -> Result<Vec<&str>> {
         let observer: AXObserverRef = self.observer.as_ptr();
-        let context = Box::pin(ObserverContext {
-            events: self.events.clone(),
-            which,
-        });
-        let context_ptr = NonNull::from_ref(&*context).as_ptr();
-        self.contexts.force_write().push(context);
+        let context_ptr = self.get_or_insert_context(which).as_ptr();
 
         // TODO: retry re-registering these.
         let mut retry = vec![];
@@ -563,14 +559,10 @@ impl AxObserverHandler {
         element: &AXUIWrapper,
         notifications: &[&'static str],
     ) {
-        let mut existing = self.contexts.force_write();
-        if let ObserverType::Window(removed) = which &&
-                !existing.iter().any(
-                    |context| matches!(context.which, ObserverType::Window(window_id) if window_id == *removed),
-                ) {
-                    debug!("window {removed} ({element}) already un-observed, skipping!");
-                    return;
-            }
+        if self.get_context(*which).is_none() {
+            debug!("{which:?} ({element}) already un-observed, skipping!");
+            return;
+        }
 
         for name in notifications {
             let observer: AXObserverRef = self.observer.deref().as_ptr();
@@ -582,11 +574,8 @@ impl AxObserverHandler {
                 debug!("error removing {name} {element:x?} {observer:?}: {result}");
             }
         }
-        if let ObserverType::Window(removed) = which {
-            existing.retain(
-                    |context| !matches!(context.which, ObserverType::Window(window_id) if window_id == *removed),
-                );
-        }
+        // AX may already have queued callbacks with this context pointer. Keep
+        // every refcon alive until `drop` removes the observer's run-loop source.
     }
 
     /// The static callback function for `AXObserver`. This function is called by the macOS Accessibility API
@@ -614,5 +603,60 @@ impl AxObserverHandler {
         };
 
         context.notify(&notification, element);
+    }
+
+    fn get_context(&self, which: ObserverType) -> Option<NonNull<ObserverContext>> {
+        let contexts = self.contexts.force_read();
+        contexts
+            .iter()
+            .find(|context| context.which == which)
+            .map(|context| NonNull::from_ref(context.as_ref().get_ref()))
+    }
+
+    fn get_or_insert_context(
+        &self,
+        // contexts: &mut Vec<Pin<Box<ObserverContext>>>,
+        which: ObserverType,
+    ) -> NonNull<ObserverContext> {
+        if let Some(context) = self.get_context(which) {
+            return context;
+        }
+        self.contexts.force_write().push(Box::pin(ObserverContext {
+            events: self.events.clone(),
+            which,
+        }));
+        self.get_context(which)
+            .expect("inserted observer context must be present")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        mem::ManuallyDrop,
+        ptr::NonNull,
+        sync::{Arc, RwLock},
+    };
+    use stdext::sync::rw_lock::RwLockExt as _;
+
+    use super::ObserverType;
+    use crate::{events::EventSender, manager::app::AxObserverHandler, util::AXUIWrapper};
+
+    #[test]
+    fn same_observer_type_reuses_stable_context_pointer() {
+        let fake_ptr = NonNull::<AXUIWrapper>::dangling().as_ptr();
+        let observer = AXUIWrapper::from_retained(fake_ptr).unwrap();
+        let (events, _receiver) = EventSender::new();
+        let handler = ManuallyDrop::new(AxObserverHandler {
+            observer,
+            events,
+            contexts: Arc::new(RwLock::new(Vec::new())),
+        });
+
+        let first = handler.get_or_insert_context(ObserverType::Window(42));
+        let reused = handler.get_or_insert_context(ObserverType::Window(42));
+
+        assert_eq!(reused, first);
+        assert_eq!(handler.contexts.as_ref().force_read().len(), 1);
     }
 }
