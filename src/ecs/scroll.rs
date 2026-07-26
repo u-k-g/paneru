@@ -3,7 +3,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Res, Single, SystemParam};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
@@ -16,8 +16,9 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, MissionControlActive, Position, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt,
 };
-use crate::errors::Result;
+use crate::errors::Result as PaneruResult;
 use crate::events::Event;
 use crate::manager::{Window, WindowManager};
 use crate::platform::Modifiers;
@@ -48,41 +49,58 @@ impl Plugin for ScrollEventsPlugin {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[derive(Default)]
+struct HorizontalGestureState {
+    had_swipe: bool,
+}
+
+#[derive(SystemParam)]
+struct SwipeGestureParams<'w, 's> {
+    active_display: ActiveDisplay<'w, 's>,
+    active_workspace: Single<
+        'w,
+        's,
+        (Entity, &'static Position, Option<&'static mut Scrolling>),
+        With<ActiveWorkspaceMarker>,
+    >,
+    windows: Windows<'w, 's>,
+    time: Res<'w, Time>,
+    config: Res<'w, Config>,
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn swipe_gesture(
     mut messages: MessageReader<Event>,
-    active_display: ActiveDisplay,
-    mut active_workspace: Single<
-        (Entity, &Position, Option<&mut Scrolling>),
-        With<ActiveWorkspaceMarker>,
-    >,
-    time: Res<Time>,
-    config: Res<Config>,
+    params: SwipeGestureParams,
     mut commands: Commands,
+    mut gesture_state: Local<HorizontalGestureState>,
 ) {
+    let SwipeGestureParams {
+        active_display,
+        mut active_workspace,
+        windows,
+        time,
+        config,
+    } = params;
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
+    let mut touchpad_up = false;
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
-    // Normalization: Touchpad deltas are typically small fractions.
-    // Scroll wheel deltas can be larger. We scale it down slightly
-    // to match the "feel" of a finger swipe.
-    const SCROLL_SCALE_UPPER: f64 = 0.15;
-    const SCROLL_SCALE_LOWER: f64 = 0.005;
-    const SCROLL_FULL_RANGE: f64 = 2.0;
-    let scroll_scale = SCROLL_SCALE_LOWER
-        + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
+    let scroll_scale = modifier_scroll_scale(swipe_sensitivity);
 
     for event in messages.read() {
         match event {
             Event::TouchpadDown => {
                 touchpad_down = true;
                 total_delta = 0.0;
+                gesture_state.had_swipe = false;
             }
+            Event::TouchpadUp => touchpad_up = true,
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
@@ -96,16 +114,25 @@ fn swipe_gesture(
                 gesture_delta += delta;
                 has_scroll_event = true;
                 has_gesture_event = true;
+                gesture_state.had_swipe = true;
             }
             _ => (),
         }
     }
 
-    if !touchpad_down && !has_scroll_event {
+    let snap_on_release = touchpad_up && gesture_state.had_swipe && config.snap_to_window();
+    if touchpad_up {
+        gesture_state.had_swipe = false;
+    }
+
+    if !touchpad_down && !has_scroll_event && !snap_on_release {
         return;
     }
 
     let (entity, position, scrolling) = &mut *active_workspace;
+    let mut resulting_position = scrolling
+        .as_ref()
+        .map_or(f64::from(position.0.x), |scrolling| scrolling.position);
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
@@ -140,16 +167,95 @@ fn swipe_gesture(
             scrolling.last_event = Instant::now();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
+            resulting_position = scrolling.position;
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+            resulting_position = f64::from(position.0.x)
+                + total_delta * viewport_width * direction_modifier * swipe_sensitivity;
             entity_commands.try_insert(Scrolling {
                 velocity: new_velocity,
-                position: f64::from(position.0.x)
-                    + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
+                position: resulting_position,
                 is_user_swiping: true,
                 last_event: Instant::now(),
             });
         }
     }
+
+    if snap_on_release {
+        snap_to_nearest_window(
+            *entity,
+            resulting_position,
+            scrolling.as_deref_mut(),
+            &active_display,
+            &windows,
+            &config,
+            &mut commands,
+        );
+    }
+}
+
+fn modifier_scroll_scale(swipe_sensitivity: f64) -> f64 {
+    // Native modifier-scroll deltas are larger than raw touch deltas.
+    const UPPER: f64 = 0.15;
+    const LOWER: f64 = 0.005;
+    const FULL_RANGE: f64 = 2.0;
+    LOWER + ((UPPER - LOWER) / FULL_RANGE) * swipe_sensitivity
+}
+
+fn snap_to_nearest_window(
+    strip_entity: Entity,
+    strip_position: f64,
+    scrolling: Option<&mut Scrolling>,
+    active_display: &ActiveDisplay,
+    windows: &Windows,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    let viewport = active_display.actual_bounds(config);
+    let columns = active_display
+        .active_strip()
+        .all_columns()
+        .into_iter()
+        .filter_map(|entity| {
+            let layout_x = windows.layout_position(entity)?.0.x;
+            let width = windows.moving_frame(entity)?.width();
+            Some((entity, layout_x, width))
+        });
+    let Some((target, snap_position)) =
+        nearest_snap_target(f64::from(viewport.center().x), strip_position, columns)
+    else {
+        return;
+    };
+
+    if let Some(scrolling) = scrolling {
+        scrolling.velocity = 0.0;
+        scrolling.position = snap_position;
+        scrolling.is_user_swiping = false;
+        scrolling.last_event = Instant::now();
+    } else if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+        entity_commands.try_insert(Scrolling {
+            velocity: 0.0,
+            position: snap_position,
+            is_user_swiping: false,
+            last_event: Instant::now(),
+        });
+    }
+    commands.focus_entity(target, true);
+}
+
+fn nearest_snap_target(
+    viewport_center: f64,
+    strip_position: f64,
+    columns: impl IntoIterator<Item = (Entity, i32, i32)>,
+) -> Option<(Entity, f64)> {
+    columns
+        .into_iter()
+        .map(|(entity, layout_x, width)| {
+            let column_center = f64::from(layout_x) + f64::from(width) / 2.0;
+            let distance = (strip_position + column_center - viewport_center).abs();
+            (entity, viewport_center - column_center, distance)
+        })
+        .min_by(|(_, _, left), (_, _, right)| left.total_cmp(right))
+        .map(|(entity, position, _)| (entity, position))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -333,7 +439,7 @@ where
         .map(|(position, frame)| position.x + frame.width())?;
 
     let continuous_swipe = config.continuous_swipe();
-    let strip_position = |column: Result<Column>| {
+    let strip_position = |column: PaneruResult<Column>| {
         column
             .ok()
             .and_then(|column| column.top())

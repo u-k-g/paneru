@@ -700,6 +700,14 @@ impl Config {
             .unwrap_or(true)
     }
 
+    pub fn snap_to_window(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.snap_to_window)
+            .unwrap_or(false)
+    }
+
     pub fn swipe_deceleration(&self) -> f64 {
         let config = self.inner();
         config
@@ -2003,6 +2011,15 @@ fn test_config_defaults() {
     assert_eq!(config.border_width(), 2.0);
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
+    assert!(!config.snap_to_window());
+}
+
+#[test]
+fn test_snap_to_window_config() {
+    let config = Config::try_from("[options]\n\n[swipe]\nsnap_to_window = true\n\n[bindings]\n")
+        .expect("config should parse");
+
+    assert!(config.snap_to_window());
 }
 
 #[test]

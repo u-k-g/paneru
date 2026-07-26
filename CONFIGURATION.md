@@ -59,6 +59,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `sensitivity` | Float (0.1–2.0) | `0.35` | Multiplier for swipe distance. |
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
 | `continuous` | Boolean | `true` | If `true`, the windows are allowed to fully move across the desktop, potentially exposing the empty desktop space. If `false`, the window strip will not move further than the left or right most window. This also affects the windows during keyboard focus - if `false` the left or right most windows will snap to the edge of display. |
+| `snap_to_window` | Boolean | `false` | When a trackpad swipe ends, center the nearest window column and focus its top window. |
 
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |

@@ -384,6 +384,73 @@ fn test_scrolling_stop() {
 }
 
 #[test]
+fn test_snap_to_window_centers_and_focuses_nearest_column_on_release() {
+    let config = Config::try_from(
+        r#"
+[options]
+auto_center = false
+animation_speed = 10000.0
+
+[swipe]
+sensitivity = 1.0
+snap_to_window = true
+
+[swipe.gesture]
+fingers_count = 3
+direction = "Natural"
+
+[bindings]
+"#,
+    )
+    .expect("config should parse");
+
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+
+    for _ in 0..5 {
+        h.app.update();
+        for event in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(event);
+        }
+    }
+
+    {
+        let world = h.app.world_mut();
+        let strip_entity = world
+            .query_filtered::<Entity, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active workspace");
+        world
+            .get_mut::<Position>(strip_entity)
+            .expect("workspace position")
+            .x = 0;
+        world.entity_mut(strip_entity).remove::<Scrolling>();
+
+        world.write_message::<Event>(Event::TouchpadDown);
+        world.write_message::<Event>(Event::Swipe {
+            delta: 0.3,
+            fingers: 3,
+        });
+        world.write_message::<Event>(Event::TouchpadUp);
+    }
+
+    h.app.update();
+
+    let world = h.app.world_mut();
+    let (position, scrolling) = world
+        .query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active workspace should retain its settled scroll state");
+
+    // The swipe leaves window 2 closest to the 1024px viewport center:
+    // 512 - (layout x 800 + half-width 200) = -488.
+    assert_eq!(position.x, -488);
+    assert!((scrolling.position - -488.0).abs() < f64::EPSILON);
+    assert!(scrolling.velocity.abs() < f64::EPSILON);
+    assert!(!scrolling.is_user_swiping);
+    assert_focused!(world, 2);
+}
+
+#[test]
 fn test_window_hidden_ratio() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
