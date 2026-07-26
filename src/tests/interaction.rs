@@ -444,7 +444,7 @@ direction = "Natural"
             .expect("active workspace should still be scrolling");
 
         assert!(
-            scrolling.velocity.abs() > 0.5,
+            scrolling.velocity.abs() > 0.75,
             "finger lift should preserve swipe momentum"
         );
         assert_ne!(

@@ -202,7 +202,7 @@ fn swipe_gesture(
         is_user_swiping = false;
     }
 
-    const SNAP_VELOCITY_THRESHOLD: f64 = 0.5;
+    const SNAP_VELOCITY_THRESHOLD: f64 = 0.75;
     if gesture_state.snap_pending
         && !is_user_swiping
         && resulting_velocity.abs() <= SNAP_VELOCITY_THRESHOLD
