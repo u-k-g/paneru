@@ -52,6 +52,7 @@ impl Plugin for ScrollEventsPlugin {
 #[derive(Default)]
 struct HorizontalGestureState {
     had_swipe: bool,
+    snap_pending: bool,
 }
 
 #[derive(SystemParam)]
@@ -99,6 +100,7 @@ fn swipe_gesture(
                 touchpad_down = true;
                 total_delta = 0.0;
                 gesture_state.had_swipe = false;
+                gesture_state.snap_pending = false;
             }
             Event::TouchpadUp => touchpad_up = true,
             Event::Scroll { delta } => {
@@ -120,12 +122,15 @@ fn swipe_gesture(
         }
     }
 
-    let snap_on_release = touchpad_up && gesture_state.had_swipe && config.snap_to_window();
+    if !config.snap_to_window() {
+        gesture_state.snap_pending = false;
+    }
     if touchpad_up {
+        gesture_state.snap_pending = gesture_state.had_swipe && config.snap_to_window();
         gesture_state.had_swipe = false;
     }
 
-    if !touchpad_down && !has_scroll_event && !snap_on_release {
+    if !touchpad_down && !has_scroll_event && !gesture_state.snap_pending {
         return;
     }
 
@@ -133,11 +138,19 @@ fn swipe_gesture(
     let mut resulting_position = scrolling
         .as_ref()
         .map_or(f64::from(position.0.x), |scrolling| scrolling.position);
+    let mut resulting_velocity = scrolling
+        .as_ref()
+        .map_or(0.0, |scrolling| scrolling.velocity);
+    let mut is_user_swiping = scrolling
+        .as_ref()
+        .is_some_and(|scrolling| scrolling.is_user_swiping);
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
         scrolling.velocity = 0.0;
         scrolling.is_user_swiping = true;
         scrolling.last_event = Instant::now();
+        resulting_velocity = 0.0;
+        is_user_swiping = true;
     }
 
     if has_scroll_event {
@@ -168,19 +181,32 @@ fn swipe_gesture(
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
             resulting_position = scrolling.position;
+            resulting_velocity = scrolling.velocity;
+            is_user_swiping = true;
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             resulting_position = f64::from(position.0.x)
                 + total_delta * viewport_width * direction_modifier * swipe_sensitivity;
+            resulting_velocity = new_velocity;
+            is_user_swiping = !touchpad_up;
             entity_commands.try_insert(Scrolling {
                 velocity: new_velocity,
                 position: resulting_position,
-                is_user_swiping: true,
+                is_user_swiping,
                 last_event: Instant::now(),
             });
         }
     }
 
-    if snap_on_release {
+    if touchpad_up && let Some(scrolling) = scrolling.as_mut() {
+        scrolling.is_user_swiping = false;
+        is_user_swiping = false;
+    }
+
+    const SNAP_VELOCITY_THRESHOLD: f64 = 0.5;
+    if gesture_state.snap_pending
+        && !is_user_swiping
+        && resulting_velocity.abs() <= SNAP_VELOCITY_THRESHOLD
+    {
         snap_to_nearest_window(
             *entity,
             resulting_position,
@@ -190,6 +216,7 @@ fn swipe_gesture(
             &config,
             &mut commands,
         );
+        gesture_state.snap_pending = false;
     }
 }
 

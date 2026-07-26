@@ -384,7 +384,7 @@ fn test_scrolling_stop() {
 }
 
 #[test]
-fn test_snap_to_window_centers_and_focuses_nearest_column_on_release() {
+fn test_snap_to_window_centers_and_focuses_after_momentum_slows() {
     let config = Config::try_from(
         r#"
 [options]
@@ -430,7 +430,48 @@ direction = "Natural"
             delta: 0.3,
             fingers: 3,
         });
-        world.write_message::<Event>(Event::TouchpadUp);
+    }
+
+    h.app.update();
+    h.app.world_mut().write_message::<Event>(Event::TouchpadUp);
+    h.app.update();
+
+    {
+        let world = h.app.world_mut();
+        let (position, scrolling) = world
+            .query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active workspace should still be scrolling");
+
+        assert!(
+            scrolling.velocity.abs() > 0.5,
+            "finger lift should preserve swipe momentum"
+        );
+        assert_ne!(
+            position.x, -488,
+            "the strip should not snap while momentum is still high"
+        );
+        assert_focused!(world, 0);
+    }
+
+    {
+        let world = h.app.world_mut();
+        let strip_entity = world
+            .query_filtered::<Entity, With<ActiveWorkspaceMarker>>()
+            .single(world)
+            .expect("active workspace");
+        {
+            let mut scrolling = world
+                .get_mut::<Scrolling>(strip_entity)
+                .expect("active workspace should still be scrolling");
+            scrolling.position = -307.2;
+            scrolling.velocity = 0.1;
+            scrolling.is_user_swiping = false;
+        }
+        world
+            .get_mut::<Position>(strip_entity)
+            .expect("workspace position")
+            .x = -307;
     }
 
     h.app.update();

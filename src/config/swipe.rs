@@ -23,8 +23,8 @@ pub struct SwipeOptions {
     #[allow(dead_code)]
     pub continuous: Option<bool>,
 
-    /// Snap the column nearest the viewport center into the center and focus
-    /// its top window when a trackpad gesture ends. Default: false.
+    /// After trackpad swipe momentum slows, snap the column nearest the
+    /// viewport center into the center and focus its top window. Default: false.
     pub snap_to_window: Option<bool>,
 
     pub gesture: Option<GestureOptions>,
