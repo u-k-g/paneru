@@ -384,7 +384,7 @@ fn test_scrolling_stop() {
 }
 
 #[test]
-fn test_snap_to_window_centers_and_focuses_after_momentum_slows() {
+fn test_snap_to_window_notches_to_one_neighbor_on_release() {
     let config = Config::try_from(
         r#"
 [options]
@@ -433,62 +433,59 @@ direction = "Natural"
     }
 
     h.app.update();
-    h.app.world_mut().write_message::<Event>(Event::TouchpadUp);
-    h.app.update();
-
-    {
-        let world = h.app.world_mut();
-        let (position, scrolling) = world
-            .query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>()
-            .single(world)
-            .expect("active workspace should still be scrolling");
-
-        assert!(
-            scrolling.velocity.abs() > 0.75,
-            "finger lift should preserve swipe momentum"
-        );
-        assert_ne!(
-            position.x, -488,
-            "the strip should not snap while momentum is still high"
-        );
-        assert_focused!(world, 0);
-    }
-
     {
         let world = h.app.world_mut();
         let strip_entity = world
             .query_filtered::<Entity, With<ActiveWorkspaceMarker>>()
             .single(world)
             .expect("active workspace");
+        let initially_focused = find_window_entity(0, world);
         {
             let mut scrolling = world
                 .get_mut::<Scrolling>(strip_entity)
-                .expect("active workspace should still be scrolling");
-            scrolling.position = -307.2;
-            scrolling.velocity = 0.1;
-            scrolling.is_user_swiping = false;
+                .expect("swipe should start scrolling");
+            assert_eq!(scrolling.fingers_count, Some(3));
+            assert_eq!(scrolling.started_focused, Some(initially_focused));
+            scrolling.position = 0.0;
+            scrolling.velocity = 2.3;
         }
         world
             .get_mut::<Position>(strip_entity)
-            .expect("workspace position")
-            .x = -307;
+            .expect("active workspace position")
+            .x = 0;
     }
-
+    h.app.world_mut().write_message::<Event>(Event::TouchpadUp);
     h.app.update();
 
     let world = h.app.world_mut();
-    let (position, scrolling) = world
-        .query_filtered::<(&Position, &Scrolling), With<ActiveWorkspaceMarker>>()
+    let (position_x, scrolling) = world
+        .query_filtered::<(&Position, Option<&Scrolling>), With<ActiveWorkspaceMarker>>()
         .single(world)
-        .expect("active workspace should retain its settled scroll state");
+        .map(|(position, scrolling)| {
+            (
+                position.x,
+                scrolling.map(|scrolling| {
+                    (
+                        scrolling.velocity,
+                        scrolling.position,
+                        scrolling.is_user_swiping,
+                        scrolling.fingers_count,
+                        scrolling.started_focused,
+                    )
+                }),
+            )
+        })
+        .expect("active workspace");
 
-    // The swipe leaves window 2 closest to the 1024px viewport center:
-    // 512 - (layout x 800 + half-width 200) = -488.
-    assert_eq!(position.x, -488);
-    assert!((scrolling.position - -488.0).abs() < f64::EPSILON);
-    assert!(scrolling.velocity.abs() < f64::EPSILON);
-    assert!(!scrolling.is_user_swiping);
-    assert_focused!(world, 2);
+    // Momentum projects beyond window 1, but a fling advances only one column
+    // relative to the window focused when the swipe began. Window 1 is at
+    // layout x 400: 512 - (400 + half-width 200) = -88.
+    assert_eq!(position_x, -88);
+    assert!(
+        scrolling.is_none(),
+        "release should finish the scrolling state immediately: {scrolling:?}"
+    );
+    assert_focused!(world, 1);
 }
 
 #[test]

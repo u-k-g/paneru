@@ -237,6 +237,10 @@ pub struct Scrolling {
     pub position: f64,
     /// When true, the user's fingers are on the trackpad.
     pub is_user_swiping: bool,
+    /// Finger count for the raw gesture currently driving the strip.
+    pub fingers_count: Option<usize>,
+    /// Window focused when the current gesture began.
+    pub started_focused: Option<Entity>,
     /// Last time a physical swipe event was received.
     pub last_event: Instant,
 }
@@ -247,6 +251,8 @@ impl Default for Scrolling {
             velocity: 0.0,
             position: 0.0,
             is_user_swiping: false,
+            fingers_count: None,
+            started_focused: None,
             last_event: Instant::now(),
         }
     }
@@ -448,6 +454,8 @@ pub struct RestoreWindowState;
 pub trait SpawnCommandsExt {
     fn reposition_entity(&mut self, entity: Entity, origin: Origin);
 
+    fn snap_entity_position(&mut self, entity: Entity, origin: Origin);
+
     fn resize_entity(&mut self, entity: Entity, size: Size);
 
     fn reshuffle_around(&mut self, entity: Entity);
@@ -473,6 +481,14 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     fn reposition_entity(&mut self, entity: Entity, origin: Origin) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
             entity_commands.try_insert(RepositionMarker(origin));
+        }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn snap_entity_position(&mut self, entity: Entity, origin: Origin) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(Position(origin));
+            entity_commands.try_remove::<RepositionMarker>();
         }
     }
 
