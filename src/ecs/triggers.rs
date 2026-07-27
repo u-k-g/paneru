@@ -9,6 +9,7 @@ use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -376,33 +377,33 @@ pub(super) fn mission_control_trigger(
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
-    processes: Query<(&BProcess, Entity)>,
+    processes: Query<(&BProcess, Entity, Has<Children>)>,
     mut commands: Commands,
 ) {
     const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
     let find_process = |psn| {
         processes
             .iter()
-            .find(|(BProcess(process), _)| process.psn() == psn)
+            .find(|(BProcess(process), _, _)| process.psn() == psn)
     };
+    let mut launches = HashMap::new();
 
     for event in messages.read() {
         match event {
-            Event::ApplicationLaunched { psn, observer } if find_process(*psn).is_none() => {
-                let process: BProcess = Process::new(psn, observer.clone()).into();
-                let timeout = Timeout::new(
-                    Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
-                    Some(format!(
-                        "Process '{}' did not become ready in {PROCESS_READY_TIMEOUT_SEC}s.",
-                        process.name()
-                    )),
-                    &mut commands,
-                );
-                commands.spawn((FreshMarker, timeout, process));
+            Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer,
+            } => {
+                let launch = launches
+                    .entry(*psn)
+                    .or_insert_with(|| (observer.clone(), *pid_hint));
+                if pid_hint.is_some() {
+                    launch.1 = *pid_hint;
+                }
             }
-
             Event::ApplicationTerminated { psn } => {
-                if let Some((_, entity)) = find_process(*psn)
+                if let Some((_, entity, _)) = find_process(*psn)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
                     entity_commands.try_despawn();
@@ -410,6 +411,28 @@ pub(super) fn application_event_trigger(
             }
             _ => (),
         }
+    }
+
+    for (psn, (observer, pid_hint)) in launches {
+        if let Some((_, entity, has_children)) = find_process(psn) {
+            if has_children || pid_hint.is_none() {
+                continue;
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+        }
+
+        let process: BProcess = Process::new(&psn, observer, pid_hint).into();
+        let timeout = Timeout::new(
+            Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
+            Some(format!(
+                "Process '{}' did not become ready in {PROCESS_READY_TIMEOUT_SEC}s.",
+                process.name()
+            )),
+            &mut commands,
+        );
+        commands.spawn((FreshMarker, timeout, process));
     }
 }
 

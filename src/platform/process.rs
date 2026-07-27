@@ -1,5 +1,6 @@
 use core::ptr::NonNull;
 use objc2::rc::Retained;
+use objc2_app_kit::NSWorkspace;
 use scopeguard::ScopeGuard;
 use std::ffi::c_void;
 use std::marker::PhantomPinned;
@@ -430,11 +431,21 @@ impl ProcessHandler {
         let _ = match event {
             ProcessEventApp::Launched => self.events.send(Event::ApplicationLaunched {
                 psn,
+                pid_hint: None,
                 observer: self.observer.clone(),
             }),
             ProcessEventApp::Terminated => self.events.send(Event::ApplicationTerminated { psn }),
             ProcessEventApp::FrontSwitched => {
-                self.events.send(Event::ApplicationFrontSwitched { psn })
+                let pid_hint = NSWorkspace::sharedWorkspace()
+                    .frontmostApplication()
+                    .map(|app| app.processIdentifier());
+                self.events
+                    .send(Event::ApplicationLaunched {
+                        psn,
+                        pid_hint,
+                        observer: self.observer.clone(),
+                    })
+                    .and_then(|()| self.events.send(Event::ApplicationFrontSwitched { psn }))
             }
             _ => {
                 error!("Unknown process event: {}", event as u32);
@@ -442,5 +453,31 @@ impl ProcessHandler {
             }
         }
         .inspect_err(|err| error!("error sending event: {err}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcessEventApp, ProcessHandler};
+    use crate::events::{Event, EventSender};
+    use crate::platform::{ProcessSerialNumber, WorkspaceObserver};
+
+    #[test]
+    fn front_switch_reconciles_process_before_forwarding_focus() {
+        let (events, receiver) = EventSender::new();
+        let observer = WorkspaceObserver::new(events.clone());
+        let mut handler = ProcessHandler::new(events, observer);
+        let psn = ProcessSerialNumber { high: 1, low: 2 };
+
+        handler.process_handler(psn, ProcessEventApp::FrontSwitched);
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Event::ApplicationLaunched { psn: found, .. } if found == psn
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            Event::ApplicationFrontSwitched { psn: found } if found == psn
+        ));
     }
 }

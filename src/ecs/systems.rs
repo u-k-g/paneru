@@ -767,8 +767,12 @@ pub(crate) fn gather_initial_processes(
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded | Event::Exit => break,
-            Event::ApplicationLaunched { psn, observer } => {
-                initial_processes.push(Process::new(&psn, observer.clone()).into());
+            Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer,
+            } => {
+                initial_processes.push(Process::new(&psn, observer.clone(), pid_hint).into());
             }
             Event::InitialConfig(config) => {
                 // If there is a display menubar override, apply it to newly created displays.
