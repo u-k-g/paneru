@@ -25,6 +25,11 @@ use crate::platform::Modifiers;
 
 pub struct ScrollEventsPlugin;
 
+const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
+// Keep snap intent longer than the general scroll timeout so a brief pause in
+// gesture samples cannot strand the strip before macOS reports finger-up.
+const SNAP_GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
+
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
@@ -81,7 +86,7 @@ fn swipe_gesture(
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
-    let mut fingers_count = None;
+    let mut gesture_fingers = None;
     let mut touchpad_down = false;
     let mut touchpad_up = false;
     let mut has_scroll_event = false;
@@ -98,7 +103,6 @@ fn swipe_gesture(
             Event::TouchpadUp => touchpad_up = true,
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
-                fingers_count = None;
                 has_scroll_event = true;
             }
             Event::Swipe { delta, fingers }
@@ -110,7 +114,7 @@ fn swipe_gesture(
                 gesture_delta += delta;
                 has_scroll_event = true;
                 has_gesture_event = true;
-                fingers_count = Some(*fingers);
+                gesture_fingers = Some(*fingers);
             }
             _ => (),
         }
@@ -133,12 +137,11 @@ fn swipe_gesture(
 
     if touchpad_up
         && let Some(scrolling) = scrolling.as_mut()
-        && (!config.snap_to_window()
-            || config
-                .swipe_gesture_fingers()
-                .is_none_or(|fingers| scrolling.fingers_count != Some(fingers)))
+        && !is_snap_gesture(scrolling, &config)
     {
         scrolling.is_user_swiping = false;
+        scrolling.fingers_count = None;
+        scrolling.started_focused = None;
     }
 
     if has_scroll_event {
@@ -165,7 +168,9 @@ fn swipe_gesture(
                 0.0
             };
             scrolling.is_user_swiping = true;
-            scrolling.fingers_count = fingers_count;
+            if has_gesture_event {
+                scrolling.fingers_count = gesture_fingers;
+            }
             scrolling.last_event = Instant::now();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
@@ -176,7 +181,7 @@ fn swipe_gesture(
                 velocity: new_velocity,
                 position: resulting_position,
                 is_user_swiping: true,
-                fingers_count,
+                fingers_count: gesture_fingers,
                 started_focused: focused_at_start,
                 last_event: Instant::now(),
             });
@@ -192,6 +197,13 @@ fn modifier_scroll_scale(swipe_sensitivity: f64) -> f64 {
     LOWER + ((UPPER - LOWER) / FULL_RANGE) * swipe_sensitivity
 }
 
+fn is_snap_gesture(scrolling: &Scrolling, config: &Config) -> bool {
+    config.snap_to_window()
+        && config
+            .swipe_gesture_fingers()
+            .is_some_and(|fingers| scrolling.fingers_count == Some(fingers))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn snap_trackpad_swipe(
@@ -205,24 +217,24 @@ fn snap_trackpad_swipe(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    if !config.snap_to_window()
-        || !messages
-            .read()
-            .any(|event| matches!(event, Event::TouchpadUp))
-    {
+    if !config.snap_to_window() {
         return;
     }
 
     let (strip_entity, strip, position, mut scrolling) = active_workspace.into_inner();
-    if config
-        .swipe_gesture_fingers()
-        .is_none_or(|fingers| scrolling.fingers_count != Some(fingers))
-    {
+    if !is_snap_gesture(&scrolling, &config) {
+        return;
+    }
+
+    let released = messages
+        .read()
+        .any(|event| matches!(event, Event::TouchpadUp));
+    if !released && scrolling.last_event.elapsed() <= SNAP_GESTURE_TIMEOUT {
         return;
     }
 
     let viewport = active_display.actual_bounds(&config);
-    let Some(entity) = swipe_release_target(
+    let preferred = swipe_release_target(
         strip,
         position.0,
         scrolling.velocity,
@@ -230,15 +242,25 @@ fn snap_trackpad_swipe(
         &viewport,
         &windows,
         &config,
-    ) else {
-        return;
-    };
+    );
+    let target = preferred
+        .and_then(|entity| {
+            centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
+                .map(|position| (entity, position))
+        })
+        .or_else(|| {
+            let entity = nearest_window(strip, position.0, &viewport, &windows)?;
+            centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
+                .map(|position| (entity, position))
+        });
 
-    if let Some(target) =
-        centered_strip_position(entity, strip, position.0, &viewport, &windows, &config)
-    {
+    if let Some((entity, target)) = target {
         scrolling.position = f64::from(target.x);
         commands.snap_entity_position(strip_entity, target);
+        // Use the same raised native-focus path as keyboard focus movement
+        // (Alt-H/Alt-L). This invokes the AX focus call even when the ECS
+        // FocusedMarker already happens to be on the snapped window.
+        commands.focus_entity(entity, true);
     }
     scrolling.velocity = 0.0;
     scrolling.is_user_swiping = false;
@@ -247,7 +269,6 @@ fn snap_trackpad_swipe(
     if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
         entity_commands.try_remove::<Scrolling>();
     }
-    commands.focus_entity(entity, true);
 }
 
 fn swipe_release_target(
@@ -262,13 +283,13 @@ fn swipe_release_target(
     const MOMENTUM_SECONDS: f64 = 0.20;
     const FLING_VELOCITY_THRESHOLD: f64 = 2.2;
 
-    let visible = most_visible_window(strip, strip_position, viewport, windows)?;
+    let nearest = nearest_window(strip, strip_position, viewport, windows)?;
     if velocity.abs() < FLING_VELOCITY_THRESHOLD {
-        return Some(visible);
+        return Some(nearest);
     }
 
     let Some(started_focused) = started_focused.filter(|entity| strip.contains(*entity)) else {
-        return Some(visible);
+        return Some(nearest);
     };
 
     let direction_modifier = match config.swipe_gesture_direction() {
@@ -279,7 +300,7 @@ fn swipe_release_target(
         + velocity * f64::from(viewport.width()) * direction_modifier * MOMENTUM_SECONDS;
     let projected_position = IVec2::new(projected_x.round() as i32, strip_position.y);
 
-    let projected = most_visible_window(strip, projected_position, viewport, windows)?;
+    let projected = nearest_window(strip, projected_position, viewport, windows)?;
     let start_index = strip.index_of(started_focused).ok()?;
     let projected_index = strip.index_of(projected).ok()?;
     let target = match projected_index.cmp(&start_index) {
@@ -314,32 +335,35 @@ fn centered_strip_position(
         &get_window_frame,
         viewport,
         config,
-    )?;
+    )
+    // Transient layout changes can make the full-strip clamp unavailable. The
+    // selected window still has valid geometry, so center it instead of leaving
+    // the strip at the arbitrary release position.
+    .unwrap_or(target_x);
 
     Some(IVec2::new(clamped_x, current_position.y))
 }
 
-fn most_visible_window(
+fn nearest_window(
     strip: &LayoutStrip,
     strip_position: IVec2,
     viewport: &IRect,
     windows: &Windows,
 ) -> Option<Entity> {
+    let viewport_center = viewport.center().x;
     strip
         .all_columns()
         .into_iter()
         .filter_map(|entity| {
             let layout = windows.layout_position(entity)?;
             let frame = windows.moving_frame(entity)?;
-            let visible_frame = IRect::from_corners(
-                layout.0 + strip_position,
-                layout.0 + strip_position + frame.size(),
-            );
-            let intersection = visible_frame.intersect(*viewport);
-            let area = intersection.width().max(0) * intersection.height().max(0);
-            (area > 0).then_some((entity, area))
+            let center = layout.0.x + strip_position.x + frame.width() / 2;
+            Some((
+                entity,
+                i64::from(center).abs_diff(i64::from(viewport_center)),
+            ))
         })
-        .max_by_key(|(_, area)| *area)
+        .min_by_key(|(_, distance)| *distance)
         .map(|(entity, _)| entity)
 }
 
@@ -349,16 +373,19 @@ pub(super) fn swiping_timeout(
     strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
     active_display: ActiveDisplay,
     time: Res<Time>,
+    config: Res<Config>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
     const MIN_VELOCITY_PX: f64 = 5.0;
     let dt = time.delta_secs_f64();
     let viewport_width = f64::from(active_display.bounds().width());
 
     for (entity, mut scroll) in strips {
         if scroll.last_event.elapsed() > FINGER_LIFT_THRESHOLD {
+            if is_snap_gesture(&scroll, &config) {
+                continue;
+            }
             scroll.is_user_swiping = false;
 
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX

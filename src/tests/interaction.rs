@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
@@ -405,8 +406,7 @@ fn test_scrolling_stop() {
         .run(commands);
 }
 
-#[test]
-fn test_snap_to_window_notches_to_one_neighbor_on_release() {
+fn snap_to_window_harness() -> TestHarness {
     let config = Config::try_from(
         r#"
 [options]
@@ -427,13 +427,18 @@ direction = "Natural"
     .expect("config should parse");
 
     let mut h = TestHarness::new().with_config(config).with_windows(3);
-
     for _ in 0..5 {
         h.app.update();
         for event in h.mock_state.drain_events() {
             h.app.world_mut().write_message::<Event>(event);
         }
     }
+    h
+}
+
+#[test]
+fn test_snap_to_window_notches_to_one_neighbor_on_release() {
+    let mut h = snap_to_window_harness();
 
     {
         let world = h.app.world_mut();
@@ -508,6 +513,88 @@ direction = "Natural"
         "release should finish the scrolling state immediately: {scrolling:?}"
     );
     assert_focused!(world, 1);
+    assert_eq!(
+        h.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(1),
+        "snapped window should receive native macOS focus"
+    );
+}
+
+#[test]
+fn test_snap_to_window_centers_nearest_window_after_partial_swipe() {
+    let mut h = snap_to_window_harness();
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::TouchpadDown);
+    h.app.world_mut().write_message::<Event>(Event::Swipe {
+        delta: 0.08,
+        fingers: 3,
+    });
+    // A native scroll sample arriving in the same batch must not erase the
+    // raw gesture's pending snap state.
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::Scroll { delta: 0.01 });
+    h.app.update();
+
+    h.app.world_mut().write_message::<Event>(Event::TouchpadUp);
+    h.app.update();
+
+    let world = h.app.world_mut();
+    let (position, scrolling) = world
+        .query_filtered::<(&Position, Option<&Scrolling>), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active workspace");
+    assert_eq!(position.x, -88);
+    assert!(scrolling.is_none(), "snap should finish scrolling");
+    assert_focused!(world, 1);
+    assert_eq!(
+        h.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(1),
+        "snapped window should receive native macOS focus"
+    );
+}
+
+#[test]
+fn test_snap_to_window_timeout_cannot_leave_strip_between_windows() {
+    let mut h = snap_to_window_harness();
+
+    let world = h.app.world_mut();
+    let strip_entity = world
+        .query_filtered::<Entity, With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active workspace");
+    let initially_focused = find_window_entity(0, world);
+    world
+        .get_mut::<Position>(strip_entity)
+        .expect("workspace position")
+        .x = -250;
+    world.entity_mut(strip_entity).insert(Scrolling {
+        velocity: 0.1,
+        position: -250.0,
+        is_user_swiping: true,
+        fingers_count: Some(3),
+        started_focused: Some(initially_focused),
+        last_event: Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("200 ms should be representable"),
+    });
+
+    h.app.update();
+
+    let world = h.app.world_mut();
+    let (position, scrolling) = world
+        .query_filtered::<(&Position, Option<&Scrolling>), With<ActiveWorkspaceMarker>>()
+        .single(world)
+        .expect("active workspace");
+    assert_eq!(position.x, -88);
+    assert!(scrolling.is_none(), "timeout should finish scrolling");
+    assert_focused!(world, 1);
+    assert_eq!(
+        h.mock_state.focused_window_id(TEST_PROCESS_ID),
+        Some(1),
+        "snapped window should receive native macOS focus"
+    );
 }
 
 #[test]

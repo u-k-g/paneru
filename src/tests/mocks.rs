@@ -172,6 +172,14 @@ impl MockState {
         }
     }
 
+    pub(crate) fn focused_window_id(&self, pid: Pid) -> Option<WinID> {
+        self.inner
+            .force_read()
+            .apps
+            .get(&pid)
+            .and_then(|app| app.focused_window_id)
+    }
+
     pub fn add_display(&mut self, id: u32, bounds: IRect, workspaces: Vec<WorkspaceId>) {
         let mut inner = self.inner.force_write();
         if inner.displays.is_empty() {
