@@ -22,13 +22,13 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, NativeFullscreenMarker, Position,
-    RefreshWindowSizes, RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt,
-    Timeout, Unmanaged,
+    ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, Initializing,
+    NativeFullscreenMarker, Position, RefreshWindowSizes, RepositionMarker, Scrolling,
+    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::errors::Result;
 use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Window, WindowManager};
+use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
 pub struct WorkspaceEventsPlugin;
@@ -83,6 +83,35 @@ struct VirtualMoveMarker {
 pub(crate) struct PreviousStripPosition {
     pub origin: Origin,
     pub focus: Option<Entity>,
+}
+
+/// Guard spawned by [`show_active_workspace`] alongside the re-focus of the
+/// remembered window when a strip is restored to its saved position. That
+/// focus lands after the strip was already placed at its saved origin —
+/// `focus_entity` inserts `FocusedMarker` a command-flush later, and the OS
+/// acknowledges with one or more `WindowFocused` events several ticks later
+/// still (the front-switch handler synthesizes an extra one), long after the
+/// `is_added` guards in the layout systems have expired. Each of those would
+/// recenter or reshuffle the strip away from the restored position (visible
+/// as a wiggle on every switch). While the guard is alive,
+/// `autocenter_window_on_focus` and the duplicate-focus reshuffle in
+/// `window_focused_trigger` skip the named entity. The guard lives on its own
+/// entity next to a [`Timeout`]: focus moving to any other window despawns it
+/// immediately, and `timeout_ticker` expires it otherwise — so later genuine
+/// re-focus events reshuffle normally.
+#[derive(Component, Debug)]
+pub(crate) struct RestoreFocusMarker {
+    pub entity: Entity,
+}
+
+/// Long enough for the OS focus acknowledgments to arrive, short enough that
+/// a user re-clicking the restored window soon after the switch gets the
+/// normal expose-reshuffle back.
+const RESTORE_FOCUS_GUARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
+    let timeout = Timeout::new(RESTORE_FOCUS_GUARD_TIMEOUT, None, commands);
+    commands.spawn((timeout, RestoreFocusMarker { entity }));
 }
 
 fn fullscreen_window_in_strip(
@@ -483,60 +512,68 @@ fn find_orphaned_workspaces(
 
 #[allow(clippy::needless_pass_by_value)]
 fn refresh_workspace_window_sizes(
-    layout_strip: Single<(&LayoutStrip, Entity, &RefreshWindowSizes), With<ActiveWorkspaceMarker>>,
+    layout_strip: Populated<(&RefreshWindowSizes, &LayoutStrip, Entity, &ChildOf)>,
     mut windows: Query<(Entity, &mut Window, &mut Bounds, Option<&Unmanaged>)>,
-    active_display: ActiveDisplay,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
-    let (strip, strip_entity, marker) = *layout_strip;
-    if !marker.ready() {
-        return;
-    }
-
-    debug!("refreshing workspace {} sizes", strip.id());
-    let mut in_workspace = window_manager
-        .windows_in_workspace(strip.id())
-        .inspect_err(|err| {
-            warn!("getting windows in workspace: {err}");
-        })
-        .unwrap_or_default();
-
-    // Resize windows for the new display dimensions.
-    for entity in strip.all_windows() {
-        let Ok((_, ref mut window, ref mut bounds, _)) = windows.get_mut(entity) else {
+    for (_, strip, strip_entity, child) in
+        layout_strip.into_iter().filter(|marker| marker.0.ready())
+    {
+        debug!("refreshing workspace {} sizes", strip.id());
+        let Ok((display, dock)) = displays.get(child.parent()) else {
             continue;
         };
-        let Ok(frame) = window.update_frame() else {
-            continue;
-        };
-        bounds.0 = frame.size();
-        debug!("refreshing window {} frame {:?}", window.id(), frame);
+        let viewport = display.actual_display_bounds(dock, &config);
 
-        in_workspace.retain(|window_id| *window_id != window.id());
-    }
+        let mut in_workspace = window_manager
+            .windows_in_workspace(strip.id())
+            .inspect_err(|err| {
+                warn!("getting windows in workspace: {err}");
+            })
+            .unwrap_or_default();
 
-    // Find remaining windows which are outside of the strip.                                                  ...
-    let floating = in_workspace
-        .into_iter()
-        .filter_map(|window_id| {
-            windows
-                .iter()
-                .find_map(|(entity, window, _, unmanaged)| {
-                    (window_id == window.id()).then_some(unmanaged.zip(Some(entity)))
-                })
-                .flatten()
-        })
-        .filter_map(|(unmanaged, entity)| {
-            matches!(unmanaged, Unmanaged::Floating).then_some(entity)
-        });
-    for window_entity in floating {
-        debug!("repositioning floating window {window_entity}");
-        commands.reposition_entity(window_entity, active_display.bounds().min);
-    }
+        // Resize windows for the new display dimensions.
+        for entity in strip.all_windows() {
+            let Ok((_, ref mut window, ref mut bounds, _)) = windows.get_mut(entity) else {
+                continue;
+            };
+            if bounds.x > viewport.width() || bounds.y > viewport.height() {
+                let clamped_size = Size::new(
+                    bounds.x.clamp(0, viewport.width()),
+                    bounds.y.clamp(0, viewport.height()),
+                );
+                debug!("refreshing window {} size to {clamped_size}", window.id());
+                commands.resize_entity(entity, clamped_size);
+            }
 
-    if let Ok(mut cmds) = commands.get_entity(strip_entity) {
-        cmds.try_remove::<RefreshWindowSizes>();
+            in_workspace.retain(|window_id| *window_id != window.id());
+        }
+
+        // Find remaining windows which are outside of the strip.                                                  ...
+        let floating = in_workspace
+            .into_iter()
+            .filter_map(|window_id| {
+                windows
+                    .iter()
+                    .find_map(|(entity, window, _, unmanaged)| {
+                        (window_id == window.id()).then_some(unmanaged.zip(Some(entity)))
+                    })
+                    .flatten()
+            })
+            .filter_map(|(unmanaged, entity)| {
+                matches!(unmanaged, Unmanaged::Floating).then_some(entity)
+            });
+        for window_entity in floating {
+            debug!("repositioning floating window {window_entity}");
+            commands.reposition_entity(window_entity, viewport.min);
+        }
+
+        if let Ok(mut cmds) = commands.get_entity(strip_entity) {
+            cmds.try_remove::<RefreshWindowSizes>();
+        }
     }
 }
 
@@ -764,6 +801,13 @@ fn handle_virtual_window_moves(
                 previous.focus = Some(window_entity);
             }
             commands.reshuffle_around(window_entity);
+
+            if mid_placement.is_none()
+                && let Ok(mut entity_commands) = commands.get_entity(window_entity)
+            {
+                entity_commands.try_remove::<FocusedMarker>();
+                commands.focus_entity(window_entity, false);
+            }
         }
         debug!(
             "Moved window {} to virtual workspace {}",
@@ -813,7 +857,8 @@ fn mid_strip_slot(
     (index, moved_left - chosen_layout_x)
 }
 
-/// Handles the keybinding for switching between virtual workspaces.
+/// Handles the keybinding for switching between virtual workspaces. Moving South
+/// creates a new workspace if the current one is populated and auto-create is on.
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::needless_pass_by_value)]
 fn switch_virtual_workspace_bind(
@@ -843,7 +888,27 @@ fn switch_virtual_workspace_bind(
 
     let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
     let next_index = match operation {
-        Operation::Virtual(Direction::South) => (current_index + 1).clamp(0, rows.len() - 1),
+        Operation::Virtual(Direction::South) => {
+            if current_index + 1 < rows.len() {
+                current_index + 1
+            } else if active_display.active_strip().len() != 0
+                && config.create_workspace_automatically()
+            {
+                let target_index = rows[current_index].1.virtual_index + 1;
+                commands.spawn_layout_strip(
+                    LayoutStrip::new(workspace_id, target_index),
+                    active_display.bounds().min,
+                    active_display.entity(),
+                    true,
+                );
+                if config.workspace_popup_status() {
+                    commands.flash_message(format!("{}", target_index + 1), 1.0);
+                }
+                return;
+            } else {
+                current_index
+            }
+        }
         Operation::Virtual(Direction::North) => current_index.saturating_sub(1),
         Operation::VirtualNumber(target_virtual_index) => {
             let Some(index) = rows
@@ -892,12 +957,16 @@ fn switch_virtual_workspace_bind(
 }
 
 /// Handles the keybinding to move windows between virtual workspaces.
+/// Missing destinations are created by `handle_virtual_window_moves`. South at
+/// the last row only proceeds when `create_workspace_automatically` is on;
+/// numbered targets always may create (except index 0).
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::needless_pass_by_value)]
 fn move_virtual_workspace_bind(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
+    workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -915,13 +984,24 @@ fn move_virtual_workspace_bind(
         return;
     };
 
+    let mut rows = workspaces
+        .iter()
+        .filter(|(_, strip, _)| strip.id() == active_display.active_strip().id())
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(_, strip, _)| strip.virtual_index);
+
     let current_virtual_index = active_display.active_strip().virtual_index;
+    let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
 
     let (target_virtual_index, move_focus) = match operation {
         Operation::VirtualMove(Direction::South, move_focus)
             if active_display.active_strip().len() > 1 =>
         {
-            (current_virtual_index + 1, *move_focus)
+            if config.create_workspace_automatically() && current_index + 1 < rows.len() {
+                (rows[current_index + 1].1.virtual_index, *move_focus)
+            } else {
+                (current_virtual_index + 1, *move_focus)
+            }
         }
         Operation::VirtualMove(Direction::North, move_focus) => {
             if current_virtual_index == 0 {
@@ -931,6 +1011,11 @@ fn move_virtual_workspace_bind(
         }
         Operation::VirtualMoveNumber(target_virtual_index, move_focus) => {
             if *target_virtual_index == current_virtual_index {
+                return;
+            }
+            if *target_virtual_index == 0
+                && !rows.iter().any(|(_, strip, _)| strip.virtual_index == 0)
+            {
                 return;
             }
             (*target_virtual_index, *move_focus)
@@ -1047,6 +1132,7 @@ pub(crate) fn show_active_workspace(
             if let Some(entity) = focus
                 && strip.contains(*entity)
             {
+                spawn_restore_focus_guard(*entity, &mut commands);
                 commands.focus_entity(*entity, false);
             }
 
@@ -1065,6 +1151,7 @@ pub(crate) fn show_active_workspace(
         if let Some(entity) = focus
             && strip.contains(*entity)
         {
+            spawn_restore_focus_guard(*entity, &mut commands);
             commands.focus_entity(*entity, false);
         }
     }
@@ -1154,18 +1241,16 @@ fn reap_empty_virtual_workspaces(
         return;
     }
 
-    let primary_entity = rows[0].0;
+    // Do not reap the strip that just became active. Switching/creating onto an
+    // empty virtual workspace is intentional (e.g. South auto-create); only
+    // empty rows left behind should be removed.
     for (entity, strip) in rows {
-        if strip.virtual_index > 0 && strip.len() == 0 {
-            if entity == changed_entity {
-                debug!("moving markers from despawned virtual workspace to primary");
-                if let Ok(mut entity_commands) = commands.get_entity(primary_entity) {
-                    entity_commands.try_insert(ActiveWorkspaceMarker);
-                }
-            }
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
-            }
+        if entity != changed_entity
+            && strip.virtual_index > 0
+            && strip.len() == 0
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_despawn();
         }
     }
 }

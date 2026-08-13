@@ -23,12 +23,13 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::state::PaneruState;
+use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
     ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
     VerifyWindowPosition, WidthRatio, WindowProperties,
 };
-use crate::events::Event;
+use crate::events::{DestroySource, Event};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
@@ -181,6 +182,7 @@ pub(super) fn window_focused_trigger(
     applications: Query<&Application>,
     windows: Windows,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
     config: Res<Config>,
     global_state: GlobalState,
@@ -285,7 +287,26 @@ pub(super) fn window_focused_trigger(
             focus_history.record(workspace_id, entity, unmanaged);
         }
 
+        // The restore guard absorbs the OS acknowledgment(s) of the focus
+        // `show_active_workspace` issued — reshuffling on those would slide
+        // the strip away from the position the restore just placed it at.
+        // The acknowledgment can arrive more than once (front_switched_trigger
+        // synthesizes a duplicate), so a matching event leaves the guard in
+        // place; focus moving to any other window means the restore sequence
+        // is over and despawns it (timeout_ticker expires it otherwise).
+        let mut restored_focus = false;
+        for (guard_entity, guard) in &restore_guards {
+            if guard.entity == entity {
+                restored_focus = true;
+            } else if let Ok(mut entity_commands) = commands.get_entity(guard_entity) {
+                entity_commands.try_despawn();
+            }
+        }
+
         if already_focused {
+            if restored_focus {
+                continue;
+            }
             if !global_state.skip_reshuffle() && !global_state.initializing() {
                 commands.reshuffle_around(entity);
             }
@@ -512,14 +533,21 @@ pub(super) fn dispatch_application_messages(
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_unmanaged_trigger(
     trigger: On<Add, Unmanaged>,
     windows: Windows,
     apps: Query<(Entity, &Application)>,
-    workspaces: Query<&mut LayoutStrip>,
-    active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
+    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    // `Option<Single<…>>` rather than `Single<…>`: an unresolvable parameter skips the whole
+    // observer, and dropping the strip membership below is not optional. Without an active display
+    // there is nowhere to pop the window to, but it still must not keep tiling space.
+    active_display: Option<Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>>,
     config: Res<Config>,
     initializing: Option<Res<Initializing>>,
     mut commands: Commands,
@@ -567,12 +595,35 @@ pub(super) fn window_unmanaged_trigger(
     let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(entity) else {
         return;
     };
-    let display_bounds = {
-        let (display, dock) = *active_display;
-        display.actual_display_bounds(dock, &config)
-    };
 
     debug!("Entity {entity} is floating.");
+
+    // A window parked on a virtual row that isn't on screen sits off-screen by
+    // design. Popping it onto the active display would paint it over the row
+    // the user is actually looking at, and an app that raises itself (rather
+    // than the user floating a focused window) is enough to get here.
+    let parked_out_of_view = workspaces
+        .iter()
+        .any(|(strip, active)| !active && strip.contains(entity));
+
+    // Drop the strip membership *first*, before anything that can bail.
+    //
+    // A floating window is out of the tiling layout by definition, and the
+    // tiler lays a strip out by accumulating column widths left to right — so
+    // a floating member reserves space no window occupies, which is a gap that
+    // never closes on its own. Every step below is best-effort placement of a
+    // window that has already stopped being tiled; when reading its frame or
+    // its app failed, this used to return early and leave the slot behind.
+    for (mut strip, _) in &mut workspaces {
+        if strip.contains(entity) {
+            strip.remove(entity);
+        }
+    }
+
+    let Some((display, dock)) = active_display.map(|display| *display) else {
+        return;
+    };
+    let display_bounds = display.actual_display_bounds(dock, &config);
 
     let Some((window, frame)) = windows.get(entity).zip(windows.frame(entity)) else {
         return;
@@ -588,7 +639,9 @@ pub(super) fn window_unmanaged_trigger(
 
     // Skip the active-display reposition/resize during init; the strip
     // removal below still has to run.
-    if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
+    if parked_out_of_view {
+        debug!("Entity {entity} is floating on a hidden virtual row, keeping its frame.");
+    } else if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
         let x = display_bounds.min.x + (f64::from(display_bounds.width()) * rx) as i32;
         let y = display_bounds.min.y + (f64::from(display_bounds.height()) * ry) as i32;
         let w = (f64::from(display_bounds.width()) * rw) as i32;
@@ -619,12 +672,6 @@ pub(super) fn window_unmanaged_trigger(
             commands.reposition_entity(entity, target_frame.min);
         }
     }
-
-    workspaces.into_iter().for_each(|mut strip| {
-        if strip.contains(entity) {
-            strip.remove(entity);
-        }
-    });
 }
 
 fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
@@ -792,12 +839,12 @@ pub(super) fn window_destroyed_trigger(
     windows: Windows,
     active_display: ActiveDisplay,
     mut apps: Query<&mut Application>,
-    mut config: GlobalState,
+    mut global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
-        let Event::WindowDestroyed { window_id } = event else {
+        let Event::WindowDestroyed { window_id, source } = event else {
             continue;
         };
 
@@ -805,8 +852,20 @@ pub(super) fn window_destroyed_trigger(
             debug!("Duplicate event: window {window_id} already destroyed.");
             continue;
         };
-        if window.role().is_ok() {
-            debug!("Window still present, this was SLS workspace change.");
+
+        // Only the SLS notification is ambiguous — it also fires when a window merely leaves a
+        // space, so it needs confirming. A `kAXUIElementDestroyedNotification` means the AX element
+        // itself has been torn down and is taken at face value: confirming it against the app is
+        // not just unnecessary but actively wrong, because both signals below lag the teardown.
+        // `role()` keeps succeeding on the dead element for apps that outlive their windows, and
+        // the app's AX window list is still warm for a moment after the close. Re-checking them
+        // raced the window back to life, leaving the entity in the strip and a permanent gap where
+        // the window had been.
+        if matches!(source, DestroySource::SpaceNotification) && window.role().is_ok() {
+            debug!(
+                "Window {} still present, this was SLS workspace change.",
+                window.id()
+            );
             continue;
         }
 
@@ -814,6 +873,7 @@ pub(super) fn window_destroyed_trigger(
             error!("Window {} has no parent!", window.id());
             continue;
         };
+
         app.unobserve_window(window);
 
         give_away_focus(
@@ -821,7 +881,7 @@ pub(super) fn window_destroyed_trigger(
             &windows,
             active_display.active_strip(),
             &active_display.bounds(),
-            &mut config,
+            &mut global_state,
             &mut commands,
         );
         focus_history.forget(entity);
@@ -831,6 +891,27 @@ pub(super) fn window_destroyed_trigger(
         }
 
         // The window entity will be removed from the layout strip in the On<Remove> trigger.
+    }
+}
+
+/// Drops a window's cached title when its app reports the title changed.
+///
+/// The cache is what keeps the state document and the window set from reading
+/// every window's title over the accessibility API on every frame; this is the
+/// other half of it. `kAXTitleChangedNotification` is already observed and
+/// already becomes this event, so the invalidation rides along for free — and
+/// crucially it runs *before* the broadcast handler reads titles in
+/// `PostUpdate`, so a subscriber sees the new title in the same frame it
+/// changed.
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, windows: Windows) {
+    for event in messages.read() {
+        let Event::WindowTitleChanged { window_id } = event else {
+            continue;
+        };
+        if let Some((window, _)) = windows.find(*window_id) {
+            window.invalidate_title();
+        }
     }
 }
 

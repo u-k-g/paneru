@@ -132,7 +132,7 @@ fn swipe_gesture(
         scrolling.is_user_swiping = true;
         scrolling.fingers_count = None;
         scrolling.started_focused = focused_at_start;
-        scrolling.last_event = Instant::now();
+        scrolling.last_event = time.elapsed();
     }
 
     if touchpad_up
@@ -171,7 +171,7 @@ fn swipe_gesture(
             if has_gesture_event {
                 scrolling.fingers_count = gesture_fingers;
             }
-            scrolling.last_event = Instant::now();
+            scrolling.last_event = time.elapsed();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
@@ -183,7 +183,7 @@ fn swipe_gesture(
                 is_user_swiping: true,
                 fingers_count: gesture_fingers,
                 started_focused: focused_at_start,
-                last_event: Instant::now(),
+                last_event: time.elapsed(),
             });
         }
     }
@@ -215,6 +215,7 @@ fn snap_trackpad_swipe(
     active_display: ActiveDisplay,
     windows: Windows,
     config: Res<Config>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     if !config.snap_to_window() {
@@ -229,7 +230,7 @@ fn snap_trackpad_swipe(
     let released = messages
         .read()
         .any(|event| matches!(event, Event::TouchpadUp));
-    if !released && scrolling.last_event.elapsed() <= SNAP_GESTURE_TIMEOUT {
+    if !released && time.elapsed().abs_diff(scrolling.last_event) <= SNAP_GESTURE_TIMEOUT {
         return;
     }
 
@@ -382,7 +383,7 @@ pub(super) fn swiping_timeout(
     let viewport_width = f64::from(active_display.bounds().width());
 
     for (entity, mut scroll) in strips {
-        if scroll.last_event.elapsed() > FINGER_LIFT_THRESHOLD {
+        if time.elapsed().abs_diff(scroll.last_event) > FINGER_LIFT_THRESHOLD {
             if is_snap_gesture(&scroll, &config) {
                 continue;
             }

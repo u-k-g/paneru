@@ -2,7 +2,7 @@
 name = "paneru"
 version = "0.4.4"
 edition = "2024"
-rust-version = "1.89.0"
+rust-version = "1.95.0"
 description = "A sliding, tiling window manager for MacOS."
 homepage = "https://github.com/karinushka/paneru"
 repository = "https://github.com/karinushka/paneru"
@@ -21,7 +21,7 @@ lto = true
 [dependencies]
 accessibility-sys = "0.2"
 arc-swap = "1.9"
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
   "multi_threaded",
 ] }
 bitflags = "2.13"
@@ -47,6 +47,8 @@ objc2-app-kit = { version = "0.3", features = [
   "NSAttributedString",
   "NSParagraphStyle",
   "NSStringDrawing",
+  "NSImage",
+  "NSControl",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"

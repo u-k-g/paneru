@@ -19,6 +19,7 @@ use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
+use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
@@ -144,11 +145,12 @@ fn maintain_focus_singleton(
     config.set_ffm_flag(None);
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
+    restored: Query<&RestoreFocusMarker>,
     windows: Windows,
     global_state: GlobalState,
     active_display: ActiveDisplay,
@@ -156,6 +158,15 @@ fn autocenter_window_on_focus(
     mut commands: Commands,
 ) {
     let entity = *focused;
+
+    // A workspace restore re-focuses the remembered window after the strip was
+    // already placed at its saved origin; centering that focus would slide the
+    // strip away from the restored position. The guard outlives this system on
+    // purpose — window_focused_trigger despawns it once focus moves on, and
+    // timeout_ticker expires it otherwise.
+    if restored.iter().any(|marker| marker.entity == entity) {
+        return;
+    }
 
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;

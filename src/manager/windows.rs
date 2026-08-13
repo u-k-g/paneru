@@ -13,12 +13,14 @@ use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanFalse, kCFBooleanTrue,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::null_mut;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use stdext::function_name;
+use stdext::sync::rw_lock::RwLockExt;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::skylight::{
@@ -37,6 +39,27 @@ use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
 /// re-enabled after the last one completes (safe under `par_iter_mut`).
 static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Apps observed not to have `AXEnhancedUserInterface` set, so the workaround
+/// above can skip them without asking again.
+///
+/// An `RwLock` rather than a `Mutex` because the access pattern is lopsided: a
+/// pid is inserted once, the first time any of its windows is moved, and read by
+/// every other window of that app afterwards. Readers do not exclude each other,
+/// which matters because the callers arrive from `par_iter_mut` — several worker
+/// threads asking at once.
+///
+/// Reading the attribute means a synchronous round-trip into the app, and
+/// [`WindowOS::disable_enhanced_ui`] runs on every reposition — once per window
+/// per frame while the strip is scrolling. Caching the negative answer takes
+/// that cost to zero for every app that never turns the attribute on.
+///
+/// An app that enables it *after* being cached keeps its animated moves. That
+/// is the same outcome as before this cache existed for any app that enabled it
+/// mid-session, and the entry dies with the process: a relaunch gets a new pid
+/// and is asked afresh.
+static ENHANCED_UI_ABSENT: LazyLock<RwLock<HashSet<Pid>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// macOS may partially apply an AX width increase when the requested right edge
 /// would be far outside the display. Moving the partial result left by the
@@ -69,6 +92,9 @@ pub trait WindowApi: Send + Sync {
     fn frame(&self) -> IRect;
     fn element(&self) -> Option<CFRetained<AXUIWrapper>>;
     fn title(&self) -> Result<String>;
+    /// Drops the cached title so the next [`Self::title`] reads it afresh.
+    /// Called when the app reports the title changed.
+    fn invalidate_title(&self);
     fn identifier(&self) -> Result<String>;
     fn child_role(&self) -> Result<bool>;
     fn role(&self) -> Result<String>;
@@ -115,19 +141,26 @@ impl Window {
 ///
 /// `Ok(WinID)` with the window ID if successful, otherwise `Err(Error)`.
 pub fn ax_window_id(element_ref: AXUIElementRef) -> Result<WinID> {
-    let ptr = NonNull::new(element_ref).ok_or(Error::InvalidInput(format!(
-        "{}: nullptr passed as element.",
-        function_name!()
-    )))?;
-    let mut window_id: WinID = 0;
-    unsafe { _AXUIElementGetWindow(ptr.as_ptr(), &mut window_id) }.to_result(function_name!())?;
-    if window_id == 0 {
-        return Err(Error::InvalidInput(format!(
+    try_ax_window_id(element_ref).ok_or_else(|| {
+        Error::InvalidInput(format!(
             "{}: Unable to get window id from element {element_ref:?}.",
             function_name!()
-        )));
+        ))
+    })
+}
+
+/// Allocation-free variant of [`ax_window_id`].
+///
+/// [`crate::manager::bruteforce_windows`] calls this tens of thousands of times in
+/// a row and discards nearly every result, so the error path must not format a
+/// message it will only drop.
+pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
+    let ptr = NonNull::new(element_ref)?;
+    let mut window_id: WinID = 0;
+    if unsafe { _AXUIElementGetWindow(ptr.as_ptr(), &mut window_id) } != 0 || window_id == 0 {
+        return None;
     }
-    Ok(window_id)
+    Some(window_id)
 }
 
 // const CPS_ALL_WINDOWS: u32 = 0x100;
@@ -144,6 +177,29 @@ pub struct WindowOS {
     border_radius: OnceLock<Option<f64>>,
     pid: OnceLock<Result<Pid>>,
     app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
+    /// Set once this window's app has been found not to use
+    /// `AXEnhancedUserInterface`, which is the overwhelmingly common case.
+    ///
+    /// The check itself is the hot path's problem: `reposition` runs for every
+    /// window on every frame the strip scrolls, and reaching the shared answer
+    /// meant taking a global mutex — from inside `par_iter_mut`, so every worker
+    /// thread contended for it. Landing the answer on the window makes the
+    /// steady state a relaxed atomic load and nothing else.
+    enhanced_ui_absent: AtomicBool,
+
+    /// The last title read off the element.
+    ///
+    /// Reading a title is a synchronous cross-process call, and the callers that
+    /// want one want it for *every* window at once — the state document, the
+    /// window set, `print_state`. Uncached, a client subscribed to events made
+    /// the main thread do that whole sweep on every frame that moved a window.
+    ///
+    /// A lock rather than a `OnceLock` like its neighbours because a title,
+    /// unlike a pid or a border radius, changes: [`Self::invalidate_title`]
+    /// clears it when the app says so. Missing that notification is the one way
+    /// this can go stale, so the invalidation is driven by the same
+    /// `kAXTitleChangedNotification` the event stream already reports.
+    title: RwLock<Option<String>>,
 }
 
 impl WindowOS {
@@ -189,6 +245,8 @@ impl WindowOS {
             border_radius: OnceLock::new(),
             pid: OnceLock::new(),
             app_reference: OnceLock::new(),
+            enhanced_ui_absent: AtomicBool::new(false),
+            title: RwLock::new(None),
         };
 
         let forced = window.is_forced_manage(config, bundle_id);
@@ -278,13 +336,37 @@ impl WindowOS {
     /// This avoids animated move/resize that breaks window management for apps like Chrome,
     /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
     fn disable_enhanced_ui(&self) {
-        let Ok(pid) = self.pid() else { return };
-        let mut counts = ENHANCED_UI_REFCOUNT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&pid) {
-            *count += 1;
+        // Nothing to disable, and nothing to lock or ask: this window's app has
+        // already been found not to use the attribute.
+        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
             return;
+        }
+        let Ok(pid) = self.pid() else { return };
+        // Another window of the same app may have answered the question already.
+        // Taken before the ref-count mutex, since the answer is usually "absent"
+        // and that path should not touch the ref-count at all.
+        if ENHANCED_UI_ABSENT
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&pid)
+        {
+            self.enhanced_ui_absent.store(true, Ordering::Relaxed);
+            return;
+        }
+        // Scoped so the lock is not still held for the accessibility calls
+        // below. Reading and writing an attribute are each a synchronous
+        // round-trip into another process, and holding a global mutex across
+        // them stalled every other `par_iter_mut` worker for the duration —
+        // turning a parallel commit back into a serial one behind the slowest
+        // app.
+        {
+            let mut counts = ENHANCED_UI_REFCOUNT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(count) = counts.get_mut(&pid) {
+                *count += 1;
+                return;
+            }
         }
         let Some(app_element) = self.app_reference() else {
             return;
@@ -301,13 +383,32 @@ impl WindowOS {
                     kCFBooleanFalse.unwrap(),
                 );
             }
-            counts.insert(pid, 1);
+            // Incremented rather than set: two windows of the same app can both
+            // have found no entry above and raced here, and each still owes a
+            // matching `reenable_enhanced_ui`. Setting 1 would leave the second
+            // one decrementing past zero. Disabling twice is harmless.
+            *ENHANCED_UI_REFCOUNT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(pid)
+                .or_insert(0) += 1;
+        } else {
+            ENHANCED_UI_ABSENT
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(pid);
+            self.enhanced_ui_absent.store(true, Ordering::Relaxed);
         }
     }
 
     /// Re-enables `AXEnhancedUserInterface` on this window's app once the last concurrent
     /// caller has finished. Pairs with [`disable_enhanced_ui`].
     fn reenable_enhanced_ui(&self) {
+        // Nothing was disabled, so there is no ref-count entry to find and no
+        // reason to take the lock looking for one.
+        if self.enhanced_ui_absent.load(Ordering::Relaxed) {
+            return;
+        }
         let Ok(pid) = self.pid() else { return };
         let mut counts = ENHANCED_UI_REFCOUNT
             .lock()
@@ -315,11 +416,12 @@ impl WindowOS {
         let Some(count) = counts.get_mut(&pid) else {
             return;
         };
-        *count -= 1;
+        *count = count.saturating_sub(1);
         if *count > 0 {
             return;
         }
         counts.remove(&pid);
+        drop(counts);
         if let Some(app_element) = self.app_reference() {
             let attr = CFString::from_static_str("AXEnhancedUserInterface");
             unsafe {
@@ -444,7 +546,16 @@ impl WindowApi for WindowOS {
     ///
     /// `Ok(String)` with the window title if successful, otherwise `Err(Error)`.
     fn title(&self) -> Result<String> {
-        self.ax_element.title()
+        if let Some(cached) = self.title.force_read().clone() {
+            return Ok(cached);
+        }
+        let title = self.ax_element.title()?;
+        *self.title.force_write() = Some(title.clone());
+        Ok(title)
+    }
+
+    fn invalidate_title(&self) {
+        self.title.force_write().take();
     }
 
     fn identifier(&self) -> Result<String> {

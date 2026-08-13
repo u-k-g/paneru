@@ -194,6 +194,22 @@ $ paneru install
 $ paneru start
 ```
 
+### Installing an app launcher
+
+To start Paneru from Spotlight, Alfred, Raycast, or another application launcher,
+install the lightweight app wrapper:
+
+```shell
+$ paneru install-app
+```
+
+This creates `$HOME/Applications/Paneru.app`. Opening the app starts the
+installed Paneru launch agent and exits immediately. Remove the wrapper with:
+
+```shell
+$ paneru uninstall-app
+```
+
 ### Running in the foreground
 
 ```shell
@@ -214,7 +230,7 @@ $ paneru send-cmd <command> [args...]
 
 | Command                    | Description                                      |
 | -------------------------- | ------------------------------------------------ |
-| `window focus <direction\|number>` | Move focus by direction or column number |
+| `window focus <direction\|number\|managed\|unmanaged>` | Move focus by direction, column number, managed or unmanaged |
 | `window swap <direction>`  | Swap the focused window with a neighbour         |
 | `window center`            | Center the focused window on screen              |
 | `window resize`            | Cycle through `preset_column_widths`             |

@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{Error, ErrorKind, Result, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 use tracing::{info, warn};
@@ -147,9 +147,44 @@ impl Service {
             self.install()?;
         }
         info!("starting service...");
-        self.raw.start()?;
+        self.create_log_files()?;
+        for args in start_commands(&self.raw, self.is_bootstrapped()?) {
+            Self::run_launchctl(&args)?;
+        }
         info!("service started");
         Ok(())
+    }
+
+    fn create_log_files(&self) -> Result<()> {
+        for path in [&self.raw.error_log_path, &self.raw.out_log_path] {
+            if !Path::new(path).exists() {
+                fs::File::create(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_bootstrapped(&self) -> Result<bool> {
+        let output = Self::launchctl(&["print", self.raw.service_target.as_str()])?;
+        Ok(output.status.success())
+    }
+
+    fn run_launchctl(args: &[&str]) -> Result<()> {
+        let output = Self::launchctl(args)?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        Err(Error::other(format!(
+            "launchctl {} failed with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+
+    fn launchctl(args: &[&str]) -> Result<Output> {
+        Command::new("/bin/launchctl").args(args).output()
     }
 
     /// Stops the service using `launchctl`.
@@ -197,6 +232,7 @@ impl Service {
     pub fn launchd_plist(&self) -> String {
         let xdg_config_home = env::var("XDG_CONFIG_HOME")
             .unwrap_or_else(|_| format!("{}/.config", self.home_dir.display()));
+        let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         format!(
             include_str!("../../assets/launchd.plist"),
             name = self.raw.name,
@@ -204,6 +240,58 @@ impl Service {
             out_log_path = self.raw.out_log_path,
             error_log_path = self.raw.error_log_path,
             xdg_config_home = xdg_config_home,
+            rust_log = rust_log,
         )
+    }
+}
+
+fn start_commands(service: &launchctl::Service, bootstrapped: bool) -> Vec<Vec<&str>> {
+    if bootstrapped {
+        vec![vec!["kickstart", service.service_target.as_str()]]
+    } else {
+        vec![
+            vec!["enable", service.service_target.as_str()],
+            vec![
+                "bootstrap",
+                service.domain_target.as_str(),
+                service.plist_path.as_str(),
+            ],
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start_commands;
+
+    fn service() -> launchctl::Service {
+        launchctl::Service::builder()
+            .name("com.github.karinushka.paneru")
+            .uid("501")
+            .plist_path("/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist")
+            .build()
+    }
+
+    #[test]
+    fn start_kickstarts_a_bootstrapped_service_by_service_target() {
+        assert_eq!(
+            start_commands(&service(), true),
+            vec![vec!["kickstart", "gui/501/com.github.karinushka.paneru"]]
+        );
+    }
+
+    #[test]
+    fn start_enables_and_bootstraps_an_unloaded_service() {
+        assert_eq!(
+            start_commands(&service(), false),
+            vec![
+                vec!["enable", "gui/501/com.github.karinushka.paneru"],
+                vec![
+                    "bootstrap",
+                    "gui/501",
+                    "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist"
+                ]
+            ]
+        );
     }
 }

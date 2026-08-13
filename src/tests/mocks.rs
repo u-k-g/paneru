@@ -11,7 +11,7 @@ use crate::events::Event;
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_to,
+    Window, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -407,6 +407,10 @@ impl MockState {
                 .map(|w| w.title.clone())
                 .unwrap_or_default())
         });
+        // The real cache is invalidated by the title-changed notification; the
+        // mock reads its title from the shared state every time, so there is
+        // nothing to drop — but the call still has to be expected.
+        mw.expect_invalidate_title().return_const(());
 
         let s = self.clone();
         mw.expect_is_minimized().returning(move || {
@@ -673,7 +677,18 @@ impl MockState {
             .returning(move || Some(origin_to(s.inner.force_read().cursor_position)));
 
         wm.expect_get_associated_windows().return_const(vec![]);
-        wm.expect_find_window_at_point().return_const(Ok(0));
+
+        let s = self.clone();
+        wm.expect_find_window_at_point().returning(move |at_point| {
+            let point = origin_from(*at_point);
+            s.inner
+                .force_read()
+                .windows
+                .iter()
+                .find_map(|(id, window)| window.frame.contains(point).then_some(id))
+                .ok_or(Error::NotFound(format!("no window found at point {point}")))
+                .copied()
+        });
 
         wm
     }

@@ -3,13 +3,12 @@ use std::time::{Duration, Instant};
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
-use bevy::app::{PostUpdate, PreUpdate, Startup};
+use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::RemovedComponents;
-use bevy::ecs::message::Messages;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
+use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
@@ -74,14 +73,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // an empty virtual workspace), which otherwise leaves a stale outline.
     // Position changes on the focused window also dirty the overlay so that
     // dragging a floating window moves the highlight with it.
-    let overlay_dirty =
+    let vw_indicator_dirty =
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
-         mut focus_lost: RemovedComponents<FocusedMarker>,
+         workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
          focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
-                || focus_lost.read().next().is_some()
+                || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
     let native_tabs_enabled =
@@ -127,7 +126,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not_swiping),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
-            state::periodic_state_save.run_if(on_timer(Duration::from_secs(300))),
+            state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
         ),
     );
@@ -150,11 +149,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
                     .run_if(dimming_enabled)
-                    .run_if(overlay_dirty),
+                    .run_if(vw_indicator_dirty),
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar,
+            crate::menubar::update_menu_bar.run_if(vw_indicator_dirty),
         ),
     );
 }
@@ -170,6 +169,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
             triggers::window_destroyed_trigger,
+            triggers::invalidate_window_title,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
             triggers::window_resize_verifier,
@@ -242,7 +242,7 @@ pub struct Scrolling {
     /// Window focused when the current gesture began.
     pub started_focused: Option<Entity>,
     /// Last time a physical swipe event was received.
-    pub last_event: Instant,
+    pub last_event: Duration,
 }
 
 impl Default for Scrolling {
@@ -253,7 +253,7 @@ impl Default for Scrolling {
             is_user_swiping: false,
             fingers_count: None,
             started_focused: None,
-            last_event: Instant::now(),
+            last_event: Duration::ZERO,
         }
     }
 }
@@ -555,7 +555,20 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let mut app = BevyApp::new();
 
     app.add_plugins(MinimalPlugins)
-        .init_resource::<Messages<Event>>()
+        // `add_message`, not `init_resource`: the latter creates the buffer but
+        // does not register it with bevy's `MessageRegistry`, so
+        // `message_update_system` never double-buffers it and nothing is ever
+        // dropped. Every event the daemon has ever seen stayed in that vector
+        // for the life of the process — at input rates, a leak that grows all
+        // day.
+        //
+        // Messages now live for two frames, which is what every reader here
+        // needs: the only systems that can miss a frame and still read events
+        // are the ones gated on `not_swiping` and on having IPC subscribers,
+        // and both would rather drop what they missed than act on a backlog —
+        // stale window frames applied after a swipe, or a new subscriber handed
+        // history it never asked for.
+        .add_message::<Event>()
         .insert_resource(Time::<Virtual>::from_max_delta(Duration::from_secs(10)))
         .insert_resource(WindowManager(window_manager))
         .insert_resource(SkipReshuffle(false))
@@ -565,7 +578,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Initializing)
-        .insert_non_send_resource(watcher)
+        .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
@@ -574,6 +587,43 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
+    // Run the schedules inline rather than fanning every system out across the
+    // task pool.
+    //
+    // The handoff — spawning a task per system, parking, waking, the completion
+    // queue and the executor's own bookkeeping mutex — measured about 45% of the
+    // main thread's non-idle time, against 16% doing the accessibility calls
+    // that are the actual work. Inline it fell to around 10%.
+    //
+    // The fan-out was buying very little to begin with. Bevy only overlaps
+    // systems whose data access is disjoint, and the expensive ones here all
+    // take `&mut Window` — `commit_window_position`, `verify_window_position`
+    // and `window_moved_update_frame` are mutually exclusive whatever the
+    // executor does, and the first two are explicitly chained anyway. What is
+    // left to overlap is a hundred-odd systems whose queries usually match
+    // nothing, and sixteen that take `NonSend` and are pinned to this thread
+    // regardless.
+    //
+    // The parallelism that does pay is untouched: `par_iter_mut` reaches
+    // `ComputeTaskPool` directly, so the commit systems still spread their
+    // blocking `AXUIElementSetAttributeValue` round-trips across the pool.
+    //
+    // `First` and `Last` are included even though paneru puts nothing in them:
+    // an empty schedule still costs a task-pool scope and the park/wake that
+    // goes with it, once per frame. Bevy already runs `Main`, `FixedMain` and
+    // `RunFixedMainLoop` single-threaded for the same reason.
+    for label in [
+        First.intern(),
+        PreUpdate.intern(),
+        Update.intern(),
+        PostUpdate.intern(),
+        Last.intern(),
+    ] {
+        app.edit_schedule(label, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+    }
+
     let menu_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;
@@ -581,11 +631,11 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
     let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
-    app.insert_non_send_resource(platform_callbacks)
-        .insert_non_send_resource(overlay_manager)
-        .insert_non_send_resource(flash_message_manager)
-        .insert_non_send_resource(menu_bar_manager)
-        .insert_non_send_resource(receiver);
+    app.insert_non_send(platform_callbacks)
+        .insert_non_send(overlay_manager)
+        .insert_non_send(flash_message_manager)
+        .insert_non_send(menu_bar_manager)
+        .insert_non_send(receiver);
 
     if let Some(previous_state) =
         PaneruState::load_from_file(&PaneruState::default_state_file_path())

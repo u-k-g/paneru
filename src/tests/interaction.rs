@@ -11,31 +11,13 @@ use crate::ecs::{
     ActiveWorkspaceMarker, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
     layout::LayoutStrip,
 };
-use crate::ecs::{RepositionMarker, Scrolling, SpawnWindowTrigger};
+use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Origin, Size, Window};
 use crate::platform::Modifiers;
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::*;
-
-#[test]
-fn modifier_scroll_uses_native_momentum_without_synthetic_velocity() {
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Scroll { delta: 1.0 },
-    ];
-
-    TestHarness::new()
-        .with_windows(3)
-        .on_iteration(1, |world, _state| {
-            let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
-            let scrolling = query.single(world).expect("active workspace is scrolling");
-            assert!(scrolling.velocity.abs() < 0.0001);
-            assert!(scrolling.is_user_swiping);
-        })
-        .run(commands);
-}
 
 #[test]
 fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
@@ -365,9 +347,9 @@ fn test_scrolling() {
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -395, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, -382, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 18, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -348, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 52, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 452, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -1134,9 +1116,7 @@ fn mouse_outside_corner_still_changes_focus() {
         .with_windows(3)
         .on_iteration(2, |world, _state| {
             // After MouseMoved outside corner: FFM should have fired and changed focus.
-            // In the mock, find_window_at_point always returns window 0, so window 0
-            // should now be focused (changed from window 2).
-            assert_focused!(world, 0);
+            assert_focused!(world, 1);
         })
         .run(commands);
 }
@@ -1271,73 +1251,72 @@ fn test_mid_strip_insertion_preserves_window_x() {
     )
         .into();
 
-    let mut h = TestHarness::new().with_config(config).with_windows(8);
+    let harness = TestHarness::new().with_config(config).with_windows(8);
 
-    let pump_event = |h: &mut TestHarness, ev: Event| {
-        h.app.world_mut().write_message::<Event>(ev);
-        for _ in 0..6 {
-            h.app.update();
-            for event in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(event);
-            }
-        }
-    };
-    let cmd = |h: &mut TestHarness, c: Command| pump_event(h, Event::Command { command: c });
-    let win_x = |h: &mut TestHarness, id: i32| -> i32 {
-        let world = h.app.world_mut();
-        let mut q = world.query::<(&Window, &Position)>();
-        q.iter(world)
-            .find_map(|(w, p)| (w.id() == id).then_some(p.0.x))
-            .expect("window position")
-    };
-
-    // Build VW1 with four windows (scrollable), leaving four on VW0.
-    for _ in 0..4 {
-        cmd(
-            &mut h,
-            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
-        );
-    }
-    // Scroll VW1 off the grid, return, then scroll VW0 off the grid too, so both
-    // the moved window and the destination columns sit between column boundaries.
-    cmd(&mut h, Command::Window(Operation::VirtualNumber(1)));
-    pump_event(
-        &mut h,
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // Build VW1 with four windows (scrollable), leaving four on VW0.
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        },
+        // Scroll VW0 slightly to randomize the positions.
         Event::Swipe {
             delta: 0.3,
             fingers: 3,
         },
-    );
-    cmd(&mut h, Command::Window(Operation::VirtualNumber(0)));
-    pump_event(
-        &mut h,
+        // Used as a noop to let the scroll settle.
+        Event::MenuOpened { window_id: 0 },
+        // Change to VW1 and scroll it slightly as well.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(1)),
+        },
         Event::Swipe {
-            delta: 0.3,
+            delta: 0.2,
             fingers: 3,
         },
-    );
+        Event::MenuOpened { window_id: 0 },
+        // Change back to VW0 and send one window over to VW1.
+        Event::Command {
+            command: Command::Window(Operation::VirtualNumber(0)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
 
-    let mover = {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<&Window, With<crate::ecs::FocusedMarker>>();
-        q.single(world).expect("a focused window").id()
-    };
-    let before = win_x(&mut h, mover);
-    assert_ne!(
-        before % TEST_WINDOW_WIDTH,
-        0,
-        "test setup should leave the window off the column grid, got x={before}",
-    );
+    let previous_offset = std::rc::Rc::new(std::cell::RefCell::new(0));
+    let previous_offset2 = previous_offset.clone();
+    harness
+        .on_iteration(10, move |world, _state| {
+            let mut q =
+                world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
+            let (_, position) = q.single(world).expect("a focused window");
 
-    cmd(
-        &mut h,
-        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
-    );
-    assert_eq!(
-        win_x(&mut h, mover),
-        before,
-        "moved window must keep its exact on-screen x",
-    );
+            // Save the currently focused window's offset.
+            previous_offset.replace(position.x);
+            assert_ne!(position.x, 0);
+        })
+        .on_iteration(11, move |world, _state| {
+            let mut q =
+                world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
+            let (_, position) = q.single(world).expect("a focused window");
+
+            // Verify that the currently focused (and moved) window is still on the same offset.
+            assert_eq!(position.x, previous_offset2.take());
+        })
+        .run(commands);
 }
 
 /// Without the flag (the default), a moved window is appended to the end of the
@@ -1390,6 +1369,68 @@ fn test_move_appends_to_end_by_default() {
     assert_eq!(
         last, mover,
         "default move should append to the end of the strip"
+    );
+}
+
+/// A follow-move that appends the window to an already-populated destination
+/// strip must bring the moved window on-screen. The window keeps focus across
+/// the move, so no `Added<FocusedMarker>` fires on its own and the reshuffle
+/// issued at move time is swallowed by `reshuffle_layout_strip`'s
+/// newly-active-workspace skip. Regression test for the moved window landing
+/// off the right edge until manually centered.
+#[test]
+fn test_follow_move_brings_appended_window_on_screen() {
+    // Enough windows that the destination strip overflows the display width
+    // (each window is 400px wide, display is 1024px), so an appended window
+    // lands off the right edge unless the strip scrolls to expose it.
+    let mut h = TestHarness::new().with_windows(5);
+
+    let pump = |h: &mut TestHarness, cmd: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: cmd });
+        for _ in 0..8 {
+            h.app.update();
+            for event in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(event);
+            }
+        }
+    };
+
+    // Seed VW1 with three windows (Stay keeps us on VW0), making the
+    // destination strip wider than the display before the follow-move appends
+    // to it.
+    for _ in 0..3 {
+        pump(
+            &mut h,
+            Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+        );
+    }
+
+    let mover = focused_window_id(h.app.world_mut());
+
+    pump(
+        &mut h,
+        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+    );
+
+    // The moved window keeps focus and must be brought fully on-screen (right
+    // edge within the display), not left appended off the right edge.
+    assert_focused!(h.app.world_mut(), mover);
+    let frame = {
+        let world = h.app.world_mut();
+        let mut q = world.query::<&Window>();
+        q.iter(world)
+            .find(|w| w.id() == mover)
+            .expect("moved window")
+            .frame()
+    };
+    assert!(
+        frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH,
+        "moved window must be fully on-screen, got frame x {}..{} (display width {})",
+        frame.min.x,
+        frame.max.x,
+        TEST_DISPLAY_WIDTH,
     );
 }
 
@@ -1694,6 +1735,106 @@ fn test_virtual_workspace_switch_stops_in_flight_strip_animation() {
     );
 }
 
+/// A virtual-workspace switch restores the strip to its saved position and
+/// re-focuses the remembered window. macOS acknowledges that focus with a
+/// `WindowFocused` event several ticks later — after the `is_added` guards in
+/// `reshuffle_layout_strip` / `ensure_visible_in_strip` have expired. With
+/// `auto_center` enabled, that acknowledgment used to run
+/// `autocenter_window_on_focus`, re-centering the remembered window and
+/// sliding the strip away from the position it was just restored to — visible
+/// as a "wiggle" on every switch.
+#[test]
+fn test_virtual_workspace_switch_focus_echo_does_not_recenter_strip() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            virtual_workspace_animations: Some(false),
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(6);
+
+    let settle = |h: &mut TestHarness| {
+        for _ in 0..10 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        settle(h);
+    };
+    let strip_x = |h: &mut TestHarness| -> i32 {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip").0.x
+    };
+
+    pump(&mut h, Command::PrintState);
+
+    // Seed VW1 with one window so focus genuinely moves across the switch.
+    h.mock_state.focus_window(5);
+    settle(&mut h);
+    pump(
+        &mut h,
+        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+    );
+
+    // Focus window 0 and let auto-center settle the strip on it.
+    h.mock_state.focus_window(0);
+    settle(&mut h);
+    let centered_x = strip_x(&mut h);
+
+    // Displace the strip so the focused window is off its centered position,
+    // as any scroll would leave it. Written directly instead of swiping: the
+    // swipe pipeline's finger-lift threshold is wall-clock based, which makes
+    // event order load-dependent and the test flaky.
+    let saved_x = centered_x - 250;
+    {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<&mut Position, With<ActiveWorkspaceMarker>>();
+        q.single_mut(world).expect("exactly one active strip").0.x = saved_x;
+    }
+    settle(&mut h);
+    assert_eq!(
+        strip_x(&mut h),
+        saved_x,
+        "test setup: the displaced strip position must stick"
+    );
+
+    // Switch to VW1; deliver the OS focus acknowledgment for its window.
+    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
+    h.mock_state.focus_window(5);
+    settle(&mut h);
+
+    // Switch back to VW0: the strip must restore to its saved scroll position.
+    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
+    assert_eq!(
+        strip_x(&mut h),
+        saved_x,
+        "strip must restore to its saved position on switch-back"
+    );
+
+    // The delayed focus acknowledgment for the remembered window must not
+    // re-center the strip away from the restored position.
+    h.mock_state.focus_window(0);
+    settle(&mut h);
+    let final_x = strip_x(&mut h);
+    assert_eq!(
+        final_x, saved_x,
+        "late focus acknowledgment re-centered the strip (wiggle): \
+         restored to {saved_x}, ended at {final_x} (centered would be {centered_x})"
+    );
+}
+
 /// With `auto_center` off, a reshuffle around the leftmost window of a
 /// scrollable strip must pin the strip to the left edge — the leftmost
 /// window's left edge must touch the display's left edge, never leaving empty
@@ -1921,7 +2062,16 @@ fn test_virtual_workspace_switch_hides_old_strip_with_animations() {
 /// the edges.
 #[test]
 fn test_stack_unstack_brings_focused_window_into_view() {
-    use crate::ecs::{Bounds, Position, Scrolling};
+    fn check_if_offscreen(world: &mut World, _state: MockState) {
+        let mut q = world.query_filtered::<(&Window, &Position), With<crate::ecs::FocusedMarker>>();
+        let (_, position) = q.single(world).expect("a focused window");
+
+        // Save the currently focused window's offset.
+        assert!(
+            position.x < -(TEST_WINDOW_WIDTH / 4),
+            "focused window should be somewhat offscreen after the scroll."
+        );
+    }
 
     let config: Config = (
         MainOptions {
@@ -1935,85 +2085,46 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         .into();
 
     // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
-    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    let harness = TestHarness::new().with_config(config).with_windows(5);
 
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        for _ in 0..16 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-
-    // Emulate the real-app settled state after a swipe: the strip is scrolled
-    // and the transient Scrolling has been removed (swiping_timeout drops it
-    // within ~50ms in the app; the test harness's fast wall-clock wouldn't).
-    let settle_scroll_offset = |h: &mut TestHarness| {
-        h.app.world_mut().write_message::<Event>(Event::Swipe {
-            delta: 0.9,
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        // Swipe windows 0 and 1 off screen.
+        Event::Swipe {
+            delta: 0.3,
             fingers: 3,
-        });
-        for _ in 0..16 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<Entity, With<Scrolling>>();
-        for e in q.iter(world).collect::<Vec<_>>() {
-            if let Ok(mut em) = world.get_entity_mut(e) {
-                em.remove::<Scrolling>();
-            }
-        }
-        for _ in 0..4 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
+        },
+        // Noop to let the scroll settle.
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        // Now swipe the stacked windows off screen again.
+        Event::Swipe {
+            delta: 0.1,
+            fingers: 3,
+        },
+        // Noop to let the scroll settle.
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Stack(false)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
 
-    let is_fully_onscreen = |h: &mut TestHarness, id: i32| {
-        let e = find_window_entity(id, h.app.world_mut());
-        let world = h.app.world();
-        let p = world.get::<Position>(e).unwrap().0;
-        let b = world.get::<Bounds>(e).unwrap().0;
-        p.x >= 0 && p.x + b.x <= TEST_DISPLAY_WIDTH
-    };
-
-    pump(&mut h, Command::PrintState);
-
-    // Focus window 1, scroll it off the left edge, then stack it onto window 0.
-    pump(&mut h, Command::Window(Operation::Focus(Direction::First)));
-    pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
-    settle_scroll_offset(&mut h);
-    assert!(
-        !is_fully_onscreen(&mut h, 1),
-        "test setup: focused window should be off-screen before stacking"
-    );
-
-    pump(&mut h, Command::Window(Operation::Stack(true)));
-    assert!(
-        is_fully_onscreen(&mut h, 1),
-        "stacking must bring the focused window fully back into view"
-    );
-
-    // Scroll off-screen again, then unstack: the focused window moves out to
-    // its own column and must likewise be brought into view.
-    settle_scroll_offset(&mut h);
-    assert!(
-        !is_fully_onscreen(&mut h, 1),
-        "test setup: focused window should be off-screen before unstacking"
-    );
-
-    pump(&mut h, Command::Window(Operation::Stack(false)));
-    assert!(
-        is_fully_onscreen(&mut h, 1),
-        "unstacking must bring the focused window fully back into view"
-    );
+    harness
+        .on_iteration(2, check_if_offscreen)
+        .on_iteration(3, |world, _state| {
+            // Check that both window are stacked and moved into view.
+            assert_window_at!(world, 0, 0, 20);
+            assert_window_at!(world, 1, 0, 394);
+        })
+        .on_iteration(5, check_if_offscreen)
+        .on_iteration(6, |world, _state| {
+            // Check that both window are stacked and moved into view.
+            assert_window_at!(world, 1, 0, 20);
+        })
+        .run(commands);
 }

@@ -895,6 +895,12 @@ impl Config {
             .insert_windows_mid_strip
             .is_some_and(|enabled| enabled)
     }
+
+    pub fn create_workspace_automatically(&self) -> bool {
+        self.options()
+            .create_virtual_workspace_automatically
+            .is_some_and(|enabled| enabled)
+    }
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
@@ -1165,6 +1171,10 @@ pub struct MainOptions {
     /// shifting the rest) instead of appending it to the end of the strip.
     /// Off by default.
     pub insert_windows_mid_strip: Option<bool>,
+
+    /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
+    /// virtual workspace, create the workspace automatically.
+    pub create_virtual_workspace_automatically: Option<bool>,
 }
 
 /// Returns a default set of column widths.
