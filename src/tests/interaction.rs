@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::prelude::*;
 use objc2_core_foundation::CGPoint;
@@ -11,7 +11,7 @@ use crate::ecs::{
     ActiveWorkspaceMarker, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
     layout::LayoutStrip,
 };
-use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
+use crate::ecs::{RepositionMarker, Scrolling, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Origin, Size, Window};
 use crate::platform::Modifiers;
@@ -547,6 +547,10 @@ fn test_snap_to_window_timeout_cannot_leave_strip_between_windows() {
         .single(world)
         .expect("active workspace");
     let initially_focused = find_window_entity(0, world);
+    let last_event = world
+        .resource::<Time>()
+        .elapsed()
+        .saturating_sub(Duration::from_millis(200));
     world
         .get_mut::<Position>(strip_entity)
         .expect("workspace position")
@@ -557,9 +561,7 @@ fn test_snap_to_window_timeout_cannot_leave_strip_between_windows() {
         is_user_swiping: true,
         fingers_count: Some(3),
         started_focused: Some(initially_focused),
-        last_event: Instant::now()
-            .checked_sub(Duration::from_millis(200))
-            .expect("200 ms should be representable"),
+        last_event,
     });
 
     h.app.update();

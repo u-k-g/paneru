@@ -245,19 +245,6 @@ pub struct Scrolling {
     pub last_event: Duration,
 }
 
-impl Default for Scrolling {
-    fn default() -> Self {
-        Self {
-            velocity: 0.0,
-            position: 0.0,
-            is_user_swiping: false,
-            fingers_count: None,
-            started_focused: None,
-            last_event: Duration::ZERO,
-        }
-    }
-}
-
 #[derive(Component, Clone, Debug, Default, Deref, DerefMut)]
 pub struct LayoutPosition(pub Origin);
 
