@@ -19,7 +19,9 @@ use crate::ecs::{
     SpawnCommandsExt,
 };
 use crate::errors::Result as PaneruResult;
-use crate::events::Event;
+use bevy::ecs::schedule::common_conditions::on_message;
+
+use crate::events::{Event, InputEvent};
 use crate::manager::{Window, WindowManager};
 use crate::platform::Modifiers;
 
@@ -36,12 +38,22 @@ impl Plugin for ScrollEventsPlugin {
             mission_control.is_none_or(|active| !active.0)
         };
 
+        // The two gesture systems only act on an input event, so a frame
+        // carrying none can skip them and everything they would have fetched.
+        //
+        // The rest of the chain is deliberately left ungated: inertia, the snap
+        // force and the integrator run precisely when the fingers have stopped
+        // sending events, and `swiping_timeout` exists to notice their absence.
         app.add_systems(
             Update,
             (
-                vertical_swipe_gesture.run_if(mission_control_inactive),
+                vertical_swipe_gesture
+                    .run_if(mission_control_inactive)
+                    .run_if(on_message::<InputEvent>),
                 (
-                    swipe_gesture.run_if(mission_control_inactive),
+                    swipe_gesture
+                        .run_if(mission_control_inactive)
+                        .run_if(on_message::<InputEvent>),
                     apply_inertia,
                     apply_snap_force,
                     scrolling_integrator,
@@ -72,7 +84,7 @@ struct SwipeGestureParams<'w, 's> {
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn swipe_gesture(
-    mut messages: MessageReader<Event>,
+    mut messages: MessageReader<InputEvent>,
     params: SwipeGestureParams,
     mut commands: Commands,
 ) {
@@ -94,7 +106,7 @@ fn swipe_gesture(
 
     let scroll_scale = modifier_scroll_scale(swipe_sensitivity);
 
-    for event in messages.read() {
+    for InputEvent(event) in messages.read() {
         match event {
             Event::TouchpadDown => {
                 touchpad_down = true;
@@ -207,7 +219,7 @@ fn is_snap_gesture(scrolling: &Scrolling, config: &Config) -> bool {
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn snap_trackpad_swipe(
-    mut messages: MessageReader<Event>,
+    mut messages: MessageReader<InputEvent>,
     active_workspace: Single<
         (Entity, &LayoutStrip, &Position, &mut Scrolling),
         With<ActiveWorkspaceMarker>,
@@ -229,7 +241,7 @@ fn snap_trackpad_swipe(
 
     let released = messages
         .read()
-        .any(|event| matches!(event, Event::TouchpadUp));
+        .any(|InputEvent(event)| matches!(event, Event::TouchpadUp));
     if !released && time.elapsed().abs_diff(scrolling.last_event) <= SNAP_GESTURE_TIMEOUT {
         return;
     }
@@ -587,7 +599,7 @@ struct VerticalGestureState {
 #[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn vertical_swipe_gesture(
-    mut messages: MessageReader<Event>,
+    mut messages: MessageReader<InputEvent>,
     active_display: ActiveDisplay,
     config: Res<Config>,
     mut commands: Commands,
@@ -607,7 +619,7 @@ fn vertical_swipe_gesture(
         state.fired = false;
     }
 
-    for event in messages.read() {
+    for InputEvent(event) in messages.read() {
         match event {
             Event::VerticalScrollTick { delta } => {
                 switch_virtual_workspace(*delta, &config, &mut commands);
