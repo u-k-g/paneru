@@ -4,58 +4,30 @@
     { config, pkgs, ... }:
     let
       cfg = config.services.paneru;
-      tomlFormat = pkgs.formats.toml { };
     in
     {
-      options.services.paneru = {
-        enable = lib.mkEnableOption ''
-          Install paneru and configure the launchd agent.
-
-          The first time this is enabled after installing/updating, macOS will prompt you
-          to grant accessibilty permissions item in System Settings.
-
-          After granting permissions you may have to manually restart the service:
-          `launchctl start com.github.karinushka.paneru`
-
-          You can verify the service is running correctly from your terminal.
-          Run: `launchctl list | grep paneru`
-
-          In case of failure, check the logs with `cat /tmp/paneru.err.log`.
-        '';
-
-        package = lib.mkOption {
-          type = lib.types.package;
-          default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-          description = "The paneru package to use.";
-        };
-
-        settings = lib.mkOption {
-          type = lib.types.nullOr lib.types.attrs;
-          default = null;
-          description = "Paneru configuration";
-          example = {
-            options = {
-              focus_follows_mouse = true;
-              mouse_follows_focus = true;
-            };
-            bindings = {
-              window_focus_west = "cmd - h";
-              window_focus_east = "cmd - l";
-              window_resize = "alt - r";
-              window_center = "alt - c";
-              quit = "ctrl + alt - q";
-            };
-          };
-        };
-      };
+      imports = [ (import ./_paneru-common.nix { inherit self; }) ];
 
       config = lib.mkIf cfg.enable {
-        environment.systemPackages = [ cfg.package ];
+        assertions = [
+          {
+            assertion = cfg.config == null || cfg.luaConfig.enable;
+            message = "services.paneru.config (init.lua) requires services.paneru.luaConfig.enable = true.";
+          }
+        ];
+        environment.systemPackages = [ cfg.finalPackage ];
         # TODO: Once nix-darwin supports it, prefer `launchd.agents.paneru` so `system.primaryUser` is not needed.
         # See <https://github.com/nix-darwin/nix-darwin/issues/1255>
         launchd.user.agents.paneru = {
           serviceConfig = {
             Label = "com.github.karinushka.paneru";
+            # The Mach service clients look up. launchd creates and holds the
+            # port, so `paneru send-cmd`/`query`/`subscribe` and the Lua module
+            # keep working across a daemon restart rather than racing it to
+            # register the name.
+            MachServices = {
+              "com.github.karinushka.paneru" = true;
+            };
             KeepAlive = {
               Crashed = true;
               SuccessfulExit = false;
@@ -63,15 +35,16 @@
             Nice = -20;
             ProcessType = "Interactive";
             EnvironmentVariables = {
-              PANERU_CONFIG = lib.mkIf (cfg.settings != null) (
-                toString (tomlFormat.generate "paneru.toml" cfg.settings)
-              );
+              # The paneru.setup{...} in PANERU_LUA (init.lua) takes precedence
+              # over the options in PANERU_CONFIG (paneru.toml).
+              PANERU_CONFIG = lib.mkIf (cfg.settings != null) (toString cfg.settingsFile);
+              PANERU_LUA = lib.mkIf (cfg.config != null) (toString cfg.configFile);
               NO_COLOR = "1";
             };
             RunAtLoad = true;
             StandardOutPath = "/tmp/paneru.log";
             StandardErrorPath = "/tmp/paneru.err.log";
-            Program = lib.getExe cfg.package;
+            Program = lib.getExe cfg.finalPackage;
           };
         };
       };

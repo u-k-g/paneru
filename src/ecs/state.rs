@@ -9,17 +9,19 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
-use bevy::ecs::system::Query;
+use bevy::ecs::system::{Query, Res, SystemParam};
 use bevy::math::IRect;
 use objc2_core_graphics::CGDirectDisplayID;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
+use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
 use crate::manager::{Application, Display, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
+use paneru_shared_types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
 const SUPPORTED_STATE_VERSION: u32 = 2;
@@ -93,48 +95,32 @@ pub struct SavedWindow {
     pub subrole: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StateQueryKind {
-    State,
-    VirtualWorkspaces,
-    Active,
-}
+// These wire-format types live in the shared `paneru_shared_types` crate;
+// aliased here to the names the rest of the daemon already uses.
+pub use paneru_shared_types::state::{
+    ActiveState as PaneruActiveState, Frame, QueryState as PaneruQueryState, StateEvent,
+    StateQueryKind, VirtualWorkspaceState as PaneruVirtualWorkspaceState,
+    WindowState as PaneruWindowState,
+};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PaneruQueryState {
-    pub version: u32,
-    pub timestamp: u64,
-    pub active: PaneruActiveState,
-    pub virtual_workspaces: Vec<PaneruVirtualWorkspaceState>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct PaneruActiveState {
-    pub display_id: Option<CGDirectDisplayID>,
-    pub native_workspace_id: Option<WorkspaceId>,
-    pub virtual_workspace_number: Option<u32>,
-    pub focused_window_id: Option<WinID>,
-    pub focused_bundle_id: Option<String>,
-    pub focused_app_name: Option<String>,
-    pub focused_window_title: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PaneruVirtualWorkspaceState {
-    pub number: u32,
-    pub native_workspace_id: WorkspaceId,
-    pub active: bool,
-    pub windows: Vec<PaneruWindowState>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PaneruWindowState {
-    pub window_id: WinID,
-    pub bundle_id: String,
-    pub app_name: String,
-    pub title: String,
-    pub focused: bool,
-    pub floating: bool,
+/// Resolves which display a window frame is on and whether more than a sliver of
+/// it is showing there. Returns `None` when the frame misses every display.
+fn window_visibility(
+    frame: IRect,
+    displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    sliver_width: i32,
+) -> Option<(CGDirectDisplayID, bool)> {
+    displays
+        .iter()
+        // Pick the display showing the largest slice of the window.
+        .map(|(display, _, _)| {
+            let overlap = frame.intersect(display.bounds());
+            let (width, height) = (overlap.width().max(0), overlap.height().max(0));
+            (display.id(), width, height)
+        })
+        .filter(|(_, width, height)| *width > 0 && *height > 0)
+        .max_by_key(|(_, width, height)| i64::from(*width) * i64::from(*height))
+        .map(|(display_id, width, height)| (display_id, width > sliver_width && height > 0))
 }
 
 impl From<IRect> for SavedRect {
@@ -177,7 +163,7 @@ impl SavedWindow {
 }
 
 impl PaneruState {
-    #[allow(clippy::type_complexity, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub fn extract(
         workspaces: &Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
         displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
@@ -421,9 +407,222 @@ struct SavedWorkspaceBuilder {
     strips: Vec<SavedStrip>,
 }
 
-impl PaneruQueryState {
-    #[allow(clippy::too_many_lines, clippy::type_complexity)]
-    pub fn extract(
+/// The world access [`QueryState::extract`] needs, bundled so callers (the
+/// socket query handler, the embedded Lua runtime) take one parameter instead
+/// of six.
+#[derive(SystemParam)]
+pub struct QueryStateParams<'w, 's> {
+    workspaces: Query<
+        'w,
+        's,
+        (
+            &'static ChildOf,
+            &'static LayoutStrip,
+            Has<ActiveWorkspaceMarker>,
+            Has<SelectedVirtualMarker>,
+        ),
+    >,
+    displays: Query<'w, 's, (&'static Display, Entity, Has<ActiveDisplayMarker>)>,
+    windows: Windows<'w, 's>,
+    apps: Query<'w, 's, &'static Application>,
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+}
+
+impl QueryStateParams<'_, '_> {
+    /// The window queries backing the extract, for callers that also need to
+    /// look a window up directly rather than through the state document.
+    pub fn windows(&self) -> &Windows<'_, '_> {
+        &self.windows
+    }
+
+    /// Builds the state document from the current world.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window manager cannot enumerate a workspace.
+    pub fn extract(&self) -> crate::errors::Result<PaneruQueryState> {
+        PaneruQueryState::extract(
+            &self.workspaces,
+            &self.displays,
+            &self.windows,
+            &self.apps,
+            &self.window_manager,
+            &self.config,
+        )
+    }
+}
+
+/// Reads the layout as the tree a script transforms. Unlike
+/// [`QueryState::extract`], which flattens each workspace into a list of
+/// windows, this keeps the strip's column structure — needed for `ws:swap`,
+/// `ws:east`, `ws:stack` and friends to know what is beside what.
+impl QueryStateParams<'_, '_> {
+    pub fn extract_window_set(&self) -> crate::errors::Result<WindowSet> {
+        use paneru_shared_types::windowset::{ColumnSet, DisplaySet, WorkspaceSet};
+
+        let focused_entity = self.windows.focused().map(|(_, entity)| entity);
+        let sliver_width = self.config.sliver_width();
+        let active_workspace_id = self
+            .workspaces
+            .iter()
+            .find_map(|(_, strip, active, _)| active.then_some(strip.id()));
+
+        // Group the workspace strips by the display entity that owns them, so
+        // each display can be built with its own workspaces in one pass.
+        let mut strips_by_display: HashMap<Entity, Vec<WorkspaceSet>> = HashMap::new();
+        for (child, strip, active_workspace, selected_workspace) in self.workspaces {
+            // Only ask for floating windows on a workspace that's actually
+            // showing, since this read goes out to the window server.
+            let floating_entities = if active_workspace
+                || selected_workspace && active_workspace_id != Some(strip.id())
+            {
+                self.window_manager.windows_in_workspace(strip.id())?
+            } else {
+                Vec::new()
+            };
+
+            // A window stays tracked by the strip after it's floated (so it can
+            // be re-tiled later), so it's the `Floating` marker — not strip
+            // membership — that decides whether it goes in `columns` or `floating`.
+            let mut floating = Vec::new();
+            let mut columns: Vec<ColumnSet> = Vec::new();
+            for column in strip.columns() {
+                let mut tiled = Vec::new();
+                for entity in column.window_iter() {
+                    let Some(record) = self.window_record(entity, focused_entity, sliver_width)
+                    else {
+                        continue;
+                    };
+                    if record.floating {
+                        floating.push(record);
+                    } else {
+                        tiled.push(record);
+                    }
+                }
+                if tiled.is_empty() {
+                    continue;
+                }
+                let width_ratio = column
+                    .window_iter()
+                    .find_map(|entity| self.windows.width_ratio(entity))
+                    .unwrap_or(1.0);
+                let selected = column
+                    .top()
+                    .and_then(|top| self.windows.get(top).map(|window| window.id()))
+                    .and_then(|id| tiled.iter().position(|window| window.id == id))
+                    .unwrap_or(0);
+                columns.push(ColumnSet {
+                    kind: column_kind(column),
+                    width_ratio,
+                    selected,
+                    windows: std::sync::Arc::new(tiled),
+                });
+            }
+
+            // Floating windows the strip never knew about.
+            floating.extend(
+                floating_entities
+                    .into_iter()
+                    .filter_map(|window_id| {
+                        let (_, entity) = self.windows.find(window_id)?;
+                        let (_, _, unmanaged) = self.windows.get_managed(entity)?;
+                        (matches!(unmanaged, Some(Unmanaged::Floating)) && !strip.contains(entity))
+                            .then_some(entity)
+                    })
+                    .filter_map(|entity| self.window_record(entity, focused_entity, sliver_width)),
+            );
+
+            strips_by_display
+                .entry(child.parent())
+                .or_default()
+                .push(WorkspaceSet {
+                    number: strip.virtual_index + 1,
+                    native_id: strip.id(),
+                    active: active_workspace,
+                    columns: std::sync::Arc::new(columns),
+                    floating: std::sync::Arc::new(floating),
+                });
+        }
+
+        let displays = self
+            .displays
+            .iter()
+            .map(|(display, entity, active)| {
+                let bounds = display.bounds();
+                let mut workspaces = strips_by_display.remove(&entity).unwrap_or_default();
+                workspaces.sort_by_key(|workspace| workspace.number);
+                DisplaySet {
+                    id: display.id(),
+                    frame: Frame {
+                        x: bounds.min.x,
+                        y: bounds.min.y,
+                        width: bounds.width(),
+                        height: bounds.height(),
+                    },
+                    active,
+                    workspaces: std::sync::Arc::new(workspaces),
+                }
+            })
+            .collect();
+
+        let focused = focused_entity
+            .and_then(|entity| self.windows.get(entity))
+            .map(|window| window.id());
+        Ok(WindowSet::new(displays, focused))
+    }
+
+    /// One window, as a script sees it. `None` for an entity that is no longer
+    /// a window we know anything about.
+    fn window_record(
+        &self,
+        entity: Entity,
+        focused: Option<Entity>,
+        sliver_width: i32,
+    ) -> Option<paneru_shared_types::windowset::WindowRec> {
+        let (window, _, unmanaged) = self.windows.get_managed(entity)?;
+        let (_, _, app_entity) = self.windows.find_parent(window.id())?;
+        let app = self.apps.get(app_entity).ok()?;
+        let frame = self.windows.frame(entity);
+        // Minimized and hidden windows are never on screen, whatever their last
+        // known frame says.
+        let hidden = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        let visible = frame
+            .and_then(|frame| window_visibility(frame, &self.displays, sliver_width))
+            .is_some_and(|(_, visible)| visible && !hidden);
+
+        Some(paneru_shared_types::windowset::WindowRec {
+            id: window.id(),
+            app_name: app.name().to_string(),
+            bundle_id: app.bundle_id().unwrap_or_default().clone(),
+            title: window.title().unwrap_or_default(),
+            frame: frame.map(|frame| Frame {
+                x: frame.min.x,
+                y: frame.min.y,
+                width: frame.width(),
+                height: frame.height(),
+            }),
+            floating: matches!(unmanaged, Some(Unmanaged::Floating)),
+            managed: unmanaged.is_none(),
+            visible,
+            focused: focused == Some(entity),
+        })
+    }
+}
+
+/// How a layout column arranges its windows, in the vocabulary a script sees.
+fn column_kind(column: &Column) -> paneru_shared_types::windowset::ColumnKind {
+    use paneru_shared_types::windowset::ColumnKind;
+    match column {
+        Column::Single(_) => ColumnKind::Single,
+        Column::Stack(_) => ColumnKind::Stack,
+        Column::Tabs(_) => ColumnKind::Tabs,
+        Column::Fullscren(_) => ColumnKind::Fullscreen,
+    }
+}
+
+pub trait QueryState: std::marker::Sized {
+    fn extract(
         workspaces: &Query<(
             &ChildOf,
             &LayoutStrip,
@@ -434,8 +633,31 @@ impl PaneruQueryState {
         windows: &Windows,
         apps: &Query<&Application>,
         window_manager: &WindowManager,
+        config: &Config,
+    ) -> crate::errors::Result<Self>;
+}
+
+/// Builds the query/subscribe state document from the ECS world.
+///
+/// A free function rather than an inherent method because [`PaneruQueryState`]
+/// belongs to the shared protocol crate, which knows nothing about the ECS.
+impl QueryState for PaneruQueryState {
+    #[allow(clippy::too_many_lines)]
+    fn extract(
+        workspaces: &Query<(
+            &ChildOf,
+            &LayoutStrip,
+            Has<ActiveWorkspaceMarker>,
+            Has<SelectedVirtualMarker>,
+        )>,
+        displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+        windows: &Windows,
+        apps: &Query<&Application>,
+        window_manager: &WindowManager,
+        config: &Config,
     ) -> crate::errors::Result<Self> {
         let focused_entity = windows.focused().map(|(_, entity)| entity);
+        let sliver_width = config.sliver_width();
 
         let active_display = displays
             .iter()
@@ -477,6 +699,14 @@ impl PaneruQueryState {
                     let bundle_id = app.bundle_id().unwrap_or_default().clone();
                     let app_name = app.name().to_string();
                     let title = window.title().unwrap_or_default();
+                    let frame = windows.frame(entity);
+                    // Minimized and hidden windows are never on screen, whatever
+                    // their last known frame says.
+                    let hidden =
+                        matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+                    let visibility = frame
+                        .and_then(|frame| window_visibility(frame, displays, sliver_width))
+                        .map(|(display_id, visible)| (display_id, visible && !hidden));
                     Some(PaneruWindowState {
                         window_id: window.id(),
                         bundle_id,
@@ -484,6 +714,14 @@ impl PaneruQueryState {
                         title,
                         focused: focused_entity == Some(entity),
                         floating: matches!(unmanaged, Some(Unmanaged::Floating)),
+                        display_id: visibility.map(|(display_id, _)| display_id),
+                        frame: frame.map(|frame| Frame {
+                            x: frame.min.x,
+                            y: frame.min.y,
+                            width: frame.width(),
+                            height: frame.height(),
+                        }),
+                        visible: visibility.is_some_and(|(_, visible)| visible),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -542,20 +780,12 @@ impl PaneruQueryState {
         virtual_workspaces
             .sort_by_key(|workspace| (workspace.native_workspace_id, workspace.number));
 
-        Ok(Self {
+        Ok(PaneruQueryState {
             version: 1,
             timestamp: now_timestamp(),
             active,
             virtual_workspaces,
         })
-    }
-
-    pub fn to_query_json(&self, kind: StateQueryKind) -> serde_json::Result<String> {
-        match kind {
-            StateQueryKind::State => serde_json::to_string(self),
-            StateQueryKind::VirtualWorkspaces => serde_json::to_string(&self.virtual_workspaces),
-            StateQueryKind::Active => serde_json::to_string(&self.active),
-        }
     }
 }
 
@@ -566,7 +796,6 @@ fn now_timestamp() -> u64 {
         .as_secs()
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn periodic_state_save(
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
@@ -582,7 +811,6 @@ pub fn periodic_state_save(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,

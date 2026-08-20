@@ -19,8 +19,10 @@ use tracing::{error, info, warn};
 
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
+#[cfg(test)]
+use crate::commands::{MoveFocus, Operation, ResizeDirection};
 use crate::{
-    commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
+    commands::Command,
     manager::ProcessApi,
     platform::{Modifiers, OSStatus, macos_major_version},
 };
@@ -39,15 +41,28 @@ pub mod swipe;
 /// If no configuration file is found, a minimal one is created in the user's
 /// XDG configuration directory so a fresh app installation can start with the
 /// built-in defaults.
-pub static CONFIGURATION_FILE: LazyLock<PathBuf> = LazyLock::new(|| {
-    discover_configuration_file().unwrap_or_else(|| {
-        create_default_configuration_file().unwrap_or_else(|error| {
-            panic!(
-                "{}: Unable to create default configuration: {error}",
-                function_name!()
-            )
-        })
-    })
+/// The TOML configuration file, if there is one to use. `None` when an
+/// `init.lua` exists, since a script disables the TOML entirely (see
+/// [`Config::defaults`]).
+pub static CONFIGURATION_FILE: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    #[cfg(feature = "lua")]
+    if let Some(script) = discover_lua_file() {
+        info!(
+            "{}: {} is in charge; the TOML configuration is ignored",
+            function_name!(),
+            script.display()
+        );
+        return None;
+    }
+    if let Some(path) = discover_configuration_file() {
+        return Some(path);
+    }
+    Some(create_default_configuration_file().unwrap_or_else(|error| {
+        panic!(
+            "{}: Unable to create default configuration: {error}",
+            function_name!()
+        )
+    }))
 });
 
 const DEFAULT_CONFIGURATION: &str = "# Paneru configuration\n\n[options]\n\n[bindings]\n";
@@ -124,6 +139,115 @@ pub fn discover_configuration_file() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// The default Lua init script, written on first launch when no script exists so the
+/// file watcher always has a concrete path to observe for hot reloading.
+#[cfg(feature = "lua")]
+const DEFAULT_LUA_SCRIPT: &str = "\
+-- Paneru Lua configuration (hot-reloaded on save).
+--
+-- Hook into window-manager events:
+--   paneru.on(\"window_focused\", function(e) paneru.log(\"focused \" .. e.window_id) end)
+--
+-- Bind keys to commands (chord syntax matches [bindings]):
+--   paneru.bind(\"alt - b\", \"window balance\")
+--
+-- ...or to a function. Handlers are given the whole layout as a value they can
+-- transform; nothing moves until you return one, so computing a layout and
+-- discarding it costs nothing. See CONFIGURATION.md.
+--   paneru.bind(\"alt - j\", function(ws)
+--     return ws:focus(ws:east(ws:focused()))
+--   end)
+";
+
+/// Returns the default location for the Lua init script (`<config>/paneru/init.lua`).
+#[cfg(feature = "lua")]
+fn default_lua_file() -> std::io::Result<PathBuf> {
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::NotFound,
+                "neither XDG_CONFIG_HOME nor HOME is set",
+            )
+        })?;
+
+    Ok(config_home.join("paneru").join("init.lua"))
+}
+
+/// Finds the first existing Lua init script from supported locations, mirroring
+/// [`discover_configuration_file`]. Honors `$PANERU_LUA` first.
+#[cfg(feature = "lua")]
+pub fn discover_lua_file() -> Option<PathBuf> {
+    if let Ok(path_str) = env::var("PANERU_LUA") {
+        let path = PathBuf::from(path_str);
+        if path.exists() {
+            return Some(path);
+        }
+        warn!(
+            "{}: $PANERU_LUA is set to {}, but the file does not exist. Falling back to default locations.",
+            function_name!(),
+            path.display()
+        );
+    }
+
+    let standard_paths = [env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".paneru.lua"))];
+
+    let xdg_dirs = xdg::BaseDirectories::with_prefix("paneru");
+    let xdg_paths = xdg_dirs.find_config_files("init.lua");
+
+    standard_paths
+        .into_iter()
+        .flatten()
+        .chain(xdg_paths)
+        .find(|path| path.exists())
+}
+
+/// Returns the path to the Lua init script, creating a default one at the XDG
+/// location if none exists.
+///
+/// Returns `Ok(None)` instead if a `paneru.toml` already exists: planting a
+/// script beside an existing TOML would silently override it (see
+/// [`CONFIGURATION_FILE`]).
+#[cfg(feature = "lua")]
+pub fn ensure_lua_file() -> std::io::Result<Option<PathBuf>> {
+    if let Some(path) = discover_lua_file() {
+        return Ok(Some(path));
+    }
+    if let Some(toml) = discover_configuration_file() {
+        info!(
+            "{}: {} is the active configuration; not creating a default init.lua",
+            function_name!(),
+            toml.display()
+        );
+        return Ok(None);
+    }
+    let path = default_lua_file()?;
+    if create_lua_file_at(&path)? {
+        info!("Created default Lua script at {}", path.display());
+    }
+    Ok(Some(path))
+}
+
+#[cfg(feature = "lua")]
+fn create_lua_file_at(path: &Path) -> std::io::Result<bool> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidInput, "Lua script path has no parent")
+    })?;
+    create_dir_all(parent)?;
+
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(DEFAULT_LUA_SCRIPT.as_bytes())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Returns the list of deprecated top-level `[options]` keys present in a TOML config.
 pub fn deprecated_options_in_input(input: &str) -> Result<Vec<String>> {
     const DEPRECATED_KEYS: [&str; 16] = [
@@ -163,210 +287,12 @@ pub fn deprecated_options_in_file(path: &Path) -> Result<Vec<String>> {
     deprecated_options_in_input(&input)
 }
 
-/// Parses a string into a `Direction` enum.
-///
-/// # Arguments
-///
-/// * `dir` - The string representation of the direction (e.g., "north", "west").
-///
-/// # Returns
-///
-/// `Ok(Direction)` if the string is a valid direction, otherwise `Err(Error::InvalidConfig)`.
-fn parse_direction(dir: &str) -> Result<Direction> {
-    Ok(match dir {
-        "north" => Direction::North,
-        "south" => Direction::South,
-        "west" => Direction::West,
-        "east" => Direction::East,
-        "first" => Direction::First,
-        "last" => Direction::Last,
-        _ => {
-            return Err(Error::InvalidConfig(format!(
-                "{}: Unhandled direction {dir}",
-                function_name!()
-            )));
-        }
-    })
-}
-
-fn parse_focus_direction(dir: &str) -> Result<Direction> {
-    match dir.parse::<usize>() {
-        Ok(0) => Err(Error::InvalidConfig(format!(
-            "{}: Window numbers start at 1",
-            function_name!()
-        ))),
-        Ok(number) => Ok(Direction::Nth(number - 1)),
-        Err(_) => parse_direction(dir),
-    }
-}
-
-fn parse_virtual_workspace_number(input: &str) -> Result<u32> {
-    let number = input.parse::<u32>().map_err(|_| {
-        Error::InvalidConfig(format!(
-            "{}: Unhandled virtual workspace {input}",
-            function_name!()
-        ))
-    })?;
-    if number == 0 {
-        return Err(Error::InvalidConfig(format!(
-            "{}: Virtual workspace numbers start at 1",
-            function_name!()
-        )));
-    }
-    Ok(number - 1)
-}
-
-/// Parses a string into a `ResizeDirection` enum.
-fn parse_resize_direction(direction: &str) -> Result<ResizeDirection> {
-    Ok(match direction {
-        "grow" => ResizeDirection::Grow,
-        "shrink" => ResizeDirection::Shrink,
-        _ => {
-            return Err(Error::InvalidConfig(format!(
-                "{}: Unhandled resize direction {direction}",
-                function_name!()
-            )));
-        }
-    })
-}
-
-/// Parses a command argument vector into an `Operation` enum.
-///
-/// # Arguments
-///
-/// * `argv` - A slice of strings representing the command arguments (e.g., `["focus", "east"]`).
-///
-/// # Returns
-///
-/// `Ok(Operation)` if the arguments represent a valid operation, otherwise `Err(Error::InvalidConfig)`.
-fn parse_operation(argv: &[&str]) -> Result<Operation> {
-    let empty = "";
-    let cmd = *argv.first().unwrap_or(&empty);
-    let err = Error::InvalidConfig(format!("{}: Invalid command '{argv:?}'", function_name!()));
-
-    let out = match cmd {
-        // The bindings key splits on `_`, so `window_focus_unmanaged` arrives
-        // here as ["focus", "unmanaged"] and the suffix tells us the variant.
-        "focus" => match *argv.get(1).ok_or(err.clone())? {
-            "unmanaged" => Operation::FocusUnmanaged,
-            "managed" => Operation::FocusManaged,
-            dir => Operation::Focus(parse_focus_direction(dir)?),
-        },
-        "raise" => match *argv.get(1).ok_or(err.clone())? {
-            "floating" => Operation::RaiseFloating,
-            _ => return Err(err),
-        },
-        "togglefloatlayer" => Operation::ToggleFloatingLayer,
-        "swap" => Operation::Swap(parse_direction(argv.get(1).ok_or(err)?)?),
-        "center" => Operation::Center,
-        "resize" => Operation::Resize(
-            argv.get(1)
-                .map_or(Ok(ResizeDirection::Grow), |arg| parse_resize_direction(arg))?,
-        ),
-        "grow" => Operation::Resize(ResizeDirection::Grow),
-        "shrink" => Operation::Resize(ResizeDirection::Shrink),
-        "fullwidth" => Operation::FullWidth,
-        "manage" => Operation::Manage,
-        "equalize" => Operation::Equalize,
-        "balance" => Operation::Balance,
-        "stack" => Operation::Stack(true),
-        "unstack" => Operation::Stack(false),
-        "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
-        "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
-        "snap" => Operation::Snap,
-        "virtual" => {
-            let target = argv.get(1).ok_or(err)?;
-            target.parse::<u32>().map_or_else(
-                |_| parse_direction(target).map(Operation::Virtual),
-                |_| parse_virtual_workspace_number(target).map(Operation::VirtualNumber),
-            )?
-        }
-        "virtualnum" => {
-            Operation::VirtualNumber(parse_virtual_workspace_number(argv.get(1).ok_or(err)?)?)
-        }
-        "virtualmove" => {
-            let target = argv.get(1).ok_or(err)?;
-            target.parse::<u32>().map_or_else(
-                |_| {
-                    parse_direction(target)
-                        .map(|dir| Operation::VirtualMove(dir, MoveFocus::Follow))
-                },
-                |_| {
-                    parse_virtual_workspace_number(target)
-                        .map(|index| Operation::VirtualMoveNumber(index, MoveFocus::Follow))
-                },
-            )?
-        }
-        "virtualmovenum" => Operation::VirtualMoveNumber(
-            parse_virtual_workspace_number(argv.get(1).ok_or(err)?)?,
-            MoveFocus::Follow,
-        ),
-        "virtualsend" => {
-            let target = argv.get(1).ok_or(err)?;
-            target.parse::<u32>().map_or_else(
-                |_| parse_direction(target).map(|dir| Operation::VirtualMove(dir, MoveFocus::Stay)),
-                |_| {
-                    parse_virtual_workspace_number(target)
-                        .map(|index| Operation::VirtualMoveNumber(index, MoveFocus::Stay))
-                },
-            )?
-        }
-        "virtualsendnum" => Operation::VirtualMoveNumber(
-            parse_virtual_workspace_number(argv.get(1).ok_or(err)?)?,
-            MoveFocus::Stay,
-        ),
-        _ => {
-            return Err(err);
-        }
-    };
-    Ok(out)
-}
-
-/// Parses a command argument vector into a `MouseMove` enum.
-fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
-    let empty = "";
-    let cmd = *argv.first().unwrap_or(&empty);
-    let err = Error::InvalidConfig(format!(
-        "{}: Invalid mouse command '{argv:?}'",
-        function_name!()
-    ));
-
-    let out = match cmd {
-        "nextdisplay" => MouseMove::ToNextDisplay,
-        _ => {
-            return Err(err);
-        }
-    };
-    Ok(out)
-}
-
-/// Parses a command argument vector into a `Command` enum.
-///
-/// # Arguments
-///
-/// * `argv` - A slice of strings representing the command arguments (e.g., `["window", "focus", "east"]`).
-///
-/// # Returns
-///
-/// `Ok(Command)` if the arguments represent a valid command, otherwise `Err(Error::InvalidConfig)`.
+/// Parses a command argument vector into a [`Command`] (e.g. `["window",
+/// "focus", "east"]`), mapping the shared vocabulary crate's parse error into
+/// this crate's configuration error.
 pub fn parse_command(argv: &[&str]) -> Result<Command> {
-    let empty = "";
-    let cmd = *argv.first().unwrap_or(&empty);
-
-    let out = match cmd {
-        "printstate" => Command::PrintState,
-        "window" => Command::Window(parse_operation(&argv[1..])?),
-        "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
-        "quit" => Command::Quit,
-        "restart" => Command::Restart,
-        _ => {
-            return Err(Error::InvalidConfig(format!(
-                "{}: Unhandled command '{argv:?}'",
-                function_name!()
-            )));
-        }
-    };
-    Ok(out)
+    paneru_shared_types::commands::parse_command(argv)
+        .map_err(|err| Error::InvalidConfig(format!("{}: {err}", function_name!())))
 }
 
 /// `Config` manages the application's configuration, including options, keybindings, and window-specific parameters.
@@ -393,6 +319,25 @@ impl Config {
         })
     }
 
+    /// The configuration with every option left at its default, used when
+    /// there is no TOML file (e.g. a Lua-only setup; see [`CONFIGURATION_FILE`]).
+    /// Parses the same text the generated stub would contain.
+    pub fn defaults() -> Result<Self> {
+        Ok(Config {
+            inner: Arc::new(ArcSwap::from_pointee(InnerConfig::new(
+                DEFAULT_CONFIGURATION,
+            )?)),
+        })
+    }
+
+    /// Loads `path` if there is one, otherwise falls back to the defaults.
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        match path {
+            Some(path) => Self::new(path),
+            None => Self::defaults(),
+        }
+    }
+
     /// Reloads the configuration from the specified path, updating the internal options and keybindings.
     ///
     /// # Arguments
@@ -407,6 +352,14 @@ impl Config {
         let new = InnerConfig::new(&input)?;
         self.inner.store(Arc::new(new));
         Ok(())
+    }
+
+    /// Atomically adopts another config's inner data via a lock-free
+    /// `ArcSwap::store`, so every shared handle to this `Config` observes the
+    /// new settings. Used by the Lua hot-reload path.
+    #[cfg(feature = "lua")]
+    pub(crate) fn replace_inner_from(&self, other: &Config) {
+        self.inner.store(other.inner.load_full());
     }
 
     /// Returns a read guard to the inner `InnerConfig` for read-only access.
@@ -888,6 +841,13 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
+    /// Number of virtual workspaces to pre-create on each physical space at
+    /// startup. Default: 1 (just the physical space itself, no extra virtual
+    /// workspaces).
+    pub fn default_workspaces(&self) -> u32 {
+        self.inner().default_workspaces.unwrap_or(1).max(1)
+    }
+
     pub fn insert_windows_mid_strip(&self) -> bool {
         // Default is disabled: appending to the end of the strip is the
         // expected behaviour, especially when moving several windows.
@@ -980,10 +940,14 @@ impl OneOrMore {
 /// It is typically accessed via an `Arc<RwLock<InnerConfig>>` within the `Config` struct.
 #[derive(Deserialize, Debug, Default)]
 struct InnerConfig {
+    // Defaulted so a config may omit these; otherwise serde requires them.
+    #[serde(default)]
     options: MainOptions,
+    #[serde(default)]
     bindings: HashMap<String, OneOrMore>,
     windows: Option<HashMap<String, WindowParams>>,
     decorations: Option<decorations::DecorationsOptions>,
+    default_workspaces: Option<u32>,
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
@@ -1331,6 +1295,93 @@ where
     parse_modifiers(&s)
         .map(Some)
         .map_err(|e: Error| serde::de::Error::custom(e.to_string()))
+}
+
+/// Builds a [`Config`] from the Lua table passed to `paneru.setup{...}`,
+/// reusing the same serde `Deserialize` that parses the TOML file. Keybindings
+/// are not read here — they go through the Lua keybind pipeline via
+/// `paneru.bind` — so any `bindings` field is cleared.
+///
+/// # Errors
+///
+/// Returns an error if `value` is not a table or fails to deserialize.
+#[cfg(feature = "lua")]
+pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Result<Config> {
+    use mlua::LuaSerdeExt;
+
+    if !value.is_table() {
+        return Err(mlua::Error::RuntimeError(
+            "paneru.setup: expected a table".to_string(),
+        ));
+    }
+
+    let mut inner: InnerConfig = lua.from_value(value)?;
+    inner.bindings.clear();
+
+    // Resolve window passthrough chords into keycodes, mirroring the TOML
+    // second pass. `parsed_passthrough` is `#[serde(skip)]`, so it starts empty.
+    let needs_keys = inner.windows.as_ref().is_some_and(|windows| {
+        windows
+            .values()
+            .any(|params| !params.bindings_passthrough.is_empty())
+    });
+    if needs_keys {
+        // The primed keymap, not a fresh one: this runs on the Lua worker, and
+        // generating it goes through Carbon/TIS. See [`prime_virtual_keymap`].
+        let virtual_keys = virtual_keymap();
+        if let Some(windows) = &mut inner.windows {
+            for params in windows.values_mut() {
+                for chord in &params.bindings_passthrough {
+                    match resolve_keybinding_str(chord, virtual_keys) {
+                        Ok(pair) => params.parsed_passthrough.push(pair),
+                        Err(err) => error!("paneru.setup passthrough: {err}"),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Config {
+        inner: Arc::new(ArcSwap::from_pointee(inner)),
+    })
+}
+
+/// Resolves a keybinding chord string like `"ctrl+alt-h"` into a `(keycode, Modifiers)`
+/// pair, generating the layout-aware virtual keymap on demand.
+///
+/// This is the entry point used by the Lua runtime's `paneru.bind`, so scripted
+/// keybinds accept the exact same chord syntax as the TOML `[bindings]` table.
+#[cfg(feature = "lua")]
+pub(crate) fn resolve_chord(input: &str) -> Result<(u8, Modifiers)> {
+    // Fast path: avoids the virtual keymap for common chords, keeping this
+    // testable headlessly.
+    if let Ok(resolved) = resolve_keybinding_str(input, &[]) {
+        return Ok(resolved);
+    }
+    resolve_keybinding_str(input, virtual_keymap())
+}
+
+/// The layout-aware virtual keymap, computed once.
+///
+/// `generate_virtual_keymap` goes through Carbon/TIS, which is main-thread/
+/// GUI-session sensitive, but `paneru.bind` runs on the Lua worker thread. So
+/// the daemon primes this from the main thread at startup; the worker only
+/// ever reads what was left behind.
+#[cfg(feature = "lua")]
+static VIRTUAL_KEYMAP: std::sync::OnceLock<Vec<(String, u8)>> = std::sync::OnceLock::new();
+
+/// Computes the virtual keymap now, on the calling thread. Call once from the
+/// main thread before anything can reach [`resolve_chord`].
+#[cfg(feature = "lua")]
+pub(crate) fn prime_virtual_keymap() {
+    let _ = VIRTUAL_KEYMAP.set(generate_virtual_keymap());
+}
+
+/// The primed keymap. Falls back to computing it in place if priming never
+/// happened (harmless in unit tests, rare elsewhere).
+#[cfg(feature = "lua")]
+fn virtual_keymap() -> &'static [(String, u8)] {
+    VIRTUAL_KEYMAP.get_or_init(generate_virtual_keymap)
 }
 
 /// Resolves a keybinding string like `"ctrl+alt-h"` into a `(keycode, Modifiers)` pair.
@@ -1926,6 +1977,24 @@ fn test_parse_absolute_virtual_workspace_commands() {
         parse_command(&["window", "virtualsendnum", "3"]).unwrap(),
         Command::Window(Operation::VirtualMoveNumber(2, MoveFocus::Stay))
     ));
+    assert!(matches!(
+        parse_command(&["window", "virtualadd"]).unwrap(),
+        Command::Window(Operation::VirtualAdd)
+    ));
+}
+
+#[test]
+fn test_default_workspaces() {
+    let base = "[options]\n[bindings]\n";
+    let config = Config::try_from(base).unwrap();
+    assert_eq!(config.default_workspaces(), 1);
+
+    let config = Config::try_from(&*format!("default_workspaces = 4\n{base}")).unwrap();
+    assert_eq!(config.default_workspaces(), 4);
+
+    // Zero is clamped up to 1 (the physical space always exists).
+    let config = Config::try_from(&*format!("default_workspaces = 0\n{base}")).unwrap();
+    assert_eq!(config.default_workspaces(), 1);
 }
 
 #[test]
@@ -2068,6 +2137,17 @@ fn test_first_launch_creates_parseable_config_without_overwriting_it() {
 }
 
 #[test]
+fn defaults_config_matches_the_generated_stub() {
+    let stub = InnerConfig::new(DEFAULT_CONFIGURATION).expect("the stub should parse");
+    let defaults = Config::defaults().expect("defaults should always build");
+    assert_eq!(
+        format!("{stub:?}"),
+        format!("{:?}", defaults.inner.load()),
+        "a missing TOML should behave exactly like the generated stub"
+    );
+}
+
+#[test]
 fn test_window_rules_manage() {
     let input = r#"
 [options]
@@ -2169,4 +2249,64 @@ window_grow = "alt - minus"
         config.find_keybind(minus_keycode, Modifiers::ALT),
         Some(Command::Window(Operation::Resize(ResizeDirection::Grow)))
     ));
+}
+
+#[cfg(all(test, feature = "lua"))]
+mod lua_setup_tests {
+    use super::*;
+    use mlua::Lua;
+
+    /// Runs a `paneru.setup`-style table (as a Lua chunk that returns it) through
+    /// the same `config_from_lua` path `paneru.setup` uses.
+    fn config_from_source(source: &str) -> Config {
+        let lua = Lua::new();
+        let value: mlua::Value = lua.load(source).eval().expect("lua chunk should evaluate");
+        config_from_lua(&lua, value).expect("config_from_lua should succeed")
+    }
+
+    #[test]
+    fn setup_table_populates_accessors() {
+        let config = config_from_source(
+            r"return {
+                default_workspaces = 3,
+                options = { sliver_width = 9, focus_follows_mouse = false },
+                padding = { top = 10, bottom = 4 },
+            }",
+        );
+        assert_eq!(config.default_workspaces(), 3);
+        assert_eq!(config.sliver_width(), 9);
+        assert!(!config.focus_follows_mouse());
+        let (top, _right, bottom, _left) = config.edge_padding();
+        assert_eq!((top, bottom), (10, 4));
+    }
+
+    #[test]
+    fn missing_options_and_bindings_are_ok() {
+        // Regression guard for the `#[serde(default)]` fix: a table that omits
+        // `options` and `bindings` must still deserialize.
+        let config = config_from_source(r"return { padding = { top = 4 } }");
+        assert_eq!(config.default_workspaces(), 1);
+        assert_eq!(config.edge_padding().0, 4);
+    }
+
+    #[test]
+    fn window_rule_passthrough_is_resolved() {
+        let config = config_from_source(
+            r#"return {
+                windows = { term = { title = "kitty", bindings_passthrough = { "ctrl+alt-h" } } },
+            }"#,
+        );
+        let rules = config.find_window_properties("kitty", "");
+        assert_eq!(rules.len(), 1);
+        assert!(
+            !rules[0].passthrough_keys().is_empty(),
+            "passthrough chords should resolve to keycodes"
+        );
+    }
+
+    #[test]
+    fn non_table_argument_is_rejected() {
+        let lua = Lua::new();
+        assert!(config_from_lua(&lua, mlua::Value::Integer(3)).is_err());
+    }
 }

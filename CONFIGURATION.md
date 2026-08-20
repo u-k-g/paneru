@@ -1,6 +1,8 @@
 # Configuration Guide
 
-Paneru is configured via a TOML file. By default, it looks for the configuration in the following locations (in order):
+Paneru is configured via a TOML file *or* a Lua script — never both. By
+default, it looks for the TOML configuration in the following locations (in
+order):
 
 1.  `$PANERU_CONFIG` (environment variable)
 2.  `$HOME/.paneru`
@@ -8,6 +10,9 @@ Paneru is configured via a TOML file. By default, it looks for the configuration
 4.  `$XDG_CONFIG_HOME/paneru/paneru.toml`
 
 The configuration is automatically reloaded when the file is saved.
+
+If an `init.lua` exists (see [Lua Scripting Guide](./SCRIPTING.md)), it takes over
+completely and none of these TOML paths are read.
 
 ---
 
@@ -186,10 +191,10 @@ Virtual workspaces can also be navigated using trackpad gestures. If `[swipe.ges
 
 | Action | Description |
 | :--- | :--- |
-| `window_virtual_north` / `_south` | Switch to the previous/next virtual workspace (row of windows). |
+| `window_virtual_north` / `_south` / `_first` / `_last` | Switch to the previous/next or first/last virtual workspace (row of windows). `_east` or `_west` are aliases for `_north` and `_south`. |
 | `window_virtualnum_<number>` | Switch directly to the numbered virtual workspace. |
-| `window_virtualmove_north` / `_south` | Move currently focused window to the previous/next virtual workspace and follow it. |
-| `window_virtualsend_north` / `_south` | Move currently focused window to the previous/next virtual workspace but stay on the current one. |
+| `window_virtualmove_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace and follow it. `_east` or `_west` are aliases for `_north` and `_south`. |
+| `window_virtualsend_north` / `_south` / `_first` / `_last` | Move currently focused window to the previous/next or first/last virtual workspace but stay on the current one. `_east` or `_west` are aliases for `_north` and `_south`. |
 | `window_virtualmovenum_<number>` | Move currently focused window to the numbered virtual workspace and follow it. |
 | `window_virtualsendnum_<number>` | Move currently focused window to the numbered virtual workspace but stay on the current one. |
 
@@ -391,3 +396,18 @@ radius = 12.0
 ```
 
 > **Tip:** You can override the `border_radius` for specific applications in the `[windows]` section. See [Window Rules](#6-window-rules).
+
+## 8. Lua Scripting
+
+Paneru embeds a Lua runtime that allows full configuration via `init.lua`, replacing `paneru.toml` entirely. When a Lua configuration or script exists (`$PANERU_LUA`, `$HOME/.paneru.lua`, or `$XDG_CONFIG_HOME/paneru/init.lua`), it takes over completely and no TOML config is read.
+
+All options, padding, gesture settings, window rules, and keybindings documented in sections 1–7 above are available under identical names via `paneru.setup{...}`.
+
+In addition to static configuration, Lua scripting allows:
+- **Event Hooks (`paneru.on`)**: React to window creation (`window_spawned`), focus changes, or space switches with optional filter specs or regex matchers.
+- **Keybinding Callbacks (`paneru.bind`)**: Map hotkeys to custom Lua callbacks or commands.
+- **State Queries (`paneru.query_*`)**: Read real-time window, workspace, and display layout state without round-trip shell executions.
+- **Persistent State (`paneru.state`)**: Store and mutate data across reloads and daemon restarts.
+- **Programmatic Layout Transformations (`ws`)**: Pure layout operations (`ws:focus`, `ws:swap`, `ws:float`, `ws:shift`, `ws:view`, etc.) for custom workflows like named scratchpads.
+
+For complete documentation, event specifications, API reference, and examples, see the **[Lua Scripting Guide](./SCRIPTING.md)**.

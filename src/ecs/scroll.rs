@@ -24,6 +24,7 @@ use bevy::ecs::schedule::common_conditions::on_message;
 use crate::events::{Event, InputEvent};
 use crate::manager::{Window, WindowManager};
 use crate::platform::Modifiers;
+use crate::util::round_px;
 
 pub struct ScrollEventsPlugin;
 
@@ -32,18 +33,27 @@ const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
 // gesture samples cannot strand the strip before macOS reports finger-up.
 const SNAP_GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// The on-screen strip, its origin, and the scroll state being applied to it.
+type ScrollingStrip<'w, 's> = Single<
+    'w,
+    's,
+    (
+        &'static LayoutStrip,
+        &'static mut Position,
+        &'static mut Scrolling,
+    ),
+    (With<ActiveWorkspaceMarker>, Without<Window>),
+>;
+
 impl Plugin for ScrollEventsPlugin {
     fn build(&self, app: &mut App) {
         let mission_control_inactive = |mission_control: Option<Res<MissionControlActive>>| {
             mission_control.is_none_or(|active| !active.0)
         };
 
-        // The two gesture systems only act on an input event, so a frame
-        // carrying none can skip them and everything they would have fetched.
-        //
-        // The rest of the chain is deliberately left ungated: inertia, the snap
-        // force and the integrator run precisely when the fingers have stopped
-        // sending events, and `swiping_timeout` exists to notice their absence.
+        // Only the two gesture systems are gated on an input event. The rest of
+        // the chain (inertia, snap force, integrator) must keep running after
+        // the fingers stop sending events, since that's when they take over.
         app.add_systems(
             Update,
             (
@@ -416,7 +426,6 @@ pub(super) fn swiping_timeout(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_inertia(
     mut strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
@@ -438,7 +447,6 @@ fn apply_inertia(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
     mut strip: Single<(&LayoutStrip, &Position, &mut Scrolling)>,
@@ -486,7 +494,6 @@ fn apply_snap_force(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn scrolling_integrator(
     mut strip: Single<&mut Scrolling, With<LayoutStrip>>,
@@ -510,13 +517,9 @@ fn scrolling_integrator(
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_scrolling_constraints(
-    mut strip: Single<
-        (&LayoutStrip, &mut Position, &mut Scrolling),
-        (With<ActiveWorkspaceMarker>, Without<Window>),
-    >,
+    mut strip: ScrollingStrip,
     active_display: ActiveDisplay,
     windows: Windows,
     config: Res<Config>,
@@ -526,7 +529,7 @@ fn apply_scrolling_constraints(
 
     let get_window_frame = |entity| windows.moving_frame(entity);
     if let Some(clamped_offset) = clamp_viewport_offset(
-        scroll.position as i32,
+        round_px(scroll.position),
         strip,
         &windows,
         &get_window_frame,
@@ -596,7 +599,6 @@ struct VerticalGestureState {
     fired: bool,
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::TRACE, skip_all)]
 fn vertical_swipe_gesture(
     mut messages: MessageReader<InputEvent>,
