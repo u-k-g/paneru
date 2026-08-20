@@ -321,7 +321,7 @@ fn swipe_release_target(
     };
     let projected_x = f64::from(strip_position.x)
         + velocity * f64::from(viewport.width()) * direction_modifier * MOMENTUM_SECONDS;
-    let projected_position = IVec2::new(projected_x.round() as i32, strip_position.y);
+    let projected_position = IVec2::new(round_px(projected_x), strip_position.y);
 
     let projected = nearest_window(strip, projected_position, viewport, windows)?;
     let start_index = strip.index_of(started_focused).ok()?;
