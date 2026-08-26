@@ -307,15 +307,20 @@ pub(crate) fn add_existing_application(
         .into_iter()
         .map(LayoutStrip::id)
         .collect::<Vec<_>>();
-    let thread_pool = AsyncComputeTaskPool::get();
 
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
-            && let Ok((found_windows, offscreen)) = window_manager
-                .find_existing_application_windows(&mut app, &spaces, &config)
-                .inspect_err(|err| warn!("{err}"))
+        if !app.observe().is_ok_and(|result| result) {
+            debug!(
+                "failed to register some observers for {}; continuing window discovery",
+                app.name()
+            );
+        }
+
+        if let Ok((found_windows, offscreen)) = window_manager
+            .find_existing_application_windows(&mut app, &spaces, &config)
+            .inspect_err(|err| warn!("{err}"))
         {
             offscreen_windows.extend(offscreen);
             commands.trigger(SpawnWindowTrigger(found_windows));
@@ -325,6 +330,7 @@ pub(crate) fn add_existing_application(
         }
 
         if !offscreen_windows.is_empty() {
+            let thread_pool = AsyncComputeTaskPool::get();
             let pid = app.pid();
             let bundle_id = app.bundle_id();
             let config = config.clone();
@@ -1587,8 +1593,12 @@ mod initialization_tests {
 
     use bevy::prelude::*;
 
-    use super::gather_initial_processes;
+    use super::{add_existing_application, gather_initial_processes};
+    use crate::config::Config;
+    use crate::ecs::{ExistingMarker, layout::LayoutStrip};
     use crate::events::Event;
+    use crate::manager::app::MockApplicationApi;
+    use crate::manager::{Application, MockWindowManagerApi, WindowManager};
 
     #[derive(Default, Resource)]
     struct DeferredEventSeen(bool);
@@ -1623,6 +1633,35 @@ mod initialization_tests {
         app.update();
 
         assert!(app.world().resource::<DeferredEventSeen>().0);
+    }
+
+    #[test]
+    fn startup_discovers_windows_when_application_observers_are_unavailable() {
+        let mut application = MockApplicationApi::new();
+        application
+            .expect_name()
+            .return_const("test application".to_string());
+        application.expect_observe().returning(|| Ok(false));
+
+        let mut window_manager = MockWindowManagerApi::new();
+        window_manager
+            .expect_find_existing_application_windows()
+            .times(1)
+            .returning(|_, _, _| Ok((vec![], vec![])));
+
+        let mut app = App::new();
+        app.insert_resource(Config::defaults().expect("default config"));
+        app.insert_resource(WindowManager(Box::new(window_manager)));
+        app.add_systems(Update, add_existing_application);
+        app.world_mut().spawn(LayoutStrip::new(1, 0));
+        let application = app
+            .world_mut()
+            .spawn((Application::new(Box::new(application)), ExistingMarker))
+            .id();
+
+        app.update();
+
+        assert!(!app.world().entity(application).contains::<ExistingMarker>());
     }
 }
 

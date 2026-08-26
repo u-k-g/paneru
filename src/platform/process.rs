@@ -506,7 +506,7 @@ impl ProcessHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessEventApp, ProcessHandler};
+    use super::{ProcessEventApp, ProcessHandler, deduplicate_processes};
     use crate::events::{Event, EventSender};
     use crate::platform::{ProcessSerialNumber, WorkspaceObserver};
 
@@ -527,5 +527,25 @@ mod tests {
             receiver.recv().unwrap(),
             Event::ApplicationFrontSwitched { psn: found } if found == psn
         ));
+    }
+
+    #[test]
+    fn startup_process_union_adds_workspace_omissions_and_keeps_pid_hints() {
+        let carbon_process = ProcessSerialNumber { high: 1, low: 2 };
+        let workspace_only_process = ProcessSerialNumber { high: 3, low: 4 };
+
+        let processes = deduplicate_processes([
+            (carbon_process, None),
+            (carbon_process, Some(41)),
+            (workspace_only_process, Some(42)),
+        ]);
+
+        assert_eq!(
+            processes,
+            vec![
+                (carbon_process, Some(41)),
+                (workspace_only_process, Some(42)),
+            ]
+        );
     }
 }
