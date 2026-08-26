@@ -977,6 +977,7 @@ pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
     existing_config: Option<Res<Config>>,
     mut displays: Query<&mut Display>,
+    mut deferred_events: MessageWriter<Event>,
     mut commands: Commands,
 ) {
     let Some(receiver) = receiver else {
@@ -1003,7 +1004,13 @@ pub(crate) fn gather_initial_processes(
             Event::InitialConfig(config) => {
                 toml_config = Some(config);
             }
-            event => warn!("Stray event during initial process gathering: {event:?}"),
+            // The reader is already serving IPC while this synchronous startup
+            // scan drains the same channel. Preserve queries, subscriptions and
+            // ordinary OS events for the first PreUpdate instead of dropping a
+            // client handshake and leaving it blocked forever.
+            event => {
+                deferred_events.write(event);
+            }
         }
     }
 
@@ -1574,6 +1581,51 @@ mod animation_tests {
     }
 }
 
+#[cfg(test)]
+mod initialization_tests {
+    use std::sync::mpsc::channel;
+
+    use bevy::prelude::*;
+
+    use super::gather_initial_processes;
+    use crate::events::Event;
+
+    #[derive(Default, Resource)]
+    struct DeferredEventSeen(bool);
+
+    fn record_deferred_event(
+        mut events: MessageReader<Event>,
+        mut seen: ResMut<DeferredEventSeen>,
+    ) {
+        seen.0 = events
+            .read()
+            .any(|event| matches!(event, Event::SystemWoke { msg } if msg == "during startup"));
+    }
+
+    #[test]
+    fn startup_preserves_events_that_arrive_during_initial_process_scan() {
+        let (sender, receiver) = channel();
+        sender
+            .send(Event::SystemWoke {
+                msg: "during startup".into(),
+            })
+            .expect("send deferred event");
+        sender
+            .send(Event::ProcessesLoaded)
+            .expect("finish startup scan");
+
+        let mut app = App::new();
+        app.add_message::<Event>();
+        app.init_resource::<DeferredEventSeen>();
+        app.insert_non_send(receiver);
+        app.add_systems(Startup, gather_initial_processes);
+        app.add_systems(PreUpdate, record_deferred_event);
+        app.update();
+
+        assert!(app.world().resource::<DeferredEventSeen>().0);
+    }
+}
+
 #[cfg(all(test, feature = "lua"))]
 mod tests {
     use std::sync::mpsc::channel;
@@ -1602,6 +1654,7 @@ mod tests {
         sender.send(Event::ProcessesLoaded).expect("send loaded");
 
         let mut app = App::new();
+        app.add_message::<Event>();
         app.insert_resource(lua_config);
         app.insert_non_send(receiver);
         app.add_systems(Update, gather_initial_processes);
