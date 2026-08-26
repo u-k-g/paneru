@@ -2,6 +2,7 @@ use core::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2_app_kit::NSWorkspace;
 use scopeguard::ScopeGuard;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
@@ -11,7 +12,7 @@ use tracing::{debug, error, info};
 use super::workspace::WorkspaceObserver;
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
-use crate::platform::OSStatus;
+use crate::platform::{OSStatus, Pid};
 use crate::util::MacResult;
 use serde::{Deserialize, Serialize};
 
@@ -173,6 +174,33 @@ unsafe extern "C" {
     /// # Original signature
     /// GetNextProcess(ProcessSerialNumber * pPSN)
     fn GetNextProcess(psn: *mut ProcessSerialNumber) -> OSStatus;
+
+    /// Resolves a process serial number for a Unix process ID.
+    ///
+    /// `GetNextProcess` can omit already-running Electron applications. This
+    /// lets the `NSWorkspace` startup fallback feed those applications through
+    /// Paneru's existing PSN-based process lifecycle.
+    fn GetProcessForPID(pid: Pid, psn: *mut ProcessSerialNumber) -> OSStatus;
+}
+
+fn deduplicate_processes(
+    processes: impl IntoIterator<Item = (ProcessSerialNumber, Option<Pid>)>,
+) -> Vec<(ProcessSerialNumber, Option<Pid>)> {
+    let mut indices: HashMap<ProcessSerialNumber, usize> = HashMap::new();
+    let mut unique: Vec<(ProcessSerialNumber, Option<Pid>)> = Vec::new();
+
+    for (psn, pid_hint) in processes {
+        if let Some(&index) = indices.get(&psn) {
+            if unique[index].1.is_none() {
+                unique[index].1 = pid_hint;
+            }
+        } else {
+            indices.insert(psn, unique.len());
+            unique.push((psn, pid_hint));
+        }
+    }
+
+    unique
 }
 
 /*
@@ -308,7 +336,7 @@ impl ProcessHandler {
     ///
     /// - Registers a Carbon event handler, which will be unregistered when `cleanup` is dropped.
     /// - Iterates through existing processes and dispatches `ApplicationLaunched` events for them.
-    pub(super) fn start(mut self) -> Result<PinnedProcessHandler> {
+    pub(super) fn start(self) -> Result<PinnedProcessHandler> {
         const APPL_CLASS: &str = "appl";
         const PROCESS_EVENT_LAUNCHED: u32 = 5;
         const PROCESS_EVENT_TERMINATED: u32 = 6;
@@ -316,13 +344,33 @@ impl ProcessHandler {
 
         info!("Registering process_handler");
 
-        // Fake launch the existing processes.
+        // Fake launch the existing processes. Carbon's process list can omit
+        // already-running Electron applications, so supplement it with the
+        // public NSWorkspace list and resolve those PIDs back to PSNs. Keep the
+        // Carbon event handler for lifecycle events after startup.
+        let mut initial_processes = Vec::new();
         let mut psn = ProcessSerialNumber::default();
         while unsafe { GetNextProcess(&raw mut psn) }
             .to_result(function_name!())
             .is_ok()
         {
-            self.process_handler(psn, ProcessEventApp::Launched);
+            initial_processes.push((psn, None));
+        }
+
+        for app in NSWorkspace::sharedWorkspace().runningApplications() {
+            let pid = app.processIdentifier();
+            let mut psn = ProcessSerialNumber::default();
+            if pid != 0 && unsafe { GetProcessForPID(pid, &raw mut psn) } == 0 {
+                initial_processes.push((psn, Some(pid)));
+            }
+        }
+
+        for (psn, pid_hint) in deduplicate_processes(initial_processes) {
+            self.events.send(Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer: self.observer.clone(),
+            })?;
         }
 
         let target = unsafe { GetApplicationEventTarget() };
