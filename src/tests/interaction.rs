@@ -8,7 +8,7 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
+    ActiveWorkspaceMarker, Bounds, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
     layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, Scrolling, SpawnWindowTrigger};
@@ -844,6 +844,77 @@ fn test_external_focus_reactivates_hidden_virtual_strip_when_marker_is_stale() {
             assert_focused!(world, 0);
         })
         .run(commands);
+}
+
+#[test]
+fn test_external_focus_reactivates_hidden_virtual_strip_with_auto_center() {
+    for virtual_workspace_animations in [false, true] {
+        let config: Config = (
+            MainOptions {
+                auto_center: Some(true),
+                animation_speed: Some(10000.0),
+                virtual_workspace_animations: Some(virtual_workspace_animations),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+
+        let commands = vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+
+        TestHarness::new()
+            .with_config(config)
+            .with_windows(2)
+            .on_iteration(1, |world, _state| {
+                let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+                let active = query
+                    .iter(world)
+                    .find_map(|(strip, active)| active.then_some(strip.virtual_index))
+                    .expect("an active virtual strip");
+                assert_eq!(active, 0);
+                assert_focused!(world, 1);
+            })
+            .on_iteration(2, |_world, state| state.focus_window(0))
+            .on_iteration(4, move |world, _state| {
+                let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+                let active = query
+                    .iter(world)
+                    .find_map(|(strip, active)| active.then_some(strip.virtual_index))
+                    .expect("an active virtual strip");
+                assert_eq!(active, 1);
+
+                let entity = find_window_entity(0, world);
+                let position = world.get::<Position>(entity).expect("window position");
+                let bounds = world.get::<Bounds>(entity).expect("window bounds");
+                assert_eq!(
+                    position.y, TEST_MENUBAR_HEIGHT,
+                    "workspace animations: {virtual_workspace_animations}"
+                );
+                assert_eq!(
+                    position.x + bounds.x / 2,
+                    TEST_DISPLAY_WIDTH / 2,
+                    "workspace animations: {virtual_workspace_animations}"
+                );
+                assert_focused!(world, 0);
+            })
+            .run(commands);
+    }
 }
 
 // When the focused window leaves the active strip (e.g. it just became
