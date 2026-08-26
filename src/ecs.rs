@@ -68,6 +68,8 @@ pub(crate) use triggers::apply_config_side_effects;
 pub fn register_systems(app: &mut bevy::app::App) {
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
 
+    app.init_resource::<systems::AnimationCadence>();
+
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
             .iter()
@@ -158,14 +160,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
         PostUpdate,
         (
             (
+                systems::prepare_animation_frame,
+                systems::animate_resize_entities,
                 systems::animate_entities,
+                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
                 systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
                 systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
-            (
-                systems::animate_resize_entities,
-                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
             (

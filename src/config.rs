@@ -383,14 +383,13 @@ impl Config {
     // Exponential ease-out decay rate (per second) consumed by the animation
     // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
     // values collapse to an instant snap.
-    // Suggested range: 8..20 for a fluid feel. Unset = instant (no animation),
+    // Suggested range: 12..30 for a fluid feel. The default is deliberately at
+    // the snappy end; very large values still collapse to an instant snap.
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed
-            // If unset, set it to something high, so the move happens immediately,
-            // effectively disabling animation.
-            .unwrap_or(1_000_000.0)
-            .max(0.0)
+            .filter(|speed| speed.is_finite() && *speed > 0.0)
+            .unwrap_or(28.0)
     }
 
     /// Finds a keybinding matching the given `keycode` and `modifier` mask.
@@ -1064,7 +1063,7 @@ pub struct MainOptions {
     /// A list of preset column widths (as ratios) used for resizing windows.
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
-    /// The animation speed for window movements in pixels per second.
+    /// Exponential animation decay rate per second. Higher values settle faster.
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
@@ -2102,6 +2101,16 @@ fn test_config_defaults() {
     assert_eq!(config.border_radius(), BorderRadiusOption::Auto);
     assert_eq!(config.menubar_height(), None);
     assert!(!config.snap_to_window());
+    assert_eq!(config.animation_speed(), 28.0);
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_non_positive_animation_speed_uses_snappy_default() {
+    let config = Config::try_from("[options]\nanimation_speed = 0\n\n[bindings]\n")
+        .expect("config should parse");
+
+    assert_eq!(config.animation_speed(), 28.0);
 }
 
 #[test]

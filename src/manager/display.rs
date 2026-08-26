@@ -25,6 +25,12 @@ pub struct Display {
     /// Optional config override for the menubar height.
     menubar_height_override: Option<i32>,
     notch_height: i32,
+    /// Maximum refresh rate reported by `AppKit` for this display.
+    ///
+    /// Animation cadence uses this as a pacing hint. The default keeps mocks and
+    /// platforms where `AppKit` cannot provide a value on a conventional 60 Hz
+    /// cadence.
+    refresh_rate_hz: u32,
 }
 
 impl Display {
@@ -47,6 +53,7 @@ impl Display {
             menubar_height,
             menubar_height_override: None,
             notch_height: 0,
+            refresh_rate_hz: 60,
         }
     }
 
@@ -140,6 +147,17 @@ impl Display {
         self.notch_height = height;
     }
 
+    pub fn refresh_rate_hz(&self) -> u32 {
+        self.refresh_rate_hz
+    }
+
+    pub fn set_refresh_rate_hz(&mut self, refresh_rate_hz: u32) {
+        // AppKit should only report sensible positive values, but treating this
+        // as untrusted input keeps a bad display report from either busy-looping
+        // frame writes or making animation visibly stall.
+        self.refresh_rate_hz = refresh_rate_hz.clamp(30, 240);
+    }
+
     #[instrument(level = Level::TRACE, skip_all, ret)]
     pub fn actual_display_bounds(&self, dock: Option<&DockPosition>, config: &Config) -> IRect {
         let (pad_top, pad_right, pad_bottom, pad_left) = config.edge_padding();
@@ -158,5 +176,23 @@ impl Display {
             _ => (),
         }
         viewport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::IRect;
+
+    use super::Display;
+
+    #[test]
+    fn refresh_rate_hint_is_bounded() {
+        let mut display = Display::new(1, IRect::new(0, 0, 1920, 1080), 24);
+
+        display.set_refresh_rate_hz(0);
+        assert_eq!(display.refresh_rate_hz(), 30);
+
+        display.set_refresh_rate_hz(u32::MAX);
+        assert_eq!(display.refresh_rate_hz(), 240);
     }
 }
