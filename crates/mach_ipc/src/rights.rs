@@ -5,12 +5,29 @@
 //! space. These types make that reference counting an ownership question the
 //! compiler enforces.
 
-use mach2::kern_return::KERN_SUCCESS;
+use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_port::{mach_port_deallocate, mach_port_mod_refs};
-use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_t};
+use mach2::mach_types::ipc_space_t;
+use mach2::message::{MACH_MSG_TYPE_MAKE_SEND_ONCE, mach_msg_id_t, mach_msg_type_name_t};
+use mach2::notify::MACH_NOTIFY_NO_SENDERS;
+use mach2::port::{
+    MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_mscount_t, mach_port_name_t, mach_port_t,
+};
 use mach2::traps::mach_task_self;
 
 use crate::error::{Error, Result};
+
+unsafe extern "C" {
+    fn mach_port_request_notification(
+        task: ipc_space_t,
+        name: mach_port_name_t,
+        msgid: mach_msg_id_t,
+        sync: mach_port_mscount_t,
+        notify: mach_port_t,
+        notify_poly: mach_msg_type_name_t,
+        previous: *mut mach_port_t,
+    ) -> kern_return_t;
+}
 
 /// The receive end of a port: the side that gets messages.
 ///
@@ -75,6 +92,43 @@ impl RecvRight {
         } else {
             Err(Error::Mach(rc))
         }
+    }
+
+    /// Asks the kernel to send this port a notification once all send rights
+    /// created so far have disappeared.
+    ///
+    /// `sync` is the make-send count the caller has already handed to its peer.
+    /// Registering after that handoff closes the race where the peer exits
+    /// before this request: when there are already no senders, the kernel sends
+    /// the notification immediately.
+    pub(crate) fn notify_when_no_senders(&self, sync: mach_port_mscount_t) -> Result<()> {
+        let mut previous = MACH_PORT_NULL;
+        // SAFETY: `self.0` names a receive right owned by this task. Asking the
+        // kernel to manufacture the send-once notification right from that same
+        // receive right is the disposition required by this API.
+        let rc = unsafe {
+            mach_port_request_notification(
+                mach_task_self(),
+                self.0,
+                MACH_NOTIFY_NO_SENDERS,
+                sync,
+                self.0,
+                MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                &raw mut previous,
+            )
+        };
+        if rc != KERN_SUCCESS {
+            return Err(Error::Mach(rc));
+        }
+
+        if previous != MACH_PORT_NULL {
+            // SAFETY: a successful replacement transfers the old send-once
+            // right to this task. The fresh subscription ports used by Paneru
+            // never have one, but release it correctly if that invariant ever
+            // changes.
+            drop(unsafe { SendOnceRight::from_raw(previous) });
+        }
+        Ok(())
     }
 
     /// The underlying port name, for the few places that must speak to

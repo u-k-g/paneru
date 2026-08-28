@@ -261,6 +261,30 @@ fn a_dead_subscriber_is_reported_as_gone() {
     }
 }
 
+/// A subscription must also terminate when the process pushing events exits.
+/// Without a no-senders notification the receiving port stays valid but empty,
+/// leaving integrations blocked forever on a dead daemon.
+#[test]
+fn a_dead_subscription_source_is_reported_as_gone() {
+    let name = service_name("source-death");
+    let receiver = Receiver::<Request>::bind(&name).expect("bind");
+
+    let client_name = name.clone();
+    let client = std::thread::spawn(move || {
+        let sender = connect::<Request>(&client_name);
+        let events = block_on(sender.subscribe::<Event>(&Request::Subscribe)).expect("subscribe");
+        block_on(events.recv())
+    });
+
+    let delivery = block_on(receiver.recv()).expect("receive");
+    drop(delivery.subscriber.expect("a subscriber channel"));
+
+    match client.join().expect("the client thread") {
+        Err(Error::PeerGone) => {}
+        other => panic!("expected PeerGone, got {other:?}"),
+    }
+}
+
 /// A mistyped value is one bad client, not a dead service — it must be
 /// reported without poisoning the receiver.
 #[test]

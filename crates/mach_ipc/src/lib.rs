@@ -338,6 +338,10 @@ pub trait SendPort: sealed::Outbound {
             let payload = encode(value)?;
             let port = RecvRight::alloc()?;
             send_async(self.send_right(), &payload, Some(&port)).await?;
+            // `carrying` manufactured exactly one send right. Requesting the
+            // notification after the send makes peer loss race-free: if the
+            // receiver already dropped it, the notification is immediate.
+            port.notify_when_no_senders(1)?;
             Ok(Receiver::from_port(port))
         }
     }
@@ -371,9 +375,9 @@ pub trait SendPort: sealed::Outbound {
         &self,
         value: &Self::Message,
     ) -> Result<Receiver<E>> {
-        Ok(Receiver::from_port(
-            self.request(value, Carried::AsChannel)?,
-        ))
+        let port = self.request(value, Carried::AsChannel)?;
+        port.notify_when_no_senders(1)?;
+        Ok(Receiver::from_port(port))
     }
 
     /// Everything a request does except wait for the answer: encode, allocate

@@ -21,6 +21,7 @@ use mach2::message::{
     mach_msg, mach_msg_body_t, mach_msg_header_t, mach_msg_ool_descriptor_t,
     mach_msg_port_descriptor_t, mach_msg_size_t,
 };
+use mach2::notify::{MACH_NOTIFY_NO_SENDERS, MACH_NOTIFY_SEND_ONCE};
 use mach2::port::{MACH_PORT_NULL, mach_port_t};
 use mach2::traps::mach_task_self;
 use mach2::vm::mach_vm_deallocate;
@@ -318,6 +319,17 @@ fn parse(bytes: &[u8]) -> Result<Incoming> {
     // SAFETY: `bytes` is the 8-aligned receive buffer and is longer than a
     // header, which `mach_msg` has just filled in.
     let header = unsafe { std::ptr::read(bytes.as_ptr().cast::<mach_msg_header_t>()) };
+
+    // Kernel-generated notifications are deliberately simple messages, not
+    // Paneru's descriptor-based wire format. A no-senders notification closes
+    // a subscription after its daemon disappears; send-once is the equivalent
+    // for an unanswered call whose server exited.
+    if matches!(
+        header.msgh_id,
+        MACH_NOTIFY_NO_SENDERS | MACH_NOTIFY_SEND_ONCE
+    ) {
+        return Err(Error::PeerGone);
+    }
 
     // The sender's local port arrives as our *remote* port — the fields swap on
     // receive, because the reply destination is now the far end from our side.
