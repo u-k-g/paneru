@@ -2488,11 +2488,18 @@ mod lua_setup_tests {
         let config = config_from_source(
             r"return {
                 default_workspaces = 3,
+                jump_picker = { enabled = true },
                 options = { sliver_width = 9, focus_follows_mouse = false },
                 padding = { top = 10, bottom = 4 },
             }",
         );
         assert_eq!(config.default_workspaces(), 3);
+        assert!(config.jump_picker_enabled());
+        assert_eq!(
+            config.jump_picker_binding(),
+            Some((48, Modifiers::CMD)),
+            "Lua setup should resolve the default Cmd-Tab chord"
+        );
         assert_eq!(config.sliver_width(), 9);
         assert!(!config.focus_follows_mouse());
         let (top, _right, bottom, _left) = config.edge_padding();
