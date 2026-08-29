@@ -3,13 +3,15 @@ use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation, NSFloatingWindowLevel,
-    NSFont, NSGraphicsContext, NSParagraphStyle, NSScreen, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSFont, NSGraphicsContext, NSImage, NSParagraphStyle, NSRunningApplication, NSScreen, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
+
+use crate::platform::Pid;
 
 #[derive(Clone, PartialEq)]
 pub struct BorderParams {
@@ -494,12 +496,21 @@ pub struct OverviewItem {
     pub frame: NSRect,
     pub mark: String,
     pub focused: bool,
+    pub pid: Pid,
+}
+
+#[derive(Clone, Debug)]
+struct OverviewDrawableItem {
+    frame: NSRect,
+    mark: String,
+    focused: bool,
+    icon: Option<Retained<NSImage>>,
 }
 
 #[derive(Debug)]
 struct OverviewViewIvars {
     rows: Vec<OverviewRow>,
-    items: Vec<OverviewItem>,
+    items: Vec<OverviewDrawableItem>,
 }
 
 define_class!(
@@ -523,28 +534,37 @@ define_class!(
                     row.frame, 14.0, 14.0,
                 );
                 path.fill();
-                draw_overview_text(&row.label, row.frame.origin.x + 12.0, row.frame.origin.y + row.frame.size.height - 26.0, 13.0, false);
+                draw_overview_text(
+                    &row.label,
+                    row.frame.origin.x + 12.0,
+                    row.frame.origin.y + row.frame.size.height - 26.0,
+                    row.frame.size.width - 24.0,
+                    13.0,
+                    false,
+                );
             }
 
             for item in &self.ivars().items {
+                let icon_frame = overview_icon_frame(item.frame);
                 if item.focused {
                     NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.48, 0.78, 0.72).setFill();
-                } else {
-                    NSColor::colorWithSRGBRed_green_blue_alpha(0.25, 0.27, 0.33, 0.94).setFill();
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                        inset_rect(icon_frame, -5.0), 16.0, 16.0,
+                    )
+                    .fill();
                 }
-                let card = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                    item.frame, 9.0, 9.0,
-                );
-                card.fill();
-                NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, if item.focused { 0.9 } else { 0.24 }).setStroke();
-                card.setLineWidth(if item.focused { 2.0 } else { 1.0 });
-                card.stroke();
+                if let Some(icon) = &item.icon {
+                    icon.drawInRect(icon_frame);
+                }
 
-                let badge_size = 34.0_f64.min(item.frame.size.width * 0.55).min(item.frame.size.height * 0.55).max(18.0);
+                let badge_size = (icon_frame.size.width * 0.34)
+                    .clamp(12.0, 30.0)
+                    .min(icon_frame.size.width);
+                let mark_size = (badge_size * 0.52).clamp(8.0, 15.0);
                 let badge = NSRect::new(
                     NSPoint::new(
-                        item.frame.origin.x + (item.frame.size.width - badge_size) / 2.0,
-                        item.frame.origin.y + (item.frame.size.height - badge_size) / 2.0,
+                        icon_frame.origin.x + icon_frame.size.width - badge_size * 0.82,
+                        icon_frame.origin.y,
                     ),
                     NSSize::new(badge_size, badge_size),
                 );
@@ -555,8 +575,9 @@ define_class!(
                 draw_overview_text(
                     &item.mark,
                     badge.origin.x,
-                    badge.origin.y + (badge_size - 17.0) / 2.0,
-                    15.0,
+                    badge.origin.y + (badge_size - mark_size - 2.0) / 2.0,
+                    badge_size,
+                    mark_size,
                     true,
                 );
             }
@@ -564,7 +585,29 @@ define_class!(
     }
 );
 
-fn draw_overview_text(text: &str, x: f64, y: f64, size: f64, centered: bool) {
+fn overview_icon_frame(frame: NSRect) -> NSRect {
+    let available = frame.size.width.min(frame.size.height).max(8.0);
+    let extent = (available * 0.72).clamp(12.0, 112.0).min(available);
+    NSRect::new(
+        NSPoint::new(
+            frame.origin.x + (frame.size.width - extent) / 2.0,
+            frame.origin.y + (frame.size.height - extent) / 2.0,
+        ),
+        NSSize::new(extent, extent),
+    )
+}
+
+fn inset_rect(rect: NSRect, inset: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(rect.origin.x + inset, rect.origin.y + inset),
+        NSSize::new(
+            rect.size.width - inset * 2.0,
+            rect.size.height - inset * 2.0,
+        ),
+    )
+}
+
+fn draw_overview_text(text: &str, x: f64, y: f64, width: f64, size: f64, centered: bool) {
     let font = NSFont::boldSystemFontOfSize(size);
     let color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.96);
     let paragraph_style = unsafe {
@@ -587,7 +630,6 @@ fn draw_overview_text(text: &str, x: f64, y: f64, size: f64, centered: bool) {
     let styled_text: Retained<NSAttributedString> = unsafe {
         msg_send![NSAttributedString::alloc(), initWithString: &*value, attributes: &*attributes]
     };
-    let width = if centered { 34.0 } else { 240.0 };
     unsafe {
         let _: () = msg_send![&styled_text, drawInRect: NSRect::new(NSPoint::new(x, y), NSSize::new(width, size + 4.0))];
     }
@@ -600,6 +642,24 @@ impl OverviewView {
         rows: Vec<OverviewRow>,
         items: Vec<OverviewItem>,
     ) -> Retained<Self> {
+        let fallback_name = NSString::from_str("app");
+        let fallback_description = NSString::from_str("Application");
+        let items = items
+            .into_iter()
+            .map(|item| OverviewDrawableItem {
+                frame: item.frame,
+                mark: item.mark,
+                focused: item.focused,
+                icon: NSRunningApplication::runningApplicationWithProcessIdentifier(item.pid)
+                    .and_then(|application| application.icon())
+                    .or_else(|| {
+                        NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                            &fallback_name,
+                            Some(&fallback_description),
+                        )
+                    }),
+            })
+            .collect();
         let this = Self::alloc(mtm).set_ivars(OverviewViewIvars { rows, items });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -714,5 +774,26 @@ impl FlashMessageManager {
         if let Some(window) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
         }
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::overview_icon_frame;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn app_icon_is_centered_and_bounded_inside_its_spatial_slot() {
+        let slot = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(200.0, 100.0));
+        let icon = overview_icon_frame(slot);
+
+        assert_eq!(icon.size, NSSize::new(72.0, 72.0));
+        assert_eq!(icon.origin, NSPoint::new(74.0, 34.0));
+
+        let large = overview_icon_frame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(500.0, 500.0),
+        ));
+        assert_eq!(large.size, NSSize::new(112.0, 112.0));
     }
 }

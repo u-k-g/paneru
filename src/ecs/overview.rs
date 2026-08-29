@@ -16,7 +16,7 @@ use crate::ecs::{
     SpawnCommandsExt,
 };
 use crate::events::Event;
-use crate::manager::{Display, Window};
+use crate::manager::{Application, Display, Window};
 use crate::overlay::{OverviewItem, OverviewManager, OverviewRow};
 use crate::platform::input::{activate_jump_picker, deactivate_jump_picker};
 
@@ -45,7 +45,8 @@ fn handle_overview(
     mut state: ResMut<OverviewState>,
     strips: Query<(&LayoutStrip, &ChildOf, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
-    windows: Query<(&LayoutPosition, &Bounds, Has<FocusedMarker>), With<Window>>,
+    windows: Query<(&LayoutPosition, &Bounds, Has<FocusedMarker>, &ChildOf), With<Window>>,
+    applications: Query<&Application>,
     mut overview: Option<NonSendMut<OverviewManager>>,
     mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
@@ -137,18 +138,23 @@ fn handle_overview(
                 windows
                     .get(entity)
                     .ok()
-                    .map(|(position, bounds, focused)| (entity, position.0, bounds.0, focused))
+                    .map(|(position, bounds, focused, child)| {
+                        let pid = applications
+                            .get(child.parent())
+                            .map_or(0, |application| application.pid());
+                        (entity, position.0, bounds.0, focused, pid)
+                    })
             })
             .collect::<Vec<_>>();
         let logical_w = members
             .iter()
-            .map(|(_, position, size, _)| position.x + size.x)
+            .map(|(_, position, size, _, _)| position.x + size.x)
             .max()
             .unwrap_or(1)
             .max(1);
         let logical_h = members
             .iter()
-            .map(|(_, position, size, _)| position.y + size.y)
+            .map(|(_, position, size, _, _)| position.y + size.y)
             .max()
             .unwrap_or(1)
             .max(1);
@@ -162,7 +168,7 @@ fn handle_overview(
         let scale_x = content.size.width / f64::from(logical_w);
         let scale_y = content.size.height / f64::from(logical_h);
 
-        for (entity, position, size, focused) in &members {
+        for (entity, position, size, focused, pid) in &members {
             if targets.len() >= keys.len() {
                 break;
             }
@@ -182,6 +188,7 @@ fn handle_overview(
                 frame: item_frame,
                 mark: keys[targets.len()].0.to_string(),
                 focused: *focused,
+                pid: *pid,
             });
             targets.push(*entity);
         }
