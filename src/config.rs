@@ -2140,6 +2140,30 @@ fn test_parse_restart_command() {
 }
 
 #[test]
+fn jump_picker_is_disabled_by_default_and_uses_cmd_tab_when_enabled() {
+    let defaults = Config::defaults().expect("default config");
+    assert!(!defaults.jump_picker_enabled());
+    assert!(defaults.jump_picker_binding().is_none());
+
+    let input = "[jump_picker]\nenabled = true\n";
+    let config = Config {
+        inner: Arc::new(ArcSwap::from_pointee(
+            InnerConfig::parse_config_with_virtual_keys(input, &test_virtual_keymap())
+                .expect("jump picker config"),
+        )),
+    };
+    assert!(config.jump_picker_enabled());
+    let (code, modifiers) = config.jump_picker_binding().expect("default jump binding");
+    assert_eq!(code, 48);
+    assert_eq!(modifiers, Modifiers::CMD);
+    assert!(matches!(
+        config.find_keybind(code, Modifiers::LCMD),
+        Some(Command::Jump)
+    ));
+    assert!(!config.jump_picker_keys().is_empty());
+}
+
+#[test]
 fn test_parse_absolute_virtual_workspace_commands() {
     assert!(matches!(
         parse_command(&["window", "virtualnum", "3"]).unwrap(),

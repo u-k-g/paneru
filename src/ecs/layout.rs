@@ -409,6 +409,7 @@ impl LayoutStrip {
 
     pub(crate) fn append_strip(&mut self, other: &mut Self) {
         self.columns.append(&mut other.columns);
+        self.slot_sizes.extend(other.slot_sizes.drain());
     }
 
     pub fn append_tab_group(&mut self, entities: &[Entity]) {
@@ -1758,7 +1759,7 @@ mod tests {
             Column::Stack(items) => {
                 assert_eq!(items.len(), 2);
                 match &items[0] {
-                    StackItem::Tabs(tabs) => assert_eq!(tabs, &vec![e4, e1]),
+                    StackItem::Tabs(tabs) => assert_eq!(tabs, &vec![e1, e4]),
                     StackItem::Single(_) => panic!("Expected Tabs in stack"),
                 }
             }
@@ -1930,6 +1931,49 @@ mod tests {
         for i in 0..out.len() - 1 {
             assert_eq!(out[i].1.max.x, out[i + 1].1.min.x);
         }
+    }
+
+    #[test]
+    fn inserting_a_window_uses_committed_sizes_for_existing_columns() {
+        let mut world = World::new();
+        let existing = world.spawn_empty().id();
+        let inserted = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(existing);
+        strip.remember_slot_size(existing, Size::new(320, 600));
+        strip.insert_at(0, inserted);
+
+        let frames = |entity| {
+            if entity == existing {
+                // Simulate an AppKit frame sampled halfway through unrelated motion.
+                Some(IRect::new(900, 0, 1700, 300))
+            } else {
+                Some(IRect::new(0, 0, 240, 600))
+            }
+        };
+        let positions = strip.relative_positions(600, &frames).collect::<Vec<_>>();
+        let existing_frame = positions
+            .iter()
+            .find_map(|(entity, frame)| (*entity == existing).then_some(*frame))
+            .expect("existing frame");
+
+        assert_eq!(existing_frame.size(), Size::new(320, 600));
+    }
+
+    #[test]
+    fn insertion_to_the_left_records_the_existing_visual_anchor() {
+        let mut world = World::new();
+        let left = world.spawn_empty().id();
+        let focused = world.spawn_empty().id();
+        let inserted = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+        strip.append(left);
+        strip.append(focused);
+
+        strip.insert_at_preserving(1, inserted, Some(focused));
+
+        assert_eq!(strip.pending_anchor, Some(focused));
+        assert_eq!(strip.all_windows(), vec![left, inserted, focused]);
     }
 
     #[test]
