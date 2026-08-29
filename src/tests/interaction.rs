@@ -320,8 +320,15 @@ fn test_scrolling() {
         Event::Command {
             command: Command::PrintState,
         },
+        // A single event's delta is a fraction of the viewport travelled in
+        // one frame, and the gesture velocity it produces is `delta / dt`.
+        // 0.04 over a 20ms frame is two viewport widths per second — a brisk
+        // but ordinary swipe, which is the regime this test is about. An order
+        // of magnitude more and the strip simply flies into its clamp bound
+        // and every window parks off-screen at the sliver, which asserts
+        // nothing about scrolling.
         Event::Swipe {
-            delta: 0.2,
+            delta: 0.04,
             fingers: 3,
         },
         Event::Command {
@@ -346,10 +353,12 @@ fn test_scrolling() {
             assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
+        // The strip has come to rest mid-scroll: still one contiguous run of
+        // 400px columns, none of them parked at an edge sliver.
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -352, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 48, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 448, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -186, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 214, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 614, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -540,6 +549,7 @@ fn test_snap_to_window_centers_nearest_window_after_partial_swipe() {
 #[test]
 fn test_snap_to_window_timeout_cannot_leave_strip_between_windows() {
     let mut h = snap_to_window_harness();
+    h.advance(Duration::from_millis(200));
 
     let world = h.app.world_mut();
     let strip_entity = world
@@ -1341,9 +1351,14 @@ fn test_mid_strip_insertion_preserves_window_x() {
         Event::Command {
             command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
         },
-        // Scroll VW0 slightly to randomize the positions.
+        // Scroll VW0 slightly to randomize the positions. "Slightly" is the
+        // point: a single event's delta is viewport-fractions travelled in one
+        // frame, so the velocity it yields is `delta / dt`. Anything much
+        // larger throws the strip into its clamp bound, which parks the
+        // focused window at an edge sliver and makes the offset compared below
+        // that fixed sliver rather than a real layout position.
         Event::Swipe {
-            delta: 0.3,
+            delta: 0.06,
             fingers: 3,
         },
         // Used as a noop to let the scroll settle.
@@ -1353,7 +1368,7 @@ fn test_mid_strip_insertion_preserves_window_x() {
             command: Command::Window(Operation::VirtualNumber(1)),
         },
         Event::Swipe {
-            delta: 0.2,
+            delta: 0.04,
             fingers: 3,
         },
         Event::MenuOpened { window_id: 0 },
@@ -1458,12 +1473,7 @@ fn test_follow_move_brings_appended_window_on_screen() {
         h.app
             .world_mut()
             .write_message::<Event>(Event::Command { command: cmd });
-        for _ in 0..8 {
-            h.app.update();
-            for event in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(event);
-            }
-        }
+        h.advance(Duration::from_millis(800));
     };
 
     // Seed VW1 with three windows (Stay keeps us on VW0), making the
@@ -1682,6 +1692,82 @@ fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
     );
 }
 
+/// Switching virtual workspaces with `virtual_workspace_animations = false`
+/// must switch focus to the focused window of the destination workspace.
+#[test]
+fn test_virtual_workspace_switch_restores_focus_without_animations() {
+    let config: Config = (
+        MainOptions {
+            virtual_workspace_animations: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+
+    let pump_event = |h: &mut TestHarness, ev: Event| {
+        h.app.world_mut().write_message::<Event>(ev);
+        for _ in 0..8 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+    let pump = |h: &mut TestHarness, c: Command| pump_event(h, Event::Command { command: c });
+
+    // Boot: Window 0 is focused on VW0 (workspace_virtual_num = 0).
+    pump(&mut h, Command::PrintState);
+
+    // Move focused window (Window 0) to VW1 with MoveFocus::Stay.
+    pump(
+        &mut h,
+        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+    );
+
+    // Focus on VW0 should have shifted to Window 1.
+    let focused_on_vw0 = {
+        let world = h.app.world_mut();
+        let mut query = world.query_filtered::<&crate::manager::Window, With<FocusedMarker>>();
+        query.iter(world).next().map(|w| w.id())
+    };
+    assert_eq!(
+        focused_on_vw0,
+        Some(1),
+        "focus should remain on VW0 (shifting to Window 1) after MoveFocus::Stay"
+    );
+
+    // Switch to VW1: Window 0 (the window on VW1) should now be focused.
+    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
+
+    let focused_on_vw1 = {
+        let world = h.app.world_mut();
+        let mut query = world.query_filtered::<&crate::manager::Window, With<FocusedMarker>>();
+        query.iter(world).next().map(|w| w.id())
+    };
+    assert_eq!(
+        focused_on_vw1,
+        Some(0),
+        "focus should switch to Window 0 when activating VW1 with animations disabled"
+    );
+
+    // Switch back to VW0: Window 1 (the window on VW0) should be focused again.
+    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
+
+    let focused_back_on_vw0 = {
+        let world = h.app.world_mut();
+        let mut query = world.query_filtered::<&crate::manager::Window, With<FocusedMarker>>();
+        query.iter(world).next().map(|w| w.id())
+    };
+    assert_eq!(
+        focused_back_on_vw0,
+        Some(1),
+        "focus should switch back to Window 1 when activating VW0 with animations disabled"
+    );
+}
+
 /// When a strip is mid-animation (has a `RepositionMarker`) at the moment the
 /// user switches to another virtual workspace, the animation must stop
 /// immediately. Previously the `RepositionMarker` was left on the hidden strip
@@ -1822,14 +1908,12 @@ fn test_virtual_workspace_switch_focus_echo_does_not_recenter_strip() {
 
     let mut h = TestHarness::new().with_config(config).with_windows(6);
 
-    let settle = |h: &mut TestHarness| {
-        for _ in 0..10 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
+    // A second of simulated time, which is what the auto-centre animation
+    // needs to reach its target. Expressed as a duration rather than a frame
+    // count so it stays a second whatever the harness tick is: a settle that
+    // stops short leaves an animation still in flight, and the displacement
+    // below then gets overwritten by the tail of it.
+    let settle = |h: &mut TestHarness| h.advance(Duration::from_secs(1));
     let pump = |h: &mut TestHarness, c: Command| {
         h.app
             .world_mut()
