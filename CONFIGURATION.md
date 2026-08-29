@@ -47,8 +47,8 @@ General behavior settings for the window manager.
 
 The Overview is a bird's-eye map of the strip topology, including native
 macOS Spaces and Paneru virtual-workspace rows. Windows retain their spatial
-column, stack, and native-tab relationships. Press the configured binding,
-then the mark drawn on a window to focus it with the normal strip animation.
+column and stack relationships. Press the configured binding, then the mark
+drawn on a window to focus it with the normal strip animation.
 
 It is disabled by default. When enabled, the binding defaults to Cmd-Tab.
 

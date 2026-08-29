@@ -162,34 +162,19 @@ fn handle_overview(
         let scale_x = content.size.width / f64::from(logical_w);
         let scale_y = content.size.height / f64::from(logical_h);
 
-        for (member_index, (entity, position, size, focused)) in members.iter().enumerate() {
+        for (entity, position, size, focused) in &members {
             if targets.len() >= keys.len() {
                 break;
             }
-            let duplicate_count = members
-                .iter()
-                .filter(|(_, other_position, other_size, _)| {
-                    other_position == position && other_size == size
-                })
-                .count();
-            let duplicate_index = members[..member_index]
-                .iter()
-                .filter(|(_, other_position, other_size, _)| {
-                    other_position == position && other_size == size
-                })
-                .count();
-            let base_x = content.origin.x + f64::from(position.x) * scale_x;
-            let base_w = (f64::from(size.x) * scale_x).max(8.0);
-            let split_w = base_w / duplicate_count as f64;
             let item_frame = NSRect::new(
                 NSPoint::new(
-                    base_x + duplicate_index as f64 * split_w + 2.0,
+                    content.origin.x + f64::from(position.x) * scale_x + 2.0,
                     content.origin.y + content.size.height
                         - f64::from(position.y + size.y) * scale_y
                         + 2.0,
                 ),
                 NSSize::new(
-                    (split_w - 4.0).max(5.0),
+                    (f64::from(size.x) * scale_x - 4.0).max(5.0),
                     (f64::from(size.y) * scale_y - 4.0).max(5.0),
                 ),
             );

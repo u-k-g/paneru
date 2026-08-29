@@ -244,6 +244,27 @@ impl Column {
             Column::Tabs(tabs) => tabs.contains(&entity).then_some(0),
         }
     }
+
+    /// Moves the specified entity to the front of stack-local ordering.
+    /// Native tab ordering is stable; the focused tab is tracked by `FocusedMarker`.
+    pub fn move_to_front(&mut self, entity: Entity) {
+        match self {
+            Column::Single(_) | Column::Fullscren(_) => {}
+            Column::Stack(stack) => {
+                if let Some(StackItem::Tabs(tabs)) =
+                    stack.iter_mut().find(|item| item.contains(entity))
+                    && let Some(pos) = tabs.iter().position(|&e| e == entity)
+                {
+                    tabs.swap(0, pos);
+                }
+            }
+            Column::Tabs(tabs) => {
+                if let Some(pos) = tabs.iter().position(|&e| e == entity) {
+                    tabs.swap(0, pos);
+                }
+            }
+        }
+    }
 }
 
 pub enum ColumnWindowIter<'a> {
@@ -373,10 +394,7 @@ impl LayoutStrip {
     /// for real resizes; topology-only changes leave existing entries intact.
     pub fn remember_slot_size(&mut self, entity: Entity, size: Size) {
         if self.contains(entity) && size.x > 0 && size.y > 0 {
-            let siblings = self.tab_group(entity).unwrap_or_else(|| vec![entity]);
-            for sibling in siblings {
-                self.slot_sizes.insert(sibling, size);
-            }
+            self.slot_sizes.insert(entity, size);
         }
     }
 
@@ -450,36 +468,23 @@ impl LayoutStrip {
 
     /// Converts a column containing `leader` to a `Tabs` column and adds `follower`.
     pub fn convert_to_tabs(&mut self, leader: Entity, follower: Entity) -> Result<()> {
-        let leader_index_before = self.index_of(leader)?;
-        let follower_was_left = self
-            .index_of(follower)
-            .is_ok_and(|follower_index| follower_index < leader_index_before);
         self.remove(follower);
         let index = self.index_of(leader)?;
         let column = self.columns.remove(index).unwrap();
         match column {
             Column::Single(id) | Column::Fullscren(id) => {
-                let tabs = if follower_was_left {
-                    vec![follower, id]
-                } else {
-                    vec![id, follower]
-                };
-                self.columns.insert(index, Column::Tabs(tabs));
+                self.columns.insert(index, Column::Tabs(vec![follower, id]));
             }
             Column::Stack(mut items) => {
                 if let Some(pos) = items.iter().position(|item| item.contains(leader)) {
                     match &mut items[pos] {
                         StackItem::Single(id) => {
                             let id = *id;
-                            items[pos] = StackItem::Tabs(if follower_was_left {
-                                vec![follower, id]
-                            } else {
-                                vec![id, follower]
-                            });
+                            items[pos] = StackItem::Tabs(vec![follower, id]);
                         }
                         StackItem::Tabs(tabs) => {
                             if !tabs.contains(&follower) {
-                                tabs.push(follower);
+                                tabs.insert(0, follower);
                             }
                         }
                     }
@@ -488,7 +493,7 @@ impl LayoutStrip {
             }
             Column::Tabs(mut tabs) => {
                 if !tabs.contains(&follower) {
-                    tabs.push(follower);
+                    tabs.insert(0, follower);
                 }
                 self.columns.insert(index, Column::Tabs(tabs));
             }
@@ -1748,14 +1753,14 @@ mod tests {
 
         // Convert e1 (in stack) to tabs with e4
         strip.convert_to_tabs(e1, e4).unwrap();
-        // [Stack([Tabs([e1, e4]), Single(e2)]), Single(e3)]
+        // [Stack([Tabs([e4, e1]), Single(e2)]), Single(e3)]
 
         assert_eq!(strip.len(), 2);
         match strip.get(0).unwrap() {
             Column::Stack(items) => {
                 assert_eq!(items.len(), 2);
                 match &items[0] {
-                    StackItem::Tabs(tabs) => assert_eq!(tabs, &vec![e1, e4]),
+                    StackItem::Tabs(tabs) => assert_eq!(tabs, &vec![e4, e1]),
                     StackItem::Single(_) => panic!("Expected Tabs in stack"),
                 }
             }
@@ -1989,7 +1994,7 @@ mod tests {
         assert_eq!(strip.len(), 2);
         match strip.get(0).unwrap() {
             Column::Tabs(tabs) => {
-                assert_eq!(tabs, vec![e1, e2]);
+                assert_eq!(tabs, vec![e2, e1]);
             }
             _ => panic!("Expected Tabs column"),
         }
@@ -2000,7 +2005,7 @@ mod tests {
         assert_eq!(strip.len(), 2);
         match strip.get(0).unwrap() {
             Column::Tabs(tabs) => {
-                assert_eq!(tabs, vec![e1, e2, e4]);
+                assert_eq!(tabs, vec![e4, e2, e1]);
             }
             _ => panic!("Expected Tabs column"),
         }
@@ -2024,7 +2029,7 @@ mod tests {
         strip.remove(e2);
         assert_eq!(strip.len(), 1);
         match strip.get(0).unwrap() {
-            Column::Tabs(tabs) => assert_eq!(tabs, vec![e1, e3]),
+            Column::Tabs(tabs) => assert_eq!(tabs, vec![e3, e1]),
             _ => panic!(),
         }
 
@@ -2050,8 +2055,8 @@ mod tests {
         strip.convert_to_tabs(e1, e2).unwrap();
         strip.append(e3);
 
-        assert_eq!(strip.tab_group(e1), Some(vec![e1, e2]));
-        assert_eq!(strip.tab_group(e2), Some(vec![e1, e2]));
+        assert_eq!(strip.tab_group(e1), Some(vec![e2, e1]));
+        assert_eq!(strip.tab_group(e2), Some(vec![e2, e1]));
         assert_eq!(strip.tab_group(e3), None);
     }
 
@@ -2088,6 +2093,10 @@ mod tests {
         let mut strip = LayoutStrip::default();
         strip.append(e1);
         strip.convert_to_tabs(e1, e2).unwrap();
+        strip
+            .get_column_mut(0)
+            .expect("tab column")
+            .move_to_front(e2);
         let get_window_frame = |entity| {
             if entity == e1 {
                 Some(IRect::new(0, 0, 300, 600))
@@ -2127,7 +2136,7 @@ mod tests {
 
         assert_eq!(strip.len(), 1);
         match strip.get(0).unwrap() {
-            Column::Tabs(tabs) => assert_eq!(tabs, vec![e1, e2]),
+            Column::Tabs(tabs) => assert_eq!(tabs, vec![e2, e1]),
             _ => panic!(),
         }
     }
@@ -2157,7 +2166,7 @@ mod tests {
             "follower must not remain in its own column after being tabbed onto leader",
         );
         match strip.get(0).unwrap() {
-            Column::Tabs(tabs) => assert_eq!(tabs, vec![leader, follower]),
+            Column::Tabs(tabs) => assert_eq!(tabs, vec![follower, leader]),
             other => panic!("expected Tabs column, got {other:?}"),
         }
     }

@@ -44,8 +44,8 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   navigation of the window pane.
 - **Native macOS tabs support:** Applications like Ghostty use these, so
   Paneru manages them on the layout strip like other windows.
-- **Spatial Overview:** A bird's-eye map keeps windows in strip, stack, tab,
-  native Space, and virtual-workspace order. Enable it to use Cmd-Tab plus a
+- **Spatial Overview:** A bird's-eye map keeps windows in strip, stack, native
+  Space, and virtual-workspace order. Enable it to use Cmd-Tab plus a
   displayed mark as a spatial jump instead of a flat application list.
 - **Optimal for Large Displays:** Standard tiling window managers can be
   suboptimal for large displays, often resulting in either huge maximized
