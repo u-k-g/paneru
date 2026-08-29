@@ -26,12 +26,13 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    LayoutPosition, LowPowerMode, MissionControlActive, Position, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
