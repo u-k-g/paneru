@@ -481,6 +481,170 @@ pub struct FlashMessageManager {
     window: Option<Retained<NSWindow>>,
 }
 
+// ── Spatial Overview / jump map ─────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct OverviewRow {
+    pub frame: NSRect,
+    pub label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct OverviewItem {
+    pub frame: NSRect,
+    pub mark: String,
+    pub focused: bool,
+}
+
+#[derive(Debug)]
+struct OverviewViewIvars {
+    rows: Vec<OverviewRow>,
+    items: Vec<OverviewItem>,
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "PaneruOverviewView"]
+    #[ivars = OverviewViewIvars]
+    #[derive(Debug)]
+    struct OverviewView;
+
+    impl OverviewView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty_rect: NSRect) {
+            let bounds = self.bounds();
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.035, 0.04, 0.055, 0.84).setFill();
+            NSBezierPath::fillRect(bounds);
+
+            for row in &self.ivars().rows {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.14, 0.15, 0.19, 0.9).setFill();
+                let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    row.frame, 14.0, 14.0,
+                );
+                path.fill();
+                draw_overview_text(&row.label, row.frame.origin.x + 12.0, row.frame.origin.y + row.frame.size.height - 26.0, 13.0, false);
+            }
+
+            for item in &self.ivars().items {
+                if item.focused {
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.48, 0.78, 0.72).setFill();
+                } else {
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.25, 0.27, 0.33, 0.94).setFill();
+                }
+                let card = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    item.frame, 9.0, 9.0,
+                );
+                card.fill();
+                NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, if item.focused { 0.9 } else { 0.24 }).setStroke();
+                card.setLineWidth(if item.focused { 2.0 } else { 1.0 });
+                card.stroke();
+
+                let badge_size = 34.0_f64.min(item.frame.size.width * 0.55).min(item.frame.size.height * 0.55).max(18.0);
+                let badge = NSRect::new(
+                    NSPoint::new(
+                        item.frame.origin.x + (item.frame.size.width - badge_size) / 2.0,
+                        item.frame.origin.y + (item.frame.size.height - badge_size) / 2.0,
+                    ),
+                    NSSize::new(badge_size, badge_size),
+                );
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.045, 0.06, 0.94).setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    badge, badge_size / 2.0, badge_size / 2.0,
+                ).fill();
+                draw_overview_text(
+                    &item.mark,
+                    badge.origin.x,
+                    badge.origin.y + (badge_size - 17.0) / 2.0,
+                    15.0,
+                    true,
+                );
+            }
+        }
+    }
+);
+
+fn draw_overview_text(text: &str, x: f64, y: f64, size: f64, centered: bool) {
+    let font = NSFont::boldSystemFontOfSize(size);
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.96);
+    let paragraph_style = unsafe {
+        let style = NSParagraphStyle::defaultParagraphStyle().mutableCopy();
+        let alignment = if centered { 1isize } else { 0isize };
+        let _: () = msg_send![&style, setAlignment: alignment];
+        style
+    };
+    let value = NSString::from_str(text);
+    let font_key = NSString::from_str("NSFont");
+    let color_key = NSString::from_str("NSColor");
+    let para_key = NSString::from_str("NSParagraphStyle");
+    let keys = [&*font_key, &*color_key, &*para_key];
+    let objects = [
+        &*font as &AnyObject,
+        &*color as &AnyObject,
+        &*paragraph_style as &AnyObject,
+    ];
+    let attributes = NSDictionary::from_slices(&keys, &objects);
+    let attributed: Retained<NSAttributedString> = unsafe {
+        msg_send![NSAttributedString::alloc(), initWithString: &*value, attributes: &*attributes]
+    };
+    let width = if centered { 34.0 } else { 240.0 };
+    unsafe {
+        let _: () = msg_send![&attributed, drawInRect: NSRect::new(NSPoint::new(x, y), NSSize::new(width, size + 4.0))];
+    }
+}
+
+impl OverviewView {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        rows: Vec<OverviewRow>,
+        items: Vec<OverviewItem>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(OverviewViewIvars { rows, items });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
+pub struct OverviewManager {
+    mtm: MainThreadMarker,
+    window: Option<Retained<NSWindow>>,
+}
+
+impl OverviewManager {
+    pub fn new(mtm: MainThreadMarker) -> Self {
+        Self { mtm, window: None }
+    }
+
+    pub fn show(
+        &mut self,
+        display_abs_cg: NSRect,
+        rows: Vec<OverviewRow>,
+        items: Vec<OverviewItem>,
+    ) {
+        let screen_h = primary_screen_height(self.mtm);
+        let frame = cg_abs_to_cocoa(display_abs_cg, screen_h);
+        let local = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+        let view = OverviewView::new(self.mtm, local, rows, items);
+        if let Some(window) = &self.window {
+            window.setContentView(Some(&view));
+            window.setFrame_display(frame, true);
+            window.orderFront(None::<&AnyObject>);
+        } else {
+            let window = make_overlay_window(self.mtm, frame);
+            window.setLevel(NSFloatingWindowLevel + 2);
+            window.setContentView(Some(&view));
+            window.orderFront(None::<&AnyObject>);
+            self.window = Some(window);
+        }
+    }
+
+    pub fn remove(&mut self) {
+        if let Some(window) = self.window.take() {
+            window.orderOut(None::<&AnyObject>);
+        }
+    }
+}
+
 impl FlashMessageManager {
     pub fn new(mtm: MainThreadMarker) -> Self {
         Self { mtm, window: None }

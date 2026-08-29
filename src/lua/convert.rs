@@ -252,6 +252,8 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::ApplicationFrontSwitched { .. }
             | Event::WindowCreated { .. }
             | Event::Command { .. }
+            | Event::JumpPickerSelect { .. }
+            | Event::JumpPickerCancel
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
             | Event::StateSubscribe { .. }

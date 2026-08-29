@@ -1227,14 +1227,14 @@ pub(super) fn apply_window_positions(
                 .iter_mut()
                 .find_map(|(strip, active)| active.then_some(strip))
         {
+            let focused_entity = ctx.windows.focused().map(|(_, entity)| entity);
             // Attempt inserting the window at a pre-defined position.
             let insert_at = properties.insertion().map_or_else(
                 || {
                     // Otherwise attempt inserting it after the current focus.
-                    let focused_window = ctx.windows.focused();
                     // Insert to the right of the currently focused window
-                    focused_window
-                        .and_then(|(_, entity)| strip.index_of(entity).ok())
+                    focused_entity
+                        .and_then(|entity| strip.index_of(entity).ok())
                         .and_then(|insert_at| {
                             (insert_at + 1 < strip.len()).then_some(insert_at + 1)
                         })
@@ -1246,7 +1246,7 @@ pub(super) fn apply_window_positions(
             match insert_at {
                 Some(after) => {
                     debug!("New window inserted at {after}");
-                    strip.insert_at(after, entity);
+                    strip.insert_at_preserving(after, entity, focused_entity);
                 }
                 None => strip.append(entity),
             }
