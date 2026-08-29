@@ -273,9 +273,9 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        // Handle tab switching: if the focused window is a tab, make it the leader.
-        // Also reactivate the owning virtual strip before treating duplicate
-        // focus as a no-op; the focus marker can be stale on a hidden strip.
+        // Native-tab focus changes must not rewrite their structural order.
+        // Reactivate the owning virtual strip before treating duplicate focus
+        // as a no-op; the focus marker can be stale on a hidden strip.
         // Track the active workspace as a fallback so focus_history can record
         // a workspace id even when the entity hasn't been routed into a strip.
         let mut owner = None;
