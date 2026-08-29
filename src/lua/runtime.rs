@@ -488,7 +488,7 @@ mod tests {
 
     /// Drains the outbox commands for assertions.
     fn drained_commands(runtime: &LuaRuntime) -> Vec<Command> {
-        runtime.outbox.borrow_mut().commands.drain(..).collect()
+        std::mem::take(&mut runtime.outbox.borrow_mut().commands)
     }
 
     #[test]

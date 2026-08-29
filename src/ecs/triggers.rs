@@ -281,16 +281,11 @@ pub(super) fn window_focused_trigger(
         let mut owner = None;
         let mut owning_workspace_id = None;
         let mut active_workspace_id = None;
-        for (strip_entity, mut strip, active) in &mut workspaces {
+        for (strip_entity, strip, active) in &mut workspaces {
             if active {
                 active_workspace_id = Some(strip.id());
             }
             if owner.is_none() && strip.contains(entity) {
-                if let Ok(index) = strip.index_of(entity)
-                    && let Some(column) = strip.get_column_mut(index)
-                {
-                    column.move_to_front(entity);
-                }
                 owning_workspace_id = Some(strip.id());
                 owner = Some((strip_entity, active));
             }

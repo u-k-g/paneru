@@ -569,7 +569,7 @@ fn draw_overview_text(text: &str, x: f64, y: f64, size: f64, centered: bool) {
     let color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.96);
     let paragraph_style = unsafe {
         let style = NSParagraphStyle::defaultParagraphStyle().mutableCopy();
-        let alignment = if centered { 1isize } else { 0isize };
+        let alignment = isize::from(centered);
         let _: () = msg_send![&style, setAlignment: alignment];
         style
     };
@@ -584,12 +584,12 @@ fn draw_overview_text(text: &str, x: f64, y: f64, size: f64, centered: bool) {
         &*paragraph_style as &AnyObject,
     ];
     let attributes = NSDictionary::from_slices(&keys, &objects);
-    let attributed: Retained<NSAttributedString> = unsafe {
+    let styled_text: Retained<NSAttributedString> = unsafe {
         msg_send![NSAttributedString::alloc(), initWithString: &*value, attributes: &*attributes]
     };
     let width = if centered { 34.0 } else { 240.0 };
     unsafe {
-        let _: () = msg_send![&attributed, drawInRect: NSRect::new(NSPoint::new(x, y), NSSize::new(width, size + 4.0))];
+        let _: () = msg_send![&styled_text, drawInRect: NSRect::new(NSPoint::new(x, y), NSSize::new(width, size + 4.0))];
     }
 }
 

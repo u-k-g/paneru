@@ -34,7 +34,11 @@ impl Plugin for OverviewPlugin {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn handle_overview(
     mut messages: MessageReader<Event>,
     config: Res<Config>,

@@ -43,6 +43,31 @@ General behavior settings for the window manager.
 
 ---
 
+## Spatial Overview (`[jump_picker]`)
+
+The Overview is a bird's-eye map of the strip topology, including native
+macOS Spaces and Paneru virtual-workspace rows. Windows retain their spatial
+column, stack, and native-tab relationships. Press the configured binding,
+then the mark drawn on a window to focus it with the normal strip animation.
+
+It is disabled by default. When enabled, the binding defaults to Cmd-Tab.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Boolean | `false` | Enable the spatial Overview and reserve its binding. |
+| `binding` | String | `"cmd - tab"` | Chord that opens the Overview. |
+| `keys` | String | `"asdfghjklqwertyuiopzxcvbnm"` | One-key marks assigned in workspace and strip order. |
+
+```toml
+[jump_picker]
+enabled = true
+```
+
+The `jump` command opens the same Overview; `rescue` restores floating windows
+that belong to the visible workspace but are wholly off-screen.
+
+---
+
 ## 2. Padding (`[padding]`)
 
 Sets the margins at the edges of the screen.
@@ -198,6 +223,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `quit` | Exit Paneru. |
 | `restart` | Restart the Paneru service (`paneru restart`). |
+| `jump` | Open the spatial Overview/window picker. |
+| `rescue` | Recover off-screen floating windows on the visible workspace. |
 
 **Example:**
 ```toml

@@ -244,10 +244,6 @@ impl Column {
             Column::Tabs(tabs) => tabs.contains(&entity).then_some(0),
         }
     }
-
-    /// Native tab order is structural, not focus history. The active tab is
-    /// represented by `FocusedMarker`; focusing it must not rewrite the group.
-    pub fn move_to_front(&mut self, _entity: Entity) {}
 }
 
 pub enum ColumnWindowIter<'a> {
@@ -282,7 +278,7 @@ pub struct LayoutStrip {
     pub virtual_index: u32,
     columns: VecDeque<Column>,
     /// Last committed layout size for every member. Topology changes use these
-    /// slots instead of sampling an in-flight AppKit frame, so adding a window
+    /// slots instead of sampling an in-flight `AppKit` frame, so adding a window
     /// cannot resize windows that were already in the strip.
     slot_sizes: EntityHashMap<Size>,
     /// Existing window whose visual x position must survive the next layout
@@ -2092,11 +2088,6 @@ mod tests {
         let mut strip = LayoutStrip::default();
         strip.append(e1);
         strip.convert_to_tabs(e1, e2).unwrap();
-        strip
-            .get_column_mut(0)
-            .expect("tab column")
-            .move_to_front(e2);
-
         let get_window_frame = |entity| {
             if entity == e1 {
                 Some(IRect::new(0, 0, 300, 600))
