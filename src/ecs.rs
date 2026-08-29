@@ -5,8 +5,10 @@ use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
+use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
@@ -66,7 +68,9 @@ pub(crate) use triggers::apply_config_side_effects;
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
+    const CLOSED_WINDOW_CHECK_FREQ_MS: u64 = 1000;
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
+    const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     app.init_resource::<systems::AnimationCadence>();
 
@@ -94,6 +98,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
+        };
+    // The menu bar additionally shows how many virtual workspaces exist, so it
+    // has to redraw when one is created or reaped, neither of which touches the
+    // active strip.
+    let strip_count_changed =
+        |added: Query<(), Added<LayoutStrip>>, mut removed: RemovedComponents<LayoutStrip>| {
+            !added.is_empty() || removed.read().next().is_some()
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
@@ -134,10 +145,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain()
                 .run_if(resource_exists::<Initializing>),
-            systems::add_launched_process,
-            systems::add_launched_application,
+            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
+            workspace::cleanup_unordered_windows
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(Duration::from_millis(CLOSED_WINDOW_CHECK_FREQ_MS))),
+            systems::auto_discover_unmanaged_focused_windows,
             systems::retry_front_switch,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
@@ -177,7 +192,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar.run_if(vw_indicator_dirty),
+            crate::menubar::update_menu_bar
+                .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
         ),
     );
 }

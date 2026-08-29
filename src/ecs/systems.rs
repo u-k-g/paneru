@@ -471,7 +471,7 @@ pub(super) fn add_launched_process(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    const APP_OBSERVABLE_TIMEOUT_SEC: u64 = 5;
+    const APP_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(10);
     let mut already_seen = HashSet::new();
 
     for (entity, mut process, children) in fresh_processes {
@@ -508,9 +508,10 @@ pub(super) fn add_launched_process(
 
         if app.observe().is_ok_and(|good| good) {
             let timeout = Timeout::new(
-                Duration::from_secs(APP_OBSERVABLE_TIMEOUT_SEC),
+                APP_OBSERVABLE_TIMEOUT,
                 Some(format!(
-                    "{app} did not become observable in {APP_OBSERVABLE_TIMEOUT_SEC}s.",
+                    "{app} did not become observable in {}s.",
+                    APP_OBSERVABLE_TIMEOUT.as_secs()
                 )),
                 &mut commands,
             );
@@ -1680,6 +1681,65 @@ mod initialization_tests {
         app.update();
 
         assert!(!app.world().entity(application).contains::<ExistingMarker>());
+    }
+}
+
+/// Listens for focus events for unknown window IDs and attempts to auto-discover
+/// and manage them on the fly (e.g., when a user clicks an unmanaged tab or window).
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn auto_discover_unmanaged_focused_windows(
+    mut messages: MessageReader<Event>,
+    windows: Query<&Window>,
+    apps: Query<&Application>,
+    config: Res<Config>,
+    mut cache: Local<HashSet<WinID>>,
+    mut commands: Commands,
+) {
+    const CACHE_CLEANUP_SIZE: usize = 1000;
+    if cache.len() > CACHE_CLEANUP_SIZE {
+        cache.clear();
+    }
+
+    for event in messages.read() {
+        let Event::WindowFocused { window_id } = *event else {
+            continue;
+        };
+
+        if windows.iter().any(|w| w.id() == window_id) || cache.contains(&window_id) {
+            continue;
+        }
+
+        trace!("Focus event for unknown window id {window_id}; attempting on-the-fly discovery.");
+
+        let mut discovered = None;
+        let (frontmost, non_frontmost): (Vec<_>, Vec<_>) =
+            apps.iter().partition(|app| app.is_frontmost());
+
+        for app in frontmost.into_iter().chain(non_frontmost) {
+            if let Some(window) = app.focused_window(&config)
+                && window.id() == window_id
+            {
+                debug!("Discovered unknown focused window {window_id} via focused_window.");
+                discovered = Some(window);
+                break;
+            }
+
+            let window_list = app.window_list(&config);
+            if let Some(window) = window_list.into_iter().find(|w| w.id() == window_id) {
+                debug!("Discovered unknown focused window {window_id} via window_list scan.");
+                discovered = Some(window);
+                break;
+            }
+        }
+
+        if let Some(window) = discovered {
+            commands.trigger(SpawnWindowTrigger(vec![window]));
+        } else {
+            trace!(
+                "Failed to discover manageable window for focused ID {window_id}; caching as unmanageable."
+            );
+            cache.insert(window_id);
+        }
     }
 }
 

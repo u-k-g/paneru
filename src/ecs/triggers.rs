@@ -1020,7 +1020,11 @@ pub(super) fn spawn_window_trigger(
 ) {
     let new_windows = &mut trigger.event_mut().0;
 
-    while let Some(mut window) = new_windows.pop() {
+    // Preserve the source's window order explicitly. Iteration order for the
+    // subsequent `Added<Window>` query is not a stable way to undo LIFO
+    // processing here, and can change when otherwise unrelated systems are
+    // merged into the schedule.
+    for mut window in std::mem::take(new_windows) {
         let window_id = window.id();
 
         if windows.iter().any(|window| window.id() == window_id) {

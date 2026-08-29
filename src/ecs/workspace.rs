@@ -22,12 +22,12 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker, Initializing,
-    NativeFullscreenMarker, Position, RaiseWindow, RefreshWindowSizes, RepositionMarker, Scrolling,
-    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, NativeFullscreenMarker,
+    Position, RaiseWindow, RefreshWindowSizes, RepositionMarker, Scrolling, SelectedVirtualMarker,
+    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::errors::Result;
-use crate::events::Event;
+use crate::events::{DestroySource, Event};
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
@@ -543,9 +543,38 @@ fn find_orphaned_workspaces(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn cleanup_unordered_windows(
+    windows: Query<&Window>,
+    workspaces: Query<&LayoutStrip>,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let windows = workspaces
+        .iter()
+        .flat_map(|strip| {
+            strip
+                .all_windows()
+                .into_iter()
+                .filter(|entity| !strip.tabbed(*entity))
+        })
+        .filter_map(|entity| windows.get(entity).ok());
+
+    for window in windows {
+        let window_id = window.id();
+        if window_manager.window_is_unordered(window_id) {
+            debug!("Window {window_id} is unordered; removing it.");
+            commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+                window_id,
+                source: DestroySource::Accessibility,
+            }));
+        }
+    }
+}
+
 fn refresh_workspace_window_sizes(
     layout_strip: Populated<(&RefreshWindowSizes, &LayoutStrip, Entity, &ChildOf)>,
-    mut windows: Query<(Entity, &mut Window, &mut Bounds, Option<&Unmanaged>)>,
+    mut windows: Query<(Entity, &mut Window, Option<&Unmanaged>)>,
     displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -569,17 +598,18 @@ fn refresh_workspace_window_sizes(
 
         // Resize windows for the new display dimensions.
         for entity in strip.all_windows() {
-            let Ok((_, ref mut window, ref mut bounds, _)) = windows.get_mut(entity) else {
+            let Ok((_, ref mut window, _)) = windows.get_mut(entity) else {
                 continue;
             };
-            if bounds.x > viewport.width() || bounds.y > viewport.height() {
-                let clamped_size = Size::new(
-                    bounds.x.clamp(0, viewport.width()),
-                    bounds.y.clamp(0, viewport.height()),
-                );
-                debug!("refreshing window {} size to {clamped_size}", window.id());
-                commands.resize_entity(entity, clamped_size);
-            }
+            let Ok(frame) = window.update_frame() else {
+                continue;
+            };
+            let clamped_size = Size::new(
+                frame.width().clamp(0, viewport.width()),
+                frame.height().clamp(0, viewport.height()),
+            );
+            debug!("resizing window {} size to {clamped_size}", window.id());
+            commands.resize_entity(entity, clamped_size);
 
             in_workspace.retain(|window_id| *window_id != window.id());
         }
@@ -590,7 +620,7 @@ fn refresh_workspace_window_sizes(
             .filter_map(|window_id| {
                 windows
                     .iter()
-                    .find_map(|(entity, window, _, unmanaged)| {
+                    .find_map(|(entity, window, unmanaged)| {
                         (window_id == window.id()).then_some(unmanaged.zip(Some(entity)))
                     })
                     .flatten()
@@ -1159,7 +1189,7 @@ pub(crate) fn show_active_workspace(
         }
     }
 
-    let Ok((_, mut position, strip, _, previous_position, _)) = workspaces.get_mut(*activated)
+    let Ok((_, mut position, strip, child, previous_position, _)) = workspaces.get_mut(*activated)
     else {
         return;
     };
@@ -1167,6 +1197,23 @@ pub(crate) fn show_active_workspace(
 
     // If no previous strip position exists, then the workspace was not hidden.
     if let Some(PreviousStripPosition { origin, focus }) = previous_position {
+        let mut origin = *origin;
+        // An external focus can activate a hidden virtual workspace before the
+        // deferred focus auto-center runs. Center the saved strip origin while
+        // restoring it so window placement does not depend on system order.
+        if config.auto_center()
+            && let Some((_, current_focus)) = windows.focused()
+            && strip.contains(current_focus)
+            && let Some(layout_position) = windows.layout_position(current_focus)
+            && let Some(size) = windows.size(current_focus)
+            && let Ok(display) = displays.get(child.parent())
+        {
+            origin.x = display.bounds().center().x - size.x / 2 - layout_position.x;
+            if !config.virtual_workspace_animations() {
+                commands.snap_entity_position(current_focus, origin + layout_position.0);
+            }
+        }
+
         if let Ok(mut entity_commands) = commands.get_entity(*activated) {
             entity_commands.try_remove::<PreviousStripPosition>();
         }
@@ -1179,9 +1226,9 @@ pub(crate) fn show_active_workspace(
                 commands.focus_entity(focus, false);
             }
 
-            commands.reposition_entity(*activated, *origin);
+            commands.reposition_entity(*activated, origin);
         } else {
-            position.0 = *origin;
+            position.0 = origin;
         }
 
         if let Some((_, current_focus)) = windows.focused()
