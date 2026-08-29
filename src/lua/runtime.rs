@@ -320,8 +320,8 @@ impl LuaRuntime {
     pub(super) fn drain_outbox(&self) -> Effects {
         let mut outbox = self.outbox.borrow_mut();
         (
-            outbox.commands.drain(..).collect(),
-            outbox.flashes.drain(..).collect(),
+            std::mem::take(&mut outbox.commands),
+            std::mem::take(&mut outbox.flashes),
         )
     }
 
