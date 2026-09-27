@@ -14,8 +14,10 @@ use objc2_core_foundation::{
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
     CGGetActiveDisplayList, CGWarpMouseCursorPosition, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGNullWindowID, kCGWindowNumber,
+    CGWindowListOption, kCGNullWindowID, kCGWindowAlpha, kCGWindowLayer, kCGWindowNumber,
+    kCGWindowOwnerPID,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
@@ -441,8 +443,16 @@ impl WindowManagerApi for WindowManagerOS {
         spaces: &[WorkspaceId],
         config: &Config,
     ) -> Result<(Vec<Window>, Vec<WinID>)> {
-        let global_window_list = existing_application_window_list(self.main_cid, app, spaces)?;
         let found_windows = app.window_list(config);
+        let global_window_list = match existing_application_window_list(self.main_cid, app, spaces)
+        {
+            Ok(windows) => windows,
+            Err(err) if !found_windows.is_empty() => {
+                warn!("SkyLight window query failed for {app}: {err}; using AX windows");
+                return Ok((found_windows, vec![]));
+            }
+            Err(err) => return Err(err),
+        };
         if global_window_list.is_empty() {
             if found_windows.is_empty() {
                 return Err(Error::InvalidInput(format!("No windows found for {app}")));
@@ -740,6 +750,35 @@ fn existing_application_window_list(
         )));
     }
     space_window_list_for_connection(cid, spaces, app.connection(), true)
+}
+
+/// Visible regular windows identify apps worth retrying after an AX failure.
+/// `None` means the snapshot failed, so callers should retry without filtering.
+pub(crate) fn visible_window_pids() -> Option<HashSet<Pid>> {
+    let options =
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+    let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)?;
+    let windows = unsafe { windows.cast_unchecked::<CFDictionary<CFString, CFNumber>>() };
+    Some(
+        windows
+            .iter()
+            .filter(|window| {
+                window
+                    .get(unsafe { kCGWindowLayer })
+                    .and_then(|layer| layer.as_i32())
+                    == Some(0)
+                    && window
+                        .get(unsafe { kCGWindowAlpha })
+                        .and_then(|alpha| alpha.as_f64())
+                        .is_some_and(|alpha| alpha > 0.0)
+            })
+            .filter_map(|window| {
+                window
+                    .get(unsafe { kCGWindowOwnerPID })
+                    .and_then(|pid| pid.as_i32())
+            })
+            .collect(),
+    )
 }
 
 /// How many applications may run [`bruteforce_windows`] at the same time.

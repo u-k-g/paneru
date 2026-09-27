@@ -149,6 +149,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(resource_exists::<Initializing>),
             systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::retry_inaccessible_applications
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(Duration::from_secs(10))),
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
             workspace::cleanup_unordered_windows
@@ -255,6 +258,10 @@ pub struct FreshMarker;
 /// Marker component used to gather existing processes and windows during initialization.
 #[derive(Component)]
 pub struct ExistingMarker;
+
+/// Keeps an application in discovery after its AX observer could not be installed.
+#[derive(Component)]
+pub struct RetryAccessibility;
 
 /// Component representing a request to reposition a window.
 #[derive(Component, Debug, Deref, DerefMut)]

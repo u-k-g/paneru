@@ -21,7 +21,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    RetryAccessibility, RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -320,10 +320,12 @@ pub(crate) fn add_existing_application(
         let mut offscreen_windows = vec![];
 
         if !app.observe().is_ok_and(|result| result) {
-            debug!(
-                "failed to register some observers for {}; continuing window discovery",
-                app.name()
+            warn!(
+                "Accessibility observer unavailable for {} (pid {}); retrying window discovery",
+                app.name(),
+                app.pid()
             );
+            commands.entity(entity).insert(RetryAccessibility);
         }
 
         if let Ok((found_windows, offscreen)) = window_manager
@@ -523,7 +525,11 @@ pub(super) fn add_launched_process(
             );
             commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
         } else {
-            debug!("failed to register some observers {}", process.name());
+            warn!(
+                "Accessibility unavailable for {}; retrying window discovery when it responds",
+                process.name()
+            );
+            commands.spawn((app, RetryAccessibility, ChildOf(entity)));
         }
     }
 }
@@ -568,6 +574,50 @@ pub(super) fn add_launched_application(
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FreshMarker>();
             }
+        }
+    }
+}
+
+/// Retries apps whose initial AX observer failed. A visible window from
+/// CoreGraphics is the signal to probe AX again; once AX responds, discover
+/// windows that may have appeared while notifications were unavailable.
+pub(super) fn retry_inaccessible_applications(
+    mut applications: Query<(Entity, &mut Application), With<RetryAccessibility>>,
+    windows: Query<&Window>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if applications.is_empty() {
+        return;
+    }
+
+    let visible_pids = crate::manager::visible_window_pids();
+    for (entity, mut app) in &mut applications {
+        if visible_pids
+            .as_ref()
+            .is_some_and(|pids| !pids.contains(&app.pid()))
+        {
+            continue;
+        }
+
+        let Some(accessible_windows) = app.accessible_window_list(&config) else {
+            continue;
+        };
+        let observing = app.observe().is_ok_and(|complete| complete);
+        let new_windows = accessible_windows
+            .into_iter()
+            .filter(|window| !windows.iter().any(|existing| existing.id() == window.id()))
+            .collect::<Vec<_>>();
+        if !new_windows.is_empty() {
+            info!(
+                "Accessibility recovered for {}; discovered {} windows",
+                app.name(),
+                new_windows.len()
+            );
+            commands.trigger(SpawnWindowTrigger(new_windows));
+        }
+        if observing {
+            commands.entity(entity).remove::<RetryAccessibility>();
         }
     }
 }
@@ -1687,6 +1737,64 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
             );
             cache.insert(window_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod accessibility_recovery_tests {
+    use bevy::app::{App, Update};
+    use bevy::ecs::hierarchy::Children;
+
+    use super::add_launched_process;
+    use crate::config::Config;
+    use crate::ecs::{BProcess, FreshMarker, RetryAccessibility};
+    use crate::errors::Error;
+    use crate::manager::app::MockApplicationApi;
+    use crate::manager::{Application, MockProcessApi, MockWindowManagerApi, WindowManager};
+    use crate::platform::ProcessSerialNumber;
+
+    #[test]
+    fn launched_app_survives_initial_accessibility_failure() {
+        let mut process = MockProcessApi::new();
+        process
+            .expect_psn()
+            .return_const(ProcessSerialNumber { high: 0, low: 42 });
+        process
+            .expect_name()
+            .return_const("AX-unavailable app".to_string());
+        process.expect_ready().return_const(true);
+
+        let mut application = MockApplicationApi::new();
+        application
+            .expect_observe()
+            .return_once(|| Err(Error::PermissionDenied("AX unavailable".into())));
+        let mut manager = MockWindowManagerApi::new();
+        manager
+            .expect_new_application()
+            .return_once(move |_| Ok(Application::new(Box::new(application))));
+
+        let mut app = App::new();
+        app.insert_resource(Config::default());
+        app.insert_resource(WindowManager(Box::new(manager)));
+        app.add_systems(Update, add_launched_process);
+        let process_entity = app
+            .world_mut()
+            .spawn((BProcess(Box::new(process)), FreshMarker))
+            .id();
+
+        app.update();
+
+        let world = app.world_mut();
+        let children = world.get::<Children>(process_entity).unwrap();
+        assert_eq!(children.len(), 1);
+        let application_entity = children[0];
+        assert!(world.get::<Application>(application_entity).is_some());
+        assert!(
+            world
+                .get::<RetryAccessibility>(application_entity)
+                .is_some()
+        );
+        assert!(world.get::<FreshMarker>(application_entity).is_none());
     }
 }
 
