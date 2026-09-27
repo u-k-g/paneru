@@ -95,19 +95,6 @@ impl Touch {
 static LUA_KEYBINDS: LazyLock<ArcSwap<Vec<(u8, Modifiers, u32)>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
-/// Keycodes currently displayed by the spatial picker, in mark order. An
-/// empty vector means ordinary keybinding dispatch is active.
-static JUMP_PICKER_KEYS: LazyLock<ArcSwap<Vec<u8>>> =
-    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
-
-pub fn activate_jump_picker(keys: Vec<u8>) {
-    JUMP_PICKER_KEYS.store(Arc::new(keys));
-}
-
-pub fn deactivate_jump_picker() {
-    JUMP_PICKER_KEYS.store(Arc::new(Vec::new()));
-}
-
 /// Replace the Lua keybind set that the event tap checks on every key-down.
 /// Called from the main thread on script load and hot reload.
 #[cfg(feature = "lua")]
@@ -603,37 +590,6 @@ impl InputHandler {
         };
 
         let mask = get_modifiers(eventflags);
-
-        let jump_keys = JUMP_PICKER_KEYS.load();
-        if !jump_keys.is_empty() {
-            if self
-                .config
-                .jump_picker_binding()
-                .is_some_and(|(code, modifiers)| {
-                    u8::try_from(keycode).is_ok_and(|pressed| pressed == code)
-                        && modifiers.matches(mask)
-                })
-            {
-                return true;
-            }
-            if keycode == 53 {
-                _ = events.send(Event::JumpPickerCancel);
-                deactivate_jump_picker();
-                return true;
-            }
-            if let Ok(keycode) = u8::try_from(keycode)
-                && let Some(index) = jump_keys.iter().position(|code| *code == keycode)
-            {
-                _ = events.send(Event::JumpPickerSelect { index });
-                deactivate_jump_picker();
-                return true;
-            }
-
-            // An unrelated key dismisses the picker and continues to the app.
-            _ = events.send(Event::JumpPickerCancel);
-            deactivate_jump_picker();
-            return false;
-        }
 
         // On a native fullscreen space, keybindings are still intercepted so
         // that paneru can actively switch back to the previous workspace.

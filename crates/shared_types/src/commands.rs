@@ -300,10 +300,6 @@ pub enum Command {
     /// A command to restart the window manager service.
     Restart,
     PrintState,
-    /// Opens the spatial window jump picker.
-    Jump,
-    /// Restores accidentally off-screen floating windows to their workspace.
-    Rescue,
     /// Invokes a Lua keybind handler by its registry id (see the daemon's
     /// `crate::lua`). Never produced by parsing; the runtime issues it directly.
     Lua(u32),

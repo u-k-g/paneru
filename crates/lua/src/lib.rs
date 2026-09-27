@@ -91,8 +91,6 @@ pub fn install(lua: &Lua, paneru: &Table, dispatch: &Dispatch) -> Result<()> {
     paneru.set("quit", verb(lua, dispatch, Command::Quit)?)?;
     paneru.set("restart", verb(lua, dispatch, Command::Restart)?)?;
     paneru.set("print_state", verb(lua, dispatch, Command::PrintState)?)?;
-    paneru.set("jump", verb(lua, dispatch, Command::Jump)?)?;
-    paneru.set("rescue", verb(lua, dispatch, Command::Rescue)?)?;
 
     // paneru.match{ app = …, bundle = …, title = …, floating = …, managed = … }
     // builds a predicate over window records, for `ws:find`/`ws:filter`.

@@ -47,10 +47,6 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   navigation of the window pane.
 - **Native macOS tabs support:** Applications like Ghostty use these, so
   Paneru manages them on the layout strip like other windows.
-- **Spatial Overview:** A bird's-eye map keeps windows in strip, stack, native
-  Space, and virtual-workspace order, using application icons at each window's
-  position. Enable it to use Cmd-Tab plus a displayed mark as a spatial jump
-  instead of a flat application list.
 - **Optimal for Large Displays:** Standard tiling window managers can be
   suboptimal for large displays, often resulting in either huge maximized
   windows or numerous tiny, unusable windows. Paneru addresses this by
@@ -95,12 +91,11 @@ inspired by [Niri] and [PaperWM.spoon].
   An option exists (`horizontal_mouse_warp`) which can make a vertical
   arrangement of displays "feel" horizontal.
 
-- **macOS off-screen relocation workaround**. Because macOS may forcibly relocate windows
+- **Off-screen window slivers**. Because macOS will forcibly relocate windows
   that are moved fully off-screen, Paneru keeps a thin sliver of each
   off-screen window visible at the screen edge. The `sliver_width` and
-  `sliver_height` options tune this implementation safeguard. Use `rescue` to
-  recover floating windows that macOS or an application moved entirely away;
-  Paneru also restores parked windows to visible display bounds when it quits.
+  `sliver_height` options control the size of this sliver. This is a
+  workaround for a macOS limitation, not a design choice.
 
 ### Installing from Crates.io
 
@@ -296,8 +291,6 @@ $ paneru send-cmd <command> [args...]
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
-| `jump`                     | Open the spatial Overview/window picker          |
-| `rescue`                   | Recover off-screen floating windows              |
 | `printstate`               | Print the internal ECS state to the debug log    |
 | `quit`                     | Quit Paneru                                      |
 | `restart`                  | Restart the Paneru service                         |

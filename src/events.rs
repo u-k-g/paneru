@@ -206,11 +206,6 @@ pub enum Event {
     /// A command has been issued to the window manager.
     Command { command: Command },
 
-    /// A mark was pressed while the spatial jump picker was active.
-    JumpPickerSelect { index: usize },
-    /// Dismisses the spatial jump picker without changing focus.
-    JumpPickerCancel,
-
     /// A structured state query has been issued by a client.
     StateQuery {
         kind: StateQueryKind,

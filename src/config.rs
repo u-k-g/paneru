@@ -408,14 +408,6 @@ impl Config {
     /// `Some(Command)` if a matching keybinding is found, otherwise `None`.
     pub fn find_keybind(&self, keycode: u8, mask: Modifiers) -> Option<Command> {
         let config = self.inner();
-        if config.jump_picker.enabled()
-            && config
-                .jump_picker
-                .parsed_binding
-                .is_some_and(|(code, modifiers)| code == keycode && modifiers.matches(mask))
-        {
-            return Some(Command::Jump);
-        }
         config
             .bindings
             .values()
@@ -842,18 +834,6 @@ impl Config {
             .is_some_and(|disabled| disabled)
     }
 
-    pub fn jump_picker_enabled(&self) -> bool {
-        self.inner().jump_picker.enabled()
-    }
-
-    pub fn jump_picker_binding(&self) -> Option<(u8, Modifiers)> {
-        self.inner().jump_picker.parsed_binding
-    }
-
-    pub fn jump_picker_keys(&self) -> Vec<(char, u8)> {
-        self.inner().jump_picker.parsed_keys.clone()
-    }
-
     pub fn workspace_menu_status(&self) -> bool {
         self.inner()
             .decorations
@@ -1106,8 +1086,6 @@ struct InnerConfig {
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
-    #[serde(default)]
-    jump_picker: JumpPickerOptions,
 }
 
 impl InnerConfig {
@@ -1176,69 +1154,16 @@ impl InnerConfig {
             }
         }
 
-        config.jump_picker.resolve(virtual_keys)?;
-
         Ok(config)
     }
 
     fn needs_virtual_keys(&self) -> bool {
         !self.bindings.is_empty()
-            || self.jump_picker.enabled()
             || self.windows.as_ref().is_some_and(|windows| {
                 windows
                     .values()
                     .any(|params| !params.bindings_passthrough.is_empty())
             })
-    }
-}
-
-const DEFAULT_JUMP_BINDING: &str = "cmd - tab";
-const DEFAULT_JUMP_KEYS: &str = "asdfghjklqwertyuiopzxcvbnm";
-
-/// Spatial picker configuration. It is disabled until explicitly enabled;
-/// enabling it reserves Cmd-Tab unless `binding` says otherwise.
-#[derive(Clone, Debug, Deserialize, Default)]
-pub struct JumpPickerOptions {
-    pub enabled: Option<bool>,
-    pub binding: Option<String>,
-    pub keys: Option<String>,
-    #[serde(skip)]
-    parsed_binding: Option<(u8, Modifiers)>,
-    #[serde(skip)]
-    parsed_keys: Vec<(char, u8)>,
-}
-
-impl JumpPickerOptions {
-    fn enabled(&self) -> bool {
-        self.enabled.is_some_and(|enabled| enabled)
-    }
-
-    fn resolve(&mut self, virtual_keys: &[(String, u8)]) -> Result<()> {
-        if !self.enabled() {
-            self.parsed_binding = None;
-            self.parsed_keys.clear();
-            return Ok(());
-        }
-
-        self.parsed_binding = Some(resolve_keybinding_str(
-            self.binding.as_deref().unwrap_or(DEFAULT_JUMP_BINDING),
-            virtual_keys,
-        )?);
-        self.parsed_keys = self
-            .keys
-            .as_deref()
-            .unwrap_or(DEFAULT_JUMP_KEYS)
-            .chars()
-            .filter_map(|key| {
-                keycode_for_key_name(&key.to_string(), virtual_keys).map(|code| (key, code))
-            })
-            .collect();
-        if self.parsed_keys.is_empty() {
-            return Err(Error::InvalidConfig(
-                "jump_picker.keys did not contain any valid keys".to_string(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -1546,7 +1471,7 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
             .values()
             .any(|params| !params.bindings_passthrough.is_empty())
     });
-    if needs_keys || inner.jump_picker.enabled() {
+    if needs_keys {
         // The primed keymap, not a fresh one: this runs on the Lua worker, and
         // generating it goes through Carbon/TIS. See [`prime_virtual_keymap`].
         let virtual_keys = virtual_keymap();
@@ -1560,10 +1485,6 @@ pub(crate) fn config_from_lua(lua: &mlua::Lua, value: mlua::Value) -> mlua::Resu
                 }
             }
         }
-        inner
-            .jump_picker
-            .resolve(virtual_keys)
-            .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
     }
 
     Ok(Config {
@@ -2205,30 +2126,6 @@ fn test_parse_restart_command() {
 }
 
 #[test]
-fn jump_picker_is_disabled_by_default_and_uses_cmd_tab_when_enabled() {
-    let defaults = Config::defaults().expect("default config");
-    assert!(!defaults.jump_picker_enabled());
-    assert!(defaults.jump_picker_binding().is_none());
-
-    let input = "[jump_picker]\nenabled = true\n";
-    let config = Config {
-        inner: Arc::new(ArcSwap::from_pointee(
-            InnerConfig::parse_config_with_virtual_keys(input, &test_virtual_keymap())
-                .expect("jump picker config"),
-        )),
-    };
-    assert!(config.jump_picker_enabled());
-    let (code, modifiers) = config.jump_picker_binding().expect("default jump binding");
-    assert_eq!(code, 48);
-    assert_eq!(modifiers, Modifiers::CMD);
-    assert!(matches!(
-        config.find_keybind(code, Modifiers::LCMD),
-        Some(Command::Jump)
-    ));
-    assert!(!config.jump_picker_keys().is_empty());
-}
-
-#[test]
 fn test_parse_absolute_virtual_workspace_commands() {
     assert!(matches!(
         parse_command(&["window", "virtualnum", "3"]).unwrap(),
@@ -2553,7 +2450,6 @@ mod lua_setup_tests {
         let config = config_from_source(
             r"return {
                 default_workspaces = 3,
-                jump_picker = { enabled = true },
                 options = {
                     sliver_width = 9,
                     focus_follows_mouse = false,
@@ -2563,12 +2459,6 @@ mod lua_setup_tests {
             }",
         );
         assert_eq!(config.default_workspaces(), 3);
-        assert!(config.jump_picker_enabled());
-        assert_eq!(
-            config.jump_picker_binding(),
-            Some((48, Modifiers::CMD)),
-            "Lua setup should resolve the default Cmd-Tab chord"
-        );
         assert_eq!(config.sliver_width(), 9);
         assert!(!config.focus_follows_mouse());
         assert_eq!(config.preset_stack_heights(), vec![0.3, 0.7]);

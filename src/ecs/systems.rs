@@ -26,19 +26,18 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
+use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LayoutPosition, LowPowerMode, MissionControlActive, Position, ReadDisplayProperties,
-    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
-    WindowProperties,
+    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager, OverviewManager};
+use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
 
@@ -1290,74 +1289,53 @@ pub(super) fn commit_window_size(
 /// managed window on the display its frame center falls in.
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<(Entity, &mut Window, &LayoutPosition)>,
-    layout_strips: Query<(&LayoutStrip, &ChildOf)>,
-    displays: Query<(Entity, &Display)>,
+    mut all_windows: Query<&mut Window>,
+    displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
-    mut overview_mgr: Option<NonSendMut<OverviewManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows
-            .iter()
-            .map(|(_, w, _)| w.id())
-            .collect::<Vec<_>>();
+        let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
-        crate::platform::input::deactivate_jump_picker();
 
         if let Some(ref mut overlay_mgr) = overlay_mgr {
             overlay_mgr.remove_all();
         }
-        if let Some(ref mut overview_mgr) = overview_mgr {
-            overview_mgr.remove();
-        }
 
-        let display_bounds = displays
-            .iter()
-            .map(|(entity, display)| (entity, display.bounds()))
-            .collect::<Vec<_>>();
+        let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
         if display_bounds.is_empty() {
             return;
         }
 
-        for (entity, mut window, layout_position) in &mut all_windows {
+        for mut window in &mut all_windows {
             let frame = window.frame();
-            let owner_display = layout_strips
-                .iter()
-                .find(|(strip, _)| strip.contains(entity))
-                .and_then(|(_, child)| {
-                    display_bounds
-                        .iter()
-                        .find_map(|(id, bounds)| (*id == child.parent()).then_some(*bounds))
-                });
             let center = frame.center();
-            let display_bounds = owner_display.unwrap_or_else(|| {
-                display_bounds
-                    .iter()
-                    .find_map(|(_, bounds)| bounds.contains(center).then_some(*bounds))
-                    .unwrap_or(display_bounds[0].1)
-            });
+            let bounds = display_bounds
+                .iter()
+                .find(|b| {
+                    center.x >= b.min.x
+                        && center.x <= b.max.x
+                        && center.y >= b.min.y
+                        && center.y <= b.max.y
+                })
+                .copied()
+                .unwrap_or(display_bounds[0]);
 
             let mut size = frame.size();
-            if size.x > display_bounds.width() || size.y > display_bounds.height() {
+            if size.x > bounds.width() || size.y > bounds.height() {
                 let new_size = bevy::math::IVec2::new(
-                    size.x.min(display_bounds.width() * 9 / 10),
-                    size.y.min(display_bounds.height() * 9 / 10),
+                    size.x.min(bounds.width() * 9 / 10),
+                    size.y.min(bounds.height() * 9 / 10),
                 );
                 window.resize(new_size);
                 size = new_size;
             }
 
-            // Managed windows use their logical slot, not their parked live
-            // frame. Floating windows retain their live origin. Either is
-            // clamped fully back into its owning display before Paneru exits.
-            let intended = if owner_display.is_some() {
-                display_bounds.min + layout_position.0
-            } else {
-                frame.min
-            };
-            let origin = clamp_origin_to_viewport(intended, size, display_bounds);
+            let origin = bevy::math::IVec2::new(
+                bounds.min.x + (bounds.width() - size.x) / 2,
+                bounds.min.y + (bounds.height() - size.y) / 2,
+            );
             info!(
                 "exit cleanup: window {} -> origin {:?}, size {:?}",
                 window.id(),

@@ -135,7 +135,6 @@ objc2-app-kit = { version = "0.3", features = [
   "NSFont",
   "NSAttributedString",
   "NSParagraphStyle",
-  "NSRunningApplication",
   "NSStringDrawing",
   "NSImage",
   "NSControl",
