@@ -20,7 +20,7 @@ use std::path::Path;
 use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use stdext::function_name;
 use tracing::{Level, debug, error, instrument, trace, warn};
 
@@ -442,12 +442,20 @@ impl WindowManagerApi for WindowManagerOS {
         config: &Config,
     ) -> Result<(Vec<Window>, Vec<WinID>)> {
         let global_window_list = existing_application_window_list(self.main_cid, app, spaces)?;
+        let found_windows = app.window_list(config);
         if global_window_list.is_empty() {
-            return Err(Error::InvalidInput(format!("No windows found for {app}")));
+            if found_windows.is_empty() {
+                return Err(Error::InvalidInput(format!("No windows found for {app}")));
+            }
+
+            warn!(
+                "{app} has no SkyLight windows, falling back to {} AX windows",
+                found_windows.len()
+            );
+            return Ok((found_windows, vec![]));
         }
         debug!("{app} has global windows: {global_window_list:?}");
 
-        let found_windows = app.window_list(config);
         if found_windows.len() == global_window_list.len() {
             debug!("All windows for {:?} are now resolved", app.psn());
             return Ok((found_windows, vec![]));
@@ -734,11 +742,6 @@ fn existing_application_window_list(
     space_window_list_for_connection(cid, spaces, app.connection(), true)
 }
 
-/// Wall-clock ceiling on a single application's brute-force scan: generous
-/// next to a healthy scan, but short enough that an app which never resolves
-/// cannot hold up initialisation, which waits on these tasks.
-const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
-
 /// How many applications may run [`bruteforce_windows`] at the same time.
 ///
 /// Each loop iteration is a synchronous, private-API AX round trip. Letting
@@ -833,24 +836,9 @@ pub fn bruteforce_windows(
     let bytes = MAGIC.to_ne_bytes();
     data[0x8..0x8 + bytes.len()].copy_from_slice(&bytes);
 
-    // A window SkyLight lists but that never resolves to an AX element (a
-    // panel, helper, anything non-AX) never clears from `window_list`, so
-    // without this deadline the scan would run all 0x7fff round trips every
-    // time that app starts.
-    let deadline = Instant::now() + BRUTEFORCE_BUDGET;
-
     for element_id in 0..0x7fffu64 {
         // Every iteration is a synchronous cross-process AX round trip.
         if window_list.is_empty() {
-            break;
-        }
-        // Checked periodically only: `Instant::now` can itself be a syscall.
-        if element_id.is_multiple_of(256) && Instant::now() >= deadline {
-            warn!(
-                "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
-                 unresolved: {window_list:?}",
-                window_list.len()
-            );
             break;
         }
 

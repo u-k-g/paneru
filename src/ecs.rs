@@ -37,7 +37,7 @@ use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
 use crate::menubar::MenuBarManager;
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashMessageManager, OverlayManager, OverviewManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
@@ -46,6 +46,7 @@ pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
 pub mod mouse;
+pub mod overview;
 pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
@@ -72,6 +73,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_secs(1);
     const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
+
+    app.init_resource::<systems::AnimationCadence>();
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -179,14 +182,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
         PostUpdate,
         (
             (
+                systems::prepare_animation_frame,
+                systems::animate_resize_entities,
                 systems::animate_entities,
+                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
                 systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
                 systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
-            (
-                systems::animate_resize_entities,
-                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
             (
@@ -310,6 +311,10 @@ pub struct Scrolling {
     pub position: f64,
     /// When true, the user's fingers are on the trackpad.
     pub is_user_swiping: bool,
+    /// Finger count for the raw gesture currently driving the strip.
+    pub fingers_count: Option<usize>,
+    /// Window focused when the current gesture began.
+    pub started_focused: Option<Entity>,
     /// Last time a physical swipe event was received.
     pub last_event: Duration,
 }
@@ -500,6 +505,8 @@ pub struct RaiseWindow {
 pub trait SpawnCommandsExt {
     fn reposition_entity(&mut self, entity: Entity, origin: Origin);
 
+    fn snap_entity_position(&mut self, entity: Entity, origin: Origin);
+
     fn resize_entity(&mut self, entity: Entity, size: Size);
 
     fn reshuffle_around(&mut self, entity: Entity);
@@ -531,6 +538,14 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     fn reposition_entity(&mut self, entity: Entity, origin: Origin) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
             entity_commands.try_insert(RepositionMarker(origin));
+        }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn snap_entity_position(&mut self, entity: Entity, origin: Origin) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(Position(origin));
+            entity_commands.try_remove::<RepositionMarker>();
         }
     }
 
@@ -682,6 +697,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(Initializing)
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
+        .add_plugins(overview::OverviewPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
         .add_plugins(layout::LayoutEventsPlugin)
@@ -715,10 +731,12 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
+    let overview_manager = OverviewManager::new(mtm);
     let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
+        .insert_non_send(overview_manager)
         .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
@@ -9,7 +10,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single, SystemParam};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
@@ -19,7 +20,7 @@ use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::workspace::RestoreFocusMarker;
+use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
@@ -94,6 +95,27 @@ impl FocusHistory {
 
 pub struct FocusEventsPlugin;
 
+#[derive(Component)]
+struct PendingAutoCenter(Entity);
+
+#[derive(SystemParam)]
+struct AutoCenterWorkspace<'w, 's> {
+    newly_active: Query<'w, 's, (), Added<ActiveWorkspaceMarker>>,
+}
+
+type PendingAutoCenterStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static PendingAutoCenter,
+        &'static LayoutStrip,
+        &'static Position,
+        Option<&'static PreviousStripPosition>,
+        Has<ActiveWorkspaceMarker>,
+    ),
+>;
+
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
@@ -102,6 +124,10 @@ impl Plugin for FocusEventsPlugin {
             PostUpdate,
             (
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
+                autocenter_activated_workspace
+                    .after(autocenter_window_on_focus)
+                    .after(super::systems::animate_entities)
+                    .after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
@@ -256,6 +282,7 @@ fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
+    active_workspace: AutoCenterWorkspace,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -278,15 +305,75 @@ fn autocenter_window_on_focus(
     if ctx.config.auto_center()
         && let Some((_, _, None)) = ctx.windows.get_managed(entity)
         && let Some(size) = ctx.windows.size(entity)
-        && let Some(mut origin) = ctx.windows.origin(entity)
     {
         let center = active_display.bounds().center();
-        origin.x = center.x - size.x / 2;
-        ctx.commands.reposition_entity(entity, origin);
+        if active_workspace
+            .newly_active
+            .contains(active_display.active_strip_entity())
+            && active_display.active_strip().contains(entity)
+        {
+            // External focus (for example Cmd-Tab) can activate a virtual
+            // workspace while its windows still have their parked off-screen
+            // frames. Defer centering until show_active_workspace has restored
+            // the strip; otherwise a per-window target retains the parked Y
+            // coordinate and can also be detached from its logical row.
+            if let Ok(mut commands) = ctx
+                .commands
+                .get_entity(active_display.active_strip_entity())
+            {
+                commands.try_insert(PendingAutoCenter(entity));
+            }
+            return;
+        }
+
+        if let Some(mut origin) = ctx.windows.origin(entity) {
+            origin.x = center.x - size.x / 2;
+            ctx.commands.reposition_entity(entity, origin);
+        }
     }
     ctx.commands.reshuffle_around(entity);
 }
 
+#[instrument(level = Level::DEBUG, skip_all)]
+fn autocenter_activated_workspace(
+    pending: PendingAutoCenterStrips,
+    windows: Windows,
+    focused: Query<(), With<FocusedMarker>>,
+    active_display: ActiveDisplay,
+    mut commands: Commands,
+) {
+    for (strip_entity, pending, strip, position, previous, active) in pending {
+        if !active || !focused.contains(pending.0) || !strip.contains(pending.0) {
+            if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+                entity_commands.try_remove::<PendingAutoCenter>();
+            }
+            continue;
+        }
+
+        // The activation marker and focus marker can land after
+        // show_active_workspace has already run for this frame. Keep the
+        // request until the saved strip position has actually been restored.
+        if previous.is_some() {
+            continue;
+        }
+
+        let Some(layout_position) = windows.layout_position(pending.0) else {
+            continue;
+        };
+        let Some(size) = windows.size(pending.0) else {
+            continue;
+        };
+
+        let mut strip_origin = position.0;
+        strip_origin.x = active_display.bounds().center().x - size.x / 2 - layout_position.x;
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_remove::<PendingAutoCenter>();
+        }
+        commands.reposition_entity(strip_entity, strip_origin);
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn mouse_follows_focus(
     focused: Single<Entity, Added<FocusedMarker>>,

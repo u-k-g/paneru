@@ -1129,6 +1129,7 @@ fn column_closest_to_center(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn show_active_workspace(
     activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
     windows: Windows,
@@ -1195,6 +1196,23 @@ pub(crate) fn show_active_workspace(
 
     // If no previous strip position exists, then the workspace was not hidden.
     if let Some(PreviousStripPosition { origin, focus }) = previous_position {
+        let mut origin = *origin;
+        // An external focus can activate a hidden virtual workspace before the
+        // deferred focus auto-center runs. Center the saved strip origin while
+        // restoring it so window placement does not depend on system order.
+        if config.auto_center()
+            && let Some((_, current_focus)) = windows.focused()
+            && strip.contains(current_focus)
+            && let Some(layout_position) = windows.layout_position(current_focus)
+            && let Some(size) = windows.size(current_focus)
+            && let Ok((display, _)) = displays.get(child.parent())
+        {
+            origin.x = display.bounds().center().x - size.x / 2 - layout_position.x;
+            if !config.virtual_workspace_animations() {
+                commands.snap_entity_position(current_focus, origin + layout_position.0);
+            }
+        }
+
         if let Ok(mut entity_commands) = commands.get_entity(*activated) {
             entity_commands.try_remove::<PreviousStripPosition>();
         }
@@ -1231,9 +1249,9 @@ pub(crate) fn show_active_workspace(
                 let size = windows.size(focus_entity)?;
                 let (display, dock) = displays.get(child.parent()).ok()?;
                 let viewport = display.actual_display_bounds(dock, &config);
-                Some(origin_exposing(layout, size, *origin, viewport))
+                Some(origin_exposing(layout, size, origin, viewport))
             })
-            .unwrap_or(*origin);
+            .unwrap_or(origin);
 
         if config.virtual_workspace_animations() {
             commands.reposition_entity(*activated, origin);

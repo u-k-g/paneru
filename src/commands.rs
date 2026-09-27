@@ -101,8 +101,62 @@ pub fn register_commands(app: &mut bevy::app::App) {
     //
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
+    app.add_systems(PreUpdate, rescue_offscreen_windows);
     app.init_resource::<SnippetDialect>();
     app.add_systems(PreUpdate, copy_window_rule);
+}
+
+/// Restores floating windows that belong to the visible native workspace but
+/// have been pushed wholly outside its display. Managed strip members are not
+/// candidates: their off-screen placement is intentional layout state.
+fn rescue_offscreen_windows(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    if messages.read().all(|event| {
+        !matches!(
+            event,
+            Event::Command {
+                command: Command::Rescue
+            }
+        )
+    }) {
+        return;
+    }
+
+    let viewport = active_display.bounds();
+    let workspace_id = active_display.active_strip().id();
+    let workspace_windows = window_manager
+        .windows_in_workspace(workspace_id)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut rescued = 0;
+
+    for (_, entity) in windows.iter() {
+        let Some((window, _, Some(Unmanaged::Floating))) = windows.get_managed(entity) else {
+            continue;
+        };
+        let Some(frame) = windows.frame(entity) else {
+            continue;
+        };
+        if !workspace_windows.contains(&window.id()) || !viewport.intersect(frame).is_empty() {
+            continue;
+        }
+
+        let origin = clamp_origin_to_viewport(frame.min, frame.size(), viewport);
+        commands.reposition_entity(entity, origin);
+        commands.trigger(RaiseWindow {
+            entity,
+            with_strip: false,
+        });
+        rescued += 1;
+    }
+
+    commands.flash_message(format!("Rescued {rescued} window(s)"), 1.2);
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(

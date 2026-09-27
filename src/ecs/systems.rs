@@ -1,9 +1,10 @@
 use bevy::app::AppExit;
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
@@ -25,18 +26,19 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    LayoutPosition, LowPowerMode, MissionControlActive, Position, ReadDisplayProperties,
+    RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashMessageManager, OverlayManager, OverviewManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
 
@@ -81,6 +83,18 @@ type ResizableWindows<'w, 's> = Query<
     Without<LayoutStrip>,
 >;
 
+/// Active animation targets and the change ticks used to make their first
+/// display-paced step immediate.
+type AnimationTargets<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<Ref<'static, RepositionMarker>>,
+        Option<Ref<'static, ResizeMarker>>,
+    ),
+    Or<(With<RepositionMarker>, With<ResizeMarker>)>,
+>;
+
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
@@ -104,6 +118,87 @@ const LOOP_TIMEOUT_STEP: u32 = 1;
 /// leftover events stay in the channel for the next frame to pick up.
 const PUMP_BUDGET: Duration = Duration::from_millis(4);
 const PUMP_MAX_EVENTS: usize = 256;
+
+/// Shared animation pulse for both position and size changes.
+///
+/// Paneru's application loop intentionally runs as soon as events arrive. That
+/// is excellent for input latency, but using every one of those irregular loop
+/// iterations as an animation frame causes redundant AX writes and uneven
+/// integer-pixel steps. This resource preserves the eager loop while pacing
+/// visual updates to the fastest attached display.
+#[derive(Debug, Resource)]
+pub(super) struct AnimationCadence {
+    accumulated_seconds: f64,
+    delta_seconds: f64,
+    frame_due: bool,
+}
+
+impl Default for AnimationCadence {
+    fn default() -> Self {
+        Self {
+            accumulated_seconds: 0.0,
+            delta_seconds: 1.0 / 60.0,
+            frame_due: false,
+        }
+    }
+}
+
+impl AnimationCadence {
+    const MAX_DELTA_SECONDS: f64 = 0.1;
+
+    fn advance(&mut self, elapsed_seconds: f64, refresh_rate_hz: u32, target_changed: bool) {
+        let refresh_rate_hz = refresh_rate_hz.clamp(30, 240);
+        let interval = 1.0 / f64::from(refresh_rate_hz);
+
+        if target_changed {
+            // Do not wait up to one display period before acknowledging input.
+            // A full nominal step gives the first frame useful motion even
+            // though the event loop itself may only have advanced by 1 ms.
+            self.delta_seconds = elapsed_seconds.max(interval).min(Self::MAX_DELTA_SECONDS);
+            self.accumulated_seconds = 0.0;
+            self.frame_due = true;
+            return;
+        }
+
+        self.accumulated_seconds += elapsed_seconds.max(0.0);
+        if self.accumulated_seconds + f64::EPSILON < interval {
+            self.frame_due = false;
+            return;
+        }
+
+        self.delta_seconds = self.accumulated_seconds.min(Self::MAX_DELTA_SECONDS);
+        self.accumulated_seconds %= interval;
+        self.frame_due = true;
+    }
+
+    fn idle(&mut self) {
+        self.accumulated_seconds = 0.0;
+        self.frame_due = false;
+    }
+}
+
+pub(super) fn prepare_animation_frame(
+    time: Res<Time>,
+    displays: Query<&Display>,
+    targets: AnimationTargets,
+    mut cadence: ResMut<AnimationCadence>,
+) {
+    if targets.is_empty() {
+        cadence.idle();
+        return;
+    }
+
+    let target_changed = targets.iter().any(|(position, size)| {
+        position.is_some_and(|marker| marker.is_changed())
+            || size.is_some_and(|marker| marker.is_changed())
+    });
+    let refresh_rate_hz = displays
+        .iter()
+        .map(Display::refresh_rate_hz)
+        .max()
+        .unwrap_or(60);
+    cadence.advance(time.delta_secs_f64(), refresh_rate_hz, target_changed);
+}
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
@@ -221,15 +316,20 @@ pub(crate) fn add_existing_application(
         .into_iter()
         .map(LayoutStrip::id)
         .collect::<Vec<_>>();
-    let thread_pool = AsyncComputeTaskPool::get();
 
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
-            && let Ok((found_windows, offscreen)) = window_manager
-                .find_existing_application_windows(&mut app, &spaces, &config)
-                .inspect_err(|err| warn!("{err}"))
+        if !app.observe().is_ok_and(|result| result) {
+            debug!(
+                "failed to register some observers for {}; continuing window discovery",
+                app.name()
+            );
+        }
+
+        if let Ok((found_windows, offscreen)) = window_manager
+            .find_existing_application_windows(&mut app, &spaces, &config)
+            .inspect_err(|err| warn!("{err}"))
         {
             offscreen_windows.extend(offscreen);
             commands.trigger(SpawnWindowTrigger(found_windows));
@@ -239,6 +339,7 @@ pub(crate) fn add_existing_application(
         }
 
         if !offscreen_windows.is_empty() {
+            let thread_pool = AsyncComputeTaskPool::get();
             let pid = app.pid();
             let bundle_id = app.bundle_id();
             let config = config.clone();
@@ -583,18 +684,21 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
-    time: Res<Time>,
+    animate: Populated<(&mut Position, Entity, &RepositionMarker, Has<Window>)>,
+    cadence: Res<AnimationCadence>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    if !cadence.frame_due {
+        return;
+    }
+
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), cadence.delta_seconds);
 
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
+    animate.into_iter().for_each(
+        |(mut position, entity, RepositionMarker(origin), is_window)| {
             let target = origin.as_vec2();
             let current = position.0.as_vec2();
             let lerped = current.lerp(target, t);
@@ -615,8 +719,15 @@ pub(super) fn animate_entities(
             position.0 = new_pos;
             if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
+                if is_window {
+                    // macOS may clamp an off-screen or constrained move after
+                    // accepting the AX write. Verify only the final frame so
+                    // smooth motion does not pay for an AX readback each tick.
+                    entity_commands.try_insert(VerifyWindowPosition::default());
+                }
             }
-        });
+        },
+    );
 }
 
 /// Animates window resizing.
@@ -632,12 +743,16 @@ pub(super) fn animate_entities(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
-    time: Res<Time>,
+    cadence: Res<AnimationCadence>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    if !cadence.frame_due {
+        return;
+    }
+
     // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), cadence.delta_seconds);
 
     animate
         .into_iter()
@@ -894,6 +1009,7 @@ pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
     existing_config: Option<Res<Config>>,
     mut displays: Query<&mut Display>,
+    mut deferred_events: MessageWriter<Event>,
     mut commands: Commands,
 ) {
     let Some(receiver) = receiver else {
@@ -905,8 +1021,12 @@ pub(crate) fn gather_initial_processes(
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded | Event::Exit => break,
-            Event::ApplicationLaunched { psn, observer } => {
-                let process: BProcess = Process::new(&psn, observer.clone()).into();
+            Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer,
+            } => {
+                let process: BProcess = Process::new(&psn, observer.clone(), pid_hint).into();
                 if process.pid() != 0 {
                     initial_processes.push(process);
                 } else {
@@ -916,7 +1036,13 @@ pub(crate) fn gather_initial_processes(
             Event::InitialConfig(config) => {
                 toml_config = Some(config);
             }
-            event => warn!("Stray event during initial process gathering: {event:?}"),
+            // The reader is already serving IPC while this synchronous startup
+            // scan drains the same channel. Preserve queries, subscriptions and
+            // ordinary OS events for the first PreUpdate instead of dropping a
+            // client handshake and leaving it blocked forever.
+            event => {
+                deferred_events.write(event);
+            }
         }
     }
 
@@ -1101,9 +1227,12 @@ pub(super) fn update_overlays(
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
 ) {
-    moved_windows
-        .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+    // AX/AppKit access is main-thread-only. Changed-position filtering and the
+    // display-paced animation cadence keep this loop small without sending OS
+    // calls through Bevy's worker pool.
+    for (mut window, position) in &mut moved_windows {
+        window.reposition(position.0);
+    }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1134,15 +1263,26 @@ pub(super) fn verify_window_position(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    mut resized_windows: Populated<
+        (Entity, &mut Window, &Bounds, &mut WidthRatio),
+        Changed<Bounds>,
+    >,
+    layout_strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
 ) {
-    let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            window.resize(size.0);
-        });
+    for (entity, mut window, size, mut width_ratio) in &mut resized_windows {
+        // A display change can resize windows on several monitors in one frame.
+        // Using the globally active display here corrupts the stored width ratio
+        // for every window that belongs to a differently-sized monitor.
+        let display_width = layout_strips
+            .iter()
+            .find(|(strip, _)| strip.contains(entity))
+            .and_then(|(_, display_parent)| displays.get(display_parent.parent()).ok())
+            .map_or_else(|| active_display.bounds().width(), Display::width);
+
+        width_ratio.0 = f64::from(size.0.x) / f64::from(display_width.max(1));
+        window.resize(size.0);
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
@@ -1150,53 +1290,74 @@ pub(super) fn commit_window_size(
 /// managed window on the display its frame center falls in.
 pub(super) fn cleanup_on_exit(
     mut exit_events: MessageReader<AppExit>,
-    mut all_windows: Query<&mut Window>,
-    displays: Query<&Display>,
+    mut all_windows: Query<(Entity, &mut Window, &LayoutPosition)>,
+    layout_strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<(Entity, &Display)>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut overview_mgr: Option<NonSendMut<OverviewManager>>,
 ) {
     for _ in exit_events.read() {
-        let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
+        let ids = all_windows
+            .iter()
+            .map(|(_, w, _)| w.id())
+            .collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
+        crate::platform::input::deactivate_jump_picker();
 
         if let Some(ref mut overlay_mgr) = overlay_mgr {
             overlay_mgr.remove_all();
         }
+        if let Some(ref mut overview_mgr) = overview_mgr {
+            overview_mgr.remove();
+        }
 
-        let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
+        let display_bounds = displays
+            .iter()
+            .map(|(entity, display)| (entity, display.bounds()))
+            .collect::<Vec<_>>();
         if display_bounds.is_empty() {
             return;
         }
 
-        for mut window in &mut all_windows {
+        for (entity, mut window, layout_position) in &mut all_windows {
             let frame = window.frame();
-            let center = frame.center();
-            let bounds = display_bounds
+            let owner_display = layout_strips
                 .iter()
-                .find(|b| {
-                    center.x >= b.min.x
-                        && center.x <= b.max.x
-                        && center.y >= b.min.y
-                        && center.y <= b.max.y
-                })
-                .copied()
-                .unwrap_or(display_bounds[0]);
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, child)| {
+                    display_bounds
+                        .iter()
+                        .find_map(|(id, bounds)| (*id == child.parent()).then_some(*bounds))
+                });
+            let center = frame.center();
+            let display_bounds = owner_display.unwrap_or_else(|| {
+                display_bounds
+                    .iter()
+                    .find_map(|(_, bounds)| bounds.contains(center).then_some(*bounds))
+                    .unwrap_or(display_bounds[0].1)
+            });
 
             let mut size = frame.size();
-            if size.x > bounds.width() || size.y > bounds.height() {
+            if size.x > display_bounds.width() || size.y > display_bounds.height() {
                 let new_size = bevy::math::IVec2::new(
-                    size.x.min(bounds.width() * 9 / 10),
-                    size.y.min(bounds.height() * 9 / 10),
+                    size.x.min(display_bounds.width() * 9 / 10),
+                    size.y.min(display_bounds.height() * 9 / 10),
                 );
                 window.resize(new_size);
                 size = new_size;
             }
 
-            let origin = bevy::math::IVec2::new(
-                bounds.min.x + (bounds.width() - size.x) / 2,
-                bounds.min.y + (bounds.height() - size.y) / 2,
-            );
+            // Managed windows use their logical slot, not their parked live
+            // frame. Floating windows retain their live origin. Either is
+            // clamped fully back into its owning display before Paneru exits.
+            let intended = if owner_display.is_some() {
+                display_bounds.min + layout_position.0
+            } else {
+                frame.min
+            };
+            let origin = clamp_origin_to_viewport(intended, size, display_bounds);
             info!(
                 "exit cleanup: window {} -> origin {:?}, size {:?}",
                 window.id(),
@@ -1579,6 +1740,7 @@ mod tests {
         sender.send(Event::ProcessesLoaded).expect("send loaded");
 
         let mut app = App::new();
+        app.add_message::<Event>();
         app.insert_resource(lua_config);
         app.insert_non_send(receiver);
         app.add_systems(Update, gather_initial_processes);

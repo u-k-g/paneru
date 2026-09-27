@@ -30,6 +30,7 @@ use paneru_shared_types::wire::Response;
 struct Subscriber {
     channel: Arc<async_mach_ports::Subscriber>,
     alive: Arc<AtomicBool>,
+    initialized: bool,
 }
 
 #[derive(Default, Resource)]
@@ -241,10 +242,47 @@ fn state_subscribe_handler(
         let Event::StateSubscribe { subscriber } = event else {
             continue;
         };
+
         subscribers.streams.push(Subscriber {
             channel: subscriber.clone(),
             alive: Arc::new(AtomicBool::new(true)),
+            initialized: false,
         });
+    }
+}
+
+/// Makes each new subscription a complete synchronization point, not merely a
+/// promise of future deltas. If Paneru is still initializing, this is retried
+/// every frame until state extraction succeeds, so connecting early cannot
+/// strand a consumer waiting for the next mutation.
+fn initialize_subscribers(subscribers: &mut StateSubscribers, state: &QueryStateParams) {
+    if subscribers
+        .streams
+        .iter()
+        .all(|subscriber| subscriber.initialized)
+    {
+        return;
+    }
+
+    let Ok(document) = state.extract() else {
+        return;
+    };
+    let initial = StateEvent::WindowsChanged {
+        virtual_workspace_number: document.active.virtual_workspace_number,
+        active: document.active,
+    };
+
+    for subscriber in &mut subscribers.streams {
+        if subscriber.initialized {
+            continue;
+        }
+        match subscriber.channel.try_send(&initial) {
+            Ok(()) => subscriber.initialized = true,
+            Err(async_mach_ports::Error::PeerGone) => {
+                subscriber.alive.store(false, Ordering::Relaxed);
+            }
+            Err(err) => warn!("pushing initial subscription state: {err}"),
+        }
     }
 }
 
@@ -378,6 +416,8 @@ fn state_event_broadcast_handler(
         return;
     }
 
+    initialize_subscribers(&mut subscribers, &state);
+
     let signals = StateBroadcastSignals {
         virtual_workspace_changed: !active_workspace_changes.is_empty(),
         windows_changed: events.iter().any(|event| {
@@ -433,6 +473,9 @@ fn state_event_broadcast_handler(
 
     let events = Arc::new(outgoing);
     for subscriber in &subscribers.streams {
+        if !subscriber.initialized {
+            continue;
+        }
         for event in events.iter() {
             match subscriber.channel.try_send(event) {
                 Ok(()) => {}

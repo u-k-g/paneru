@@ -995,11 +995,9 @@ fn test_set_frame_places_a_floating_window() {
             },
         ]),
     });
-    // Several ticks: the placement has to survive the layout passes that follow,
-    // not just land for one frame.
-    for _ in 0..4 {
-        harness.app.update();
-    }
+    // Let the configured animation settle: the placement has to survive the
+    // layout passes that follow, not just land for one frame.
+    harness.advance(std::time::Duration::from_millis(500));
 
     let after = extract_window_set(harness.world()).expect("window set extraction");
     let record = after.window(window).expect("the window survived");

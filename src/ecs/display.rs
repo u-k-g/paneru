@@ -380,6 +380,18 @@ fn read_display_properties_trigger(
         display.set_notch_height(height);
     }
 
+    let refresh_rate = read_screen_property(&screens, display_id, |screen| {
+        u32::try_from(screen.maximumFramesPerSecond()).unwrap_or(60)
+    });
+    if let Some(refresh_rate) = refresh_rate {
+        display.set_refresh_rate_hz(refresh_rate);
+        let refresh_rate_hz = display.refresh_rate_hz();
+        debug!(
+            "refresh rate on display {display_id}: {} Hz",
+            refresh_rate_hz
+        );
+    }
+
     let dock = read_screen_property(&screens, display_id, |screen| {
         let visible_frame = irect_from(screen.visibleFrame());
         display.locate_dock(&visible_frame)

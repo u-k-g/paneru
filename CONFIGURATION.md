@@ -28,7 +28,7 @@ General behavior settings for the window manager.
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
-| `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
+| `animation_speed` | Float | `28.0` | Exponential window-animation speed. The comfortable range is roughly 12–30; higher values settle faster. Set a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
 | `sliver_width` | Integer (px) | `5` | Horizontal width of off-screen windows kept visible. |
@@ -41,6 +41,32 @@ General behavior settings for the window manager.
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
+
+---
+
+## Spatial Overview (`[jump_picker]`)
+
+The Overview is a bird's-eye map of the strip topology, including native
+macOS Spaces and Paneru virtual-workspace rows. Windows retain their spatial
+column and stack relationships, represented by application icons at their
+window positions. Press the configured binding, then the mark drawn on an icon
+to focus its window with the normal strip animation.
+
+It is disabled by default. When enabled, the binding defaults to Cmd-Tab.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Boolean | `false` | Enable the spatial Overview and reserve its binding. |
+| `binding` | String | `"cmd - tab"` | Chord that opens the Overview. |
+| `keys` | String | `"asdfghjklqwertyuiopzxcvbnm"` | One-key marks assigned in workspace and strip order. |
+
+```toml
+[jump_picker]
+enabled = true
+```
+
+The `jump` command opens the same Overview; `rescue` restores floating windows
+that belong to the visible workspace but are wholly off-screen.
 
 ---
 
@@ -66,6 +92,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `sensitivity` | Float (0.1–2.0) | `0.35` | Multiplier for swipe distance. |
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
 | `continuous` | Boolean | `true` | If `true`, the windows are allowed to fully move across the desktop, potentially exposing the empty desktop space. If `false`, the window strip will not move further than the left or right most window. This also affects the windows during keyboard focus - if `false` the left or right most windows will snap to the edge of display. |
+| `snap_to_window` | Boolean | `false` | After trackpad swipe momentum slows, center the nearest window column and focus its top window. |
 
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |
@@ -215,6 +242,8 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_copyrule` | Copy a window rule template for the focused window to the clipboard. |
 | `quit` | Exit Paneru. |
 | `restart` | Restart the Paneru service (`paneru restart`). |
+| `jump` | Open the spatial Overview/window picker. |
+| `rescue` | Recover off-screen floating windows on the visible workspace. |
 
 **Example:**
 ```toml

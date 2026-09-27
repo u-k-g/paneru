@@ -172,6 +172,11 @@ events whose relevant state has not changed since the last emitted event.
 Consumers should parse each line independently and then call
 `paneru query state --json` when they need a full refresh.
 
+Every new subscriber first receives a `windows_changed` event for the current
+active workspace. This makes connecting a synchronization point even when no
+window mutation happens after the subscriber starts. If the Paneru daemon exits,
+the stream closes so callers can reconnect to its replacement.
+
 ### Event Types
 
 ```json

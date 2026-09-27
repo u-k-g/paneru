@@ -23,6 +23,10 @@ pub struct SwipeOptions {
     #[allow(dead_code)]
     pub continuous: Option<bool>,
 
+    /// When a trackpad swipe ends, use its momentum to choose the current or
+    /// adjacent column, then center and focus that window. Default: false.
+    pub snap_to_window: Option<bool>,
+
     pub gesture: Option<GestureOptions>,
     pub scroll: Option<ScrollOptions>,
 }

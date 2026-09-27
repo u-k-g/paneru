@@ -488,7 +488,9 @@ fn test_unordered_window_releases_its_layout_space() {
     let mut harness = TestHarness::new().with_windows(3);
 
     // Allow initial layout to settle.
-    harness.advance(Duration::from_millis(100));
+    for _ in 0..10 {
+        harness.advance(Duration::from_millis(50));
+    }
     assert_eq!(window_x(harness.app.world_mut(), 0), 0);
     assert_eq!(window_x(harness.app.world_mut(), 1), TEST_WINDOW_WIDTH);
     assert_eq!(window_x(harness.app.world_mut(), 2), TEST_WINDOW_WIDTH * 2);
@@ -498,6 +500,9 @@ fn test_unordered_window_releases_its_layout_space() {
 
     // Step past the 1-second periodic CLOSED_WINDOW_CHECK_FREQ timer.
     harness.advance(Duration::from_millis(1100));
+    for _ in 0..10 {
+        harness.advance(Duration::from_millis(50));
+    }
 
     let mut query = harness.app.world_mut().query::<&crate::manager::Window>();
     assert!(
