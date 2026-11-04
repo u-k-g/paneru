@@ -101,9 +101,7 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// * `config` - The current Paneru configuration, used to evaluate window rules.
     ///
-    /// # Errors
-    ///
-    /// Returns an `Error` if the window list cannot be retrieved.
+    /// Returns an empty list if AX enumeration fails or no manageable windows exist.
     fn window_list(&self, config: &Config) -> Vec<Window>;
     /// Returns the IDs of the windows the app currently exposes over
     /// accessibility.
@@ -111,6 +109,8 @@ pub trait ApplicationApi: Send + Sync {
     /// A background native tab is missing from this list while the window
     /// server still reports it on screen, which is what tells the two apart.
     fn ax_window_ids(&self) -> Vec<WinID>;
+    /// Returns `None` while the application's AX window list is unavailable.
+    fn accessible_window_list(&self, config: &Config) -> Option<Vec<Window>>;
     /// Starts observing application-level accessibility notifications.
     ///
     /// # Errors
@@ -293,23 +293,22 @@ impl ApplicationApi for ApplicationOS {
 
     /// Retrieves a list of all windows associated with the application.
     ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<Result<Window>>)` containing the list of window objects if successful, otherwise `Err(Error)`.
+    /// Returns the manageable windows, or an empty list when AX is unavailable.
     fn window_list(&self, config: &Config) -> Vec<Window> {
+        self.accessible_window_list(config).unwrap_or_default()
+    }
+
+    fn accessible_window_list(&self, config: &Config) -> Option<Vec<Window>> {
         let bundle_id = self.bundle_id.as_deref();
-        self.element
-            .windows()
-            .map(|windows| {
-                windows
-                    .into_iter()
-                    .flat_map(|element| {
-                        WindowOS::new_with_config(&element, config, bundle_id)
-                            .map(|window| Window::new(Box::new(window)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.element.windows().ok().map(|windows| {
+            windows
+                .into_iter()
+                .flat_map(|element| {
+                    WindowOS::new_with_config(&element, config, bundle_id)
+                        .map(|window| Window::new(Box::new(window)))
+                })
+                .collect()
+        })
     }
 
     fn ax_window_ids(&self) -> Vec<WinID> {

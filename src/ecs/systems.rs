@@ -1,9 +1,10 @@
 use bevy::app::AppExit;
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
@@ -20,7 +21,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    RetryAccessibility, RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -83,6 +84,18 @@ type ResizableWindows<'w, 's> = Query<
     Without<LayoutStrip>,
 >;
 
+/// Active animation targets and the change ticks used to make their first
+/// display-paced step immediate.
+type AnimationTargets<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<Ref<'static, RepositionMarker>>,
+        Option<Ref<'static, ResizeMarker>>,
+    ),
+    Or<(With<RepositionMarker>, With<ResizeMarker>)>,
+>;
+
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
@@ -124,6 +137,87 @@ fn next_pump_timeout(timeout: u32, limit: u32) -> u32 {
 /// leftover events stay in the channel for the next frame to pick up.
 const PUMP_BUDGET: Duration = Duration::from_millis(4);
 const PUMP_MAX_EVENTS: usize = 256;
+
+/// Shared animation pulse for both position and size changes.
+///
+/// Paneru's application loop intentionally runs as soon as events arrive. That
+/// is excellent for input latency, but using every one of those irregular loop
+/// iterations as an animation frame causes redundant AX writes and uneven
+/// integer-pixel steps. This resource preserves the eager loop while pacing
+/// visual updates to the fastest attached display.
+#[derive(Debug, Resource)]
+pub(super) struct AnimationCadence {
+    accumulated_seconds: f64,
+    delta_seconds: f64,
+    frame_due: bool,
+}
+
+impl Default for AnimationCadence {
+    fn default() -> Self {
+        Self {
+            accumulated_seconds: 0.0,
+            delta_seconds: 1.0 / 60.0,
+            frame_due: false,
+        }
+    }
+}
+
+impl AnimationCadence {
+    const MAX_DELTA_SECONDS: f64 = 0.1;
+
+    fn advance(&mut self, elapsed_seconds: f64, refresh_rate_hz: u32, target_changed: bool) {
+        let refresh_rate_hz = refresh_rate_hz.clamp(30, 240);
+        let interval = 1.0 / f64::from(refresh_rate_hz);
+
+        if target_changed {
+            // Do not wait up to one display period before acknowledging input.
+            // A full nominal step gives the first frame useful motion even
+            // though the event loop itself may only have advanced by 1 ms.
+            self.delta_seconds = elapsed_seconds.max(interval).min(Self::MAX_DELTA_SECONDS);
+            self.accumulated_seconds = 0.0;
+            self.frame_due = true;
+            return;
+        }
+
+        self.accumulated_seconds += elapsed_seconds.max(0.0);
+        if self.accumulated_seconds + f64::EPSILON < interval {
+            self.frame_due = false;
+            return;
+        }
+
+        self.delta_seconds = self.accumulated_seconds.min(Self::MAX_DELTA_SECONDS);
+        self.accumulated_seconds %= interval;
+        self.frame_due = true;
+    }
+
+    fn idle(&mut self) {
+        self.accumulated_seconds = 0.0;
+        self.frame_due = false;
+    }
+}
+
+pub(super) fn prepare_animation_frame(
+    time: Res<Time>,
+    displays: Query<&Display>,
+    targets: AnimationTargets,
+    mut cadence: ResMut<AnimationCadence>,
+) {
+    if targets.is_empty() {
+        cadence.idle();
+        return;
+    }
+
+    let target_changed = targets.iter().any(|(position, size)| {
+        position.is_some_and(|marker| marker.is_changed())
+            || size.is_some_and(|marker| marker.is_changed())
+    });
+    let refresh_rate_hz = displays
+        .iter()
+        .map(Display::refresh_rate_hz)
+        .max()
+        .unwrap_or(60);
+    cadence.advance(time.delta_secs_f64(), refresh_rate_hz, target_changed);
+}
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
@@ -241,15 +335,22 @@ pub(crate) fn add_existing_application(
         .into_iter()
         .map(LayoutStrip::id)
         .collect::<Vec<_>>();
-    let thread_pool = AsyncComputeTaskPool::get();
 
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
-            && let Ok((found_windows, offscreen)) = window_manager
-                .find_existing_application_windows(&mut app, &spaces, &config)
-                .inspect_err(|err| warn!("{err}"))
+        if !app.observe().is_ok_and(|result| result) {
+            warn!(
+                "Accessibility observer unavailable for {} (pid {}); retrying window discovery",
+                app.name(),
+                app.pid()
+            );
+            commands.entity(entity).insert(RetryAccessibility);
+        }
+
+        if let Ok((found_windows, offscreen)) = window_manager
+            .find_existing_application_windows(&mut app, &spaces, &config)
+            .inspect_err(|err| warn!("{err}"))
         {
             offscreen_windows.extend(offscreen);
             commands.trigger(SpawnWindowTrigger(found_windows));
@@ -259,6 +360,7 @@ pub(crate) fn add_existing_application(
         }
 
         if !offscreen_windows.is_empty() {
+            let thread_pool = AsyncComputeTaskPool::get();
             let pid = app.pid();
             let bundle_id = app.bundle_id();
             let config = config.clone();
@@ -446,7 +548,11 @@ pub(super) fn add_launched_process(
             );
             commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
         } else {
-            debug!("failed to register some observers {}", process.name());
+            warn!(
+                "Accessibility unavailable for {}; retrying window discovery when it responds",
+                process.name()
+            );
+            commands.spawn((app, RetryAccessibility, ChildOf(entity)));
         }
     }
 }
@@ -491,6 +597,50 @@ pub(super) fn add_launched_application(
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FreshMarker>();
             }
+        }
+    }
+}
+
+/// Retries apps whose initial AX observer failed. A visible window from
+/// CoreGraphics is the signal to probe AX again; once AX responds, discover
+/// windows that may have appeared while notifications were unavailable.
+pub(super) fn retry_inaccessible_applications(
+    mut applications: Query<(Entity, &mut Application), With<RetryAccessibility>>,
+    windows: Query<&Window>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    if applications.is_empty() {
+        return;
+    }
+
+    let visible_pids = crate::manager::visible_window_pids();
+    for (entity, mut app) in &mut applications {
+        if visible_pids
+            .as_ref()
+            .is_some_and(|pids| !pids.contains(&app.pid()))
+        {
+            continue;
+        }
+
+        let Some(accessible_windows) = app.accessible_window_list(&config) else {
+            continue;
+        };
+        let observing = app.observe().is_ok_and(|complete| complete);
+        let new_windows = accessible_windows
+            .into_iter()
+            .filter(|window| !windows.iter().any(|existing| existing.id() == window.id()))
+            .collect::<Vec<_>>();
+        if !new_windows.is_empty() {
+            info!(
+                "Accessibility recovered for {}; discovered {} windows",
+                app.name(),
+                new_windows.len()
+            );
+            commands.trigger(SpawnWindowTrigger(new_windows));
+        }
+        if observing {
+            commands.entity(entity).remove::<RetryAccessibility>();
         }
     }
 }
@@ -621,18 +771,21 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
-    time: Res<Time>,
+    animate: Populated<(&mut Position, Entity, &RepositionMarker, Has<Window>)>,
+    cadence: Res<AnimationCadence>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    if !cadence.frame_due {
+        return;
+    }
+
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), cadence.delta_seconds);
 
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
+    animate.into_iter().for_each(
+        |(mut position, entity, RepositionMarker(origin), is_window)| {
             let target = origin.as_vec2();
             let current = position.0.as_vec2();
             let lerped = current.lerp(target, t);
@@ -653,8 +806,15 @@ pub(super) fn animate_entities(
             position.0 = new_pos;
             if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
+                if is_window {
+                    // macOS may clamp an off-screen or constrained move after
+                    // accepting the AX write. Verify only the final frame so
+                    // smooth motion does not pay for an AX readback each tick.
+                    entity_commands.try_insert(VerifyWindowPosition::default());
+                }
             }
-        });
+        },
+    );
 }
 
 /// Animates window resizing.
@@ -670,12 +830,16 @@ pub(super) fn animate_entities(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
-    time: Res<Time>,
+    cadence: Res<AnimationCadence>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    if !cadence.frame_due {
+        return;
+    }
+
     // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), cadence.delta_seconds);
 
     animate
         .into_iter()
@@ -928,6 +1092,7 @@ pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
     existing_config: Option<Res<Config>>,
     mut displays: Query<&mut Display>,
+    mut deferred_events: MessageWriter<Event>,
     mut commands: Commands,
 ) {
     let Some(receiver) = receiver else {
@@ -939,8 +1104,12 @@ pub(crate) fn gather_initial_processes(
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded | Event::Exit => break,
-            Event::ApplicationLaunched { psn, observer } => {
-                let process: BProcess = Process::new(&psn, observer.clone()).into();
+            Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer,
+            } => {
+                let process: BProcess = Process::new(&psn, observer.clone(), pid_hint).into();
                 if process.pid() != 0 {
                     initial_processes.push(process);
                 } else {
@@ -950,7 +1119,13 @@ pub(crate) fn gather_initial_processes(
             Event::InitialConfig(config) => {
                 toml_config = Some(config);
             }
-            event => warn!("Stray event during initial process gathering: {event:?}"),
+            // The reader is already serving IPC while this synchronous startup
+            // scan drains the same channel. Preserve queries, subscriptions and
+            // ordinary OS events for the first PreUpdate instead of dropping a
+            // client handshake and leaving it blocked forever.
+            event => {
+                deferred_events.write(event);
+            }
         }
     }
 
@@ -1171,15 +1346,26 @@ pub(super) fn verify_window_position(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    mut resized_windows: Populated<
+        (Entity, &mut Window, &Bounds, &mut WidthRatio),
+        Changed<Bounds>,
+    >,
+    layout_strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
 ) {
-    let display_bounds = active_display.bounds();
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            objc2::rc::autoreleasepool(|_| window.resize(size.0));
-        });
+    for (entity, mut window, size, mut width_ratio) in &mut resized_windows {
+        // A display change can resize windows on several monitors in one frame.
+        // Using the globally active display here corrupts the stored width ratio
+        // for every window that belongs to a differently-sized monitor.
+        let display_width = layout_strips
+            .iter()
+            .find(|(strip, _)| strip.contains(entity))
+            .and_then(|(_, display_parent)| displays.get(display_parent.parent()).ok())
+            .map_or_else(|| active_display.bounds().width(), Display::width);
+
+        width_ratio.0 = f64::from(size.0.x) / f64::from(display_width.max(1));
+        window.resize(size.0);
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any
@@ -1658,6 +1844,64 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
     }
 }
 
+#[cfg(test)]
+mod accessibility_recovery_tests {
+    use bevy::app::{App, Update};
+    use bevy::ecs::hierarchy::Children;
+
+    use super::add_launched_process;
+    use crate::config::Config;
+    use crate::ecs::{BProcess, FreshMarker, RetryAccessibility};
+    use crate::errors::Error;
+    use crate::manager::app::MockApplicationApi;
+    use crate::manager::{Application, MockProcessApi, MockWindowManagerApi, WindowManager};
+    use crate::platform::ProcessSerialNumber;
+
+    #[test]
+    fn launched_app_survives_initial_accessibility_failure() {
+        let mut process = MockProcessApi::new();
+        process
+            .expect_psn()
+            .return_const(ProcessSerialNumber { high: 0, low: 42 });
+        process
+            .expect_name()
+            .return_const("AX-unavailable app".to_string());
+        process.expect_ready().return_const(true);
+
+        let mut application = MockApplicationApi::new();
+        application
+            .expect_observe()
+            .return_once(|| Err(Error::PermissionDenied("AX unavailable".into())));
+        let mut manager = MockWindowManagerApi::new();
+        manager
+            .expect_new_application()
+            .return_once(move |_| Ok(Application::new(Box::new(application))));
+
+        let mut app = App::new();
+        app.insert_resource(Config::default());
+        app.insert_resource(WindowManager(Box::new(manager)));
+        app.add_systems(Update, add_launched_process);
+        let process_entity = app
+            .world_mut()
+            .spawn((BProcess(Box::new(process)), FreshMarker))
+            .id();
+
+        app.update();
+
+        let world = app.world_mut();
+        let children = world.get::<Children>(process_entity).unwrap();
+        assert_eq!(children.len(), 1);
+        let application_entity = children[0];
+        assert!(world.get::<Application>(application_entity).is_some());
+        assert!(
+            world
+                .get::<RetryAccessibility>(application_entity)
+                .is_some()
+        );
+        assert!(world.get::<FreshMarker>(application_entity).is_none());
+    }
+}
+
 #[cfg(all(test, feature = "lua"))]
 mod tests {
     use std::sync::mpsc::channel;
@@ -1686,6 +1930,7 @@ mod tests {
         sender.send(Event::ProcessesLoaded).expect("send loaded");
 
         let mut app = App::new();
+        app.add_message::<Event>();
         app.insert_resource(lua_config);
         app.insert_non_send(receiver);
         app.add_systems(Update, gather_initial_processes);

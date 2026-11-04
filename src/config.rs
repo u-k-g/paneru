@@ -387,14 +387,13 @@ impl Config {
     // Exponential ease-out decay rate (per second) consumed by the animation
     // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
     // values collapse to an instant snap.
-    // Suggested range: 8..20 for a fluid feel. Unset = instant (no animation),
+    // Suggested range: 12..30 for a fluid feel. The default is deliberately at
+    // the snappy end; very large values still collapse to an instant snap.
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed
-            // If unset, set it to something high, so the move happens immediately,
-            // effectively disabling animation.
-            .unwrap_or(1_000_000.0)
-            .max(0.0)
+            .filter(|speed| speed.is_finite() && *speed > 0.0)
+            .unwrap_or(28.0)
     }
 
     /// Finds a keybinding matching the given `keycode` and `modifier` mask.
@@ -736,6 +735,14 @@ impl Config {
             .or(config.options.continuous_swipe)
             // Default: true (enabled).
             .unwrap_or(true)
+    }
+
+    pub fn snap_to_window(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.snap_to_window)
+            .unwrap_or(false)
     }
 
     pub fn swipe_deceleration(&self) -> f64 {
@@ -1273,7 +1280,7 @@ pub struct MainOptions {
     /// a window vertically inside a stack.
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
-    /// The animation speed for window movements in pixels per second.
+    /// Exponential animation decay rate per second. Higher values settle faster.
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
@@ -2497,6 +2504,8 @@ fn test_config_defaults() {
     assert_eq!(config.border_radius(), expected_radius);
     assert_eq!(config.menubar_height(), None);
     assert!(config.menubar_enabled());
+    assert!(!config.snap_to_window());
+    assert_eq!(config.animation_speed(), 28.0);
 }
 
 #[test]
@@ -2521,6 +2530,23 @@ fn test_menubar_enabled_is_independent_of_workspace_indicator() {
         .expect("config should parse");
     assert!(!config.menubar_enabled());
     assert!(config.workspace_menu_status());
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_non_positive_animation_speed_uses_snappy_default() {
+    let config = Config::try_from("[options]\nanimation_speed = 0\n\n[bindings]\n")
+        .expect("config should parse");
+
+    assert_eq!(config.animation_speed(), 28.0);
+}
+
+#[test]
+fn test_snap_to_window_config() {
+    let config = Config::try_from("[options]\n\n[swipe]\nsnap_to_window = true\n\n[bindings]\n")
+        .expect("config should parse");
+
+    assert!(config.snap_to_window());
 }
 
 #[test]
@@ -2878,6 +2904,7 @@ mod lua_setup_tests {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn gesture_paging_defaults_and_overrides_are_resolved() {
     let defaults = Config::default();
     assert!(!defaults.swipe_gesture_paging());

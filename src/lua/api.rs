@@ -729,6 +729,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         sensitivity: _,
         deceleration: _,
         continuous: _,
+        snap_to_window: _,
         gesture: _,
         scroll: _,
     } = SwipeOptions::default();
@@ -736,6 +737,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     swipe.set("sensitivity", config.swipe_sensitivity())?;
     swipe.set("deceleration", config.swipe_deceleration())?;
     swipe.set("continuous", config.continuous_swipe())?;
+    swipe.set("snap_to_window", config.snap_to_window())?;
 
     let GestureOptions {
         fingers_count: _,
@@ -881,6 +883,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn config_to_lua_table_covers_every_struct_field() {
         // Build a config where optional fields without built-in scalar defaults
         // are populated, so every mapped key in the Lua table is non-nil.

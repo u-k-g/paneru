@@ -231,6 +231,7 @@ define_class!(
 
             let msg = Event::ApplicationLaunched {
                 psn: process.psn,
+                pid_hint: Some(process.pid),
                 observer: process.observer.clone(),
             };
             _= self.ivars().events.send(msg);

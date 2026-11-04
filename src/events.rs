@@ -63,6 +63,12 @@ pub enum Event {
     /// An application has been launched.
     ApplicationLaunched {
         psn: ProcessSerialNumber,
+        /// A PID resolved after `LaunchServices` finished registering the app.
+        ///
+        /// Carbon launch events can arrive before the PSN maps to a PID. A
+        /// later front-switch event supplies this hint so an unresolved
+        /// process can be upgraded without restarting Paneru.
+        pid_hint: Option<Pid>,
         observer: Retained<WorkspaceObserver>,
     },
 
