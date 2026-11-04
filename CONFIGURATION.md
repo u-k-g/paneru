@@ -28,7 +28,7 @@ General behavior settings for the window manager.
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
-| `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
+| `animation_speed` | Float | `28.0` | Exponential window-animation speed. The comfortable range is roughly 12–30; higher values settle faster. Set a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
 | `sliver_width` | Integer (px) | `5` | Horizontal width of off-screen windows kept visible. |
@@ -66,6 +66,7 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `sensitivity` | Float (0.1–2.0) | `0.35` | Multiplier for swipe distance. |
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
 | `continuous` | Boolean | `true` | If `true`, the windows are allowed to fully move across the desktop, potentially exposing the empty desktop space. If `false`, the window strip will not move further than the left or right most window. This also affects the windows during keyboard focus - if `false` the left or right most windows will snap to the edge of display. |
+| `snap_to_window` | Boolean | `false` | After trackpad swipe momentum slows, center the nearest window column and focus its top window. |
 
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |

@@ -565,6 +565,7 @@ fn autocenter_window_on_focus(
     ctx.commands.reshuffle_around(entity);
 }
 
+#[allow(clippy::needless_pass_by_value)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 #[allow(clippy::too_many_arguments)]
 fn mouse_follows_focus(

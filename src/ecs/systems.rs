@@ -1,9 +1,10 @@
 use bevy::app::AppExit;
-use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
+use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
@@ -122,6 +123,18 @@ type ResizableWindows<'w, 's> = Query<
     Without<LayoutStrip>,
 >;
 
+/// Active animation targets and the change ticks used to make their first
+/// display-paced step immediate.
+type AnimationTargets<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<Ref<'static, RepositionMarker>>,
+        Option<Ref<'static, ResizeMarker>>,
+    ),
+    Or<(With<RepositionMarker>, With<ResizeMarker>)>,
+>;
+
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
@@ -163,6 +176,87 @@ fn next_pump_timeout(timeout: u32, limit: u32) -> u32 {
 /// leftover events stay in the channel for the next frame to pick up.
 const PUMP_BUDGET: Duration = Duration::from_millis(4);
 const PUMP_MAX_EVENTS: usize = 256;
+
+/// Shared animation pulse for both position and size changes.
+///
+/// Paneru's application loop intentionally runs as soon as events arrive. That
+/// is excellent for input latency, but using every one of those irregular loop
+/// iterations as an animation frame causes redundant AX writes and uneven
+/// integer-pixel steps. This resource preserves the eager loop while pacing
+/// visual updates to the fastest attached display.
+#[derive(Debug, Resource)]
+pub(super) struct AnimationCadence {
+    accumulated_seconds: f64,
+    delta_seconds: f64,
+    frame_due: bool,
+}
+
+impl Default for AnimationCadence {
+    fn default() -> Self {
+        Self {
+            accumulated_seconds: 0.0,
+            delta_seconds: 1.0 / 60.0,
+            frame_due: false,
+        }
+    }
+}
+
+impl AnimationCadence {
+    const MAX_DELTA_SECONDS: f64 = 0.1;
+
+    fn advance(&mut self, elapsed_seconds: f64, refresh_rate_hz: u32, target_changed: bool) {
+        let refresh_rate_hz = refresh_rate_hz.clamp(30, 240);
+        let interval = 1.0 / f64::from(refresh_rate_hz);
+
+        if target_changed {
+            // Do not wait up to one display period before acknowledging input.
+            // A full nominal step gives the first frame useful motion even
+            // though the event loop itself may only have advanced by 1 ms.
+            self.delta_seconds = elapsed_seconds.max(interval).min(Self::MAX_DELTA_SECONDS);
+            self.accumulated_seconds = 0.0;
+            self.frame_due = true;
+            return;
+        }
+
+        self.accumulated_seconds += elapsed_seconds.max(0.0);
+        if self.accumulated_seconds + f64::EPSILON < interval {
+            self.frame_due = false;
+            return;
+        }
+
+        self.delta_seconds = self.accumulated_seconds.min(Self::MAX_DELTA_SECONDS);
+        self.accumulated_seconds %= interval;
+        self.frame_due = true;
+    }
+
+    fn idle(&mut self) {
+        self.accumulated_seconds = 0.0;
+        self.frame_due = false;
+    }
+}
+
+pub(super) fn prepare_animation_frame(
+    time: Res<Time>,
+    displays: Query<&Display>,
+    targets: AnimationTargets,
+    mut cadence: ResMut<AnimationCadence>,
+) {
+    if targets.is_empty() {
+        cadence.idle();
+        return;
+    }
+
+    let target_changed = targets.iter().any(|(position, size)| {
+        position.is_some_and(|marker| marker.is_changed())
+            || size.is_some_and(|marker| marker.is_changed())
+    });
+    let refresh_rate_hz = displays
+        .iter()
+        .map(Display::refresh_rate_hz)
+        .max()
+        .unwrap_or(60);
+    cadence.advance(time.delta_secs_f64(), refresh_rate_hz, target_changed);
+}
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
@@ -280,7 +374,6 @@ pub(crate) fn add_existing_application(
         .into_iter()
         .map(LayoutStrip::id)
         .collect::<Vec<_>>();
-    let thread_pool = AsyncComputeTaskPool::get();
 
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
@@ -302,6 +395,7 @@ pub(crate) fn add_existing_application(
         }
 
         if !offscreen_windows.is_empty() {
+            let thread_pool = AsyncComputeTaskPool::get();
             let pid = app.pid();
             let bundle_id = app.bundle_id();
             let config = config.clone();
@@ -744,18 +838,21 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
-    time: Res<Time>,
+    animate: Populated<(&mut Position, Entity, &RepositionMarker, Has<Window>)>,
+    cadence: Res<AnimationCadence>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    if !cadence.frame_due {
+        return;
+    }
+
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), cadence.delta_seconds);
 
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
+    animate.into_iter().for_each(
+        |(mut position, entity, RepositionMarker(origin), is_window)| {
             let target = origin.as_vec2();
             let current = position.0.as_vec2();
             let lerped = current.lerp(target, t);
@@ -776,8 +873,15 @@ pub(super) fn animate_entities(
             position.0 = new_pos;
             if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
+                if is_window {
+                    // macOS may clamp an off-screen or constrained move after
+                    // accepting the AX write. Verify only the final frame so
+                    // smooth motion does not pay for an AX readback each tick.
+                    entity_commands.try_insert(VerifyWindowPosition::default());
+                }
             }
-        });
+        },
+    );
 }
 
 /// Animates window resizing.
@@ -793,12 +897,16 @@ pub(super) fn animate_entities(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
-    time: Res<Time>,
+    cadence: Res<AnimationCadence>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
+    if !cadence.frame_due {
+        return;
+    }
+
     // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let t = ease_out_factor(config.animation_speed(), cadence.delta_seconds);
 
     animate
         .into_iter()
@@ -1079,6 +1187,7 @@ pub(crate) fn gather_initial_processes(
     receiver: Option<NonSendMut<Receiver<Event>>>,
     existing_config: Option<Res<Config>>,
     mut displays: Query<&mut Display>,
+    mut deferred_events: MessageWriter<Event>,
     mut commands: Commands,
 ) {
     let Some(receiver) = receiver else {
@@ -1090,8 +1199,12 @@ pub(crate) fn gather_initial_processes(
     loop {
         match receiver.recv().expect("error reading initial processes") {
             Event::ProcessesLoaded | Event::Exit => break,
-            Event::ApplicationLaunched { psn, observer } => {
-                let process: BProcess = Process::new(&psn, observer.clone()).into();
+            Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer,
+            } => {
+                let process: BProcess = Process::new(&psn, observer.clone(), pid_hint).into();
                 if process.pid() != 0 {
                     initial_processes.push(process);
                 } else {
@@ -1101,7 +1214,13 @@ pub(crate) fn gather_initial_processes(
             Event::InitialConfig(config) => {
                 toml_config = Some(config);
             }
-            event => warn!("Stray event during initial process gathering: {event:?}"),
+            // The reader is already serving IPC while this synchronous startup
+            // scan drains the same channel. Preserve queries, subscriptions and
+            // ordinary OS events for the first PreUpdate instead of dropping a
+            // client handshake and leaving it blocked forever.
+            event => {
+                deferred_events.write(event);
+            }
         }
     }
 
@@ -1863,6 +1982,7 @@ mod tests {
         sender.send(Event::ProcessesLoaded).expect("send loaded");
 
         let mut app = App::new();
+        app.add_message::<Event>();
         app.insert_resource(lua_config);
         app.insert_non_send(receiver);
         app.add_systems(Update, gather_initial_processes);

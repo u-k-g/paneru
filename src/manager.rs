@@ -458,13 +458,29 @@ impl WindowManagerApi for WindowManagerOS {
         spaces: &[WorkspaceId],
         config: &Config,
     ) -> Result<(Vec<Window>, Vec<WinID>)> {
-        let global_window_list = existing_application_window_list(self.main_cid, app, spaces)?;
+        let found_windows = app.window_list(config);
+        let global_window_list = match existing_application_window_list(self.main_cid, app, spaces)
+        {
+            Ok(windows) => windows,
+            Err(err) if !found_windows.is_empty() => {
+                warn!("SkyLight window query failed for {app}: {err}; using AX windows");
+                return Ok((found_windows, vec![]));
+            }
+            Err(err) => return Err(err),
+        };
         if global_window_list.is_empty() {
-            return Err(Error::InvalidInput(format!("No windows found for {app}")));
+            if found_windows.is_empty() {
+                return Err(Error::InvalidInput(format!("No windows found for {app}")));
+            }
+
+            warn!(
+                "{app} has no SkyLight windows, falling back to {} AX windows",
+                found_windows.len()
+            );
+            return Ok((found_windows, vec![]));
         }
         debug!("{app} has global windows: {global_window_list:?}");
 
-        let found_windows = app.window_list(config);
         if found_windows.len() == global_window_list.len() {
             debug!("All windows for {:?} are now resolved", app.psn());
             return Ok((found_windows, vec![]));
@@ -763,11 +779,6 @@ fn existing_application_window_list(
     space_window_list_for_connection(cid, spaces, app.connection(), true)
 }
 
-/// Wall-clock ceiling on a single application's brute-force scan: generous
-/// next to a healthy scan, but short enough that an app which never resolves
-/// cannot hold up initialisation, which waits on these tasks.
-const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
-
 /// How many applications may run [`bruteforce_windows`] at the same time.
 ///
 /// Each loop iteration is a synchronous, private-API AX round trip. Letting
@@ -777,6 +788,11 @@ const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
 /// wedge `WindowServer`'s main thread past the watchdog's timeout. Capping
 /// concurrency keeps the aggregate call rate bounded no matter how many apps
 /// need a scan.
+/// Wall-clock ceiling on a single application's brute-force scan: generous
+/// next to a healthy scan, but short enough that an app which never resolves
+/// cannot hold up initialisation, which waits on these tasks.
+const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
+
 const MAX_CONCURRENT_BRUTEFORCE: usize = 2;
 
 /// Blocking counting semaphore gating concurrent [`bruteforce_windows`] scans.

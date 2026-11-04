@@ -231,6 +231,7 @@ define_class!(
 
             let msg = Event::ApplicationLaunched {
                 psn: process.psn,
+                pid_hint: Some(process.pid),
                 observer: process.observer.clone(),
             };
             _= self.ivars().events.send(msg);
@@ -398,7 +399,11 @@ mod delayed_readiness_tests {
         let observer = WorkspaceObserver::new(events);
         harness
             .world()
-            .write_message(crate::events::Event::ApplicationLaunched { psn, observer });
+            .write_message(crate::events::Event::ApplicationLaunched {
+                psn,
+                pid_hint: None,
+                observer,
+            });
         harness.advance(Duration::from_secs(2));
         let world = harness.world();
         assert!(
@@ -480,7 +485,11 @@ mod delayed_readiness_tests {
         let observer = WorkspaceObserver::new(events);
         harness
             .world()
-            .write_message(crate::events::Event::ApplicationLaunched { psn, observer });
+            .write_message(crate::events::Event::ApplicationLaunched {
+                psn,
+                pid_hint: None,
+                observer,
+            });
         harness.advance(Duration::from_secs(2));
         let world = harness.world();
         assert!(

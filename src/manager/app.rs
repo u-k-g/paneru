@@ -101,9 +101,7 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// * `config` - The current Paneru configuration, used to evaluate window rules.
     ///
-    /// # Errors
-    ///
-    /// Returns an `Error` if the window list cannot be retrieved.
+    /// Returns an empty list if AX enumeration fails or no manageable windows exist.
     fn window_list(&self, config: &Config) -> Vec<Window>;
     /// Returns the IDs of the windows the app currently exposes over
     /// accessibility.
@@ -295,9 +293,7 @@ impl ApplicationApi for ApplicationOS {
 
     /// Retrieves a list of all windows associated with the application.
     ///
-    /// # Returns
-    ///
-    /// `Ok(Vec<Result<Window>>)` containing the list of window objects if successful, otherwise `Err(Error)`.
+    /// Returns the manageable windows, or an empty list when AX is unavailable.
     fn window_list(&self, config: &Config) -> Vec<Window> {
         let bundle_id = self.bundle_id.as_deref();
         self.element

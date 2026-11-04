@@ -11,6 +11,7 @@ use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -506,47 +507,32 @@ fn process_ready_timeout(name: &str, commands: &mut Commands) -> Timeout {
 /// * `commands` - Bevy commands to spawn or despawn entities.
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
-    processes: Query<(&BProcess, Entity)>,
+    processes: Query<(&BProcess, Entity, Has<Children>)>,
     mut commands: Commands,
 ) {
     let find_process = |psn| {
         processes
             .iter()
-            .find(|(BProcess(process), _)| process.psn() == psn)
+            .find(|(BProcess(process), _, _)| process.psn() == psn)
     };
+    let mut launches = HashMap::new();
 
     for event in messages.read() {
         match event {
-            Event::ApplicationLaunched { psn, observer } => {
-                if let Some((BProcess(process), entity)) = find_process(*psn) {
-                    // Readiness KVO uses the same message as the initial launch.
-                    // Re-arm an existing process instead of ignoring that signal.
-                    let timeout = process_ready_timeout(process.name(), &mut commands);
-                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                        entity_commands.try_insert((
-                            FreshMarker,
-                            crate::ecs::systems::PendingWindowRecovery::default(),
-                            timeout,
-                        ));
-                    }
-                    continue;
+            Event::ApplicationLaunched {
+                psn,
+                pid_hint,
+                observer,
+            } => {
+                let launch = launches
+                    .entry(*psn)
+                    .or_insert_with(|| (observer.clone(), *pid_hint));
+                if pid_hint.is_some() {
+                    launch.1 = *pid_hint;
                 }
-                let process: BProcess = Process::new(psn, observer.clone()).into();
-                if process.pid() == 0 {
-                    debug!("Skipping process with PID 0 (likely kernel_task).");
-                    continue;
-                }
-                let timeout = process_ready_timeout(process.name(), &mut commands);
-                commands.spawn((
-                    FreshMarker,
-                    crate::ecs::systems::PendingWindowRecovery::default(),
-                    timeout,
-                    process,
-                ));
             }
-
             Event::ApplicationTerminated { psn } => {
-                if let Some((BProcess(process), entity)) = find_process(*psn) {
+                if let Some((BProcess(process), entity, _)) = find_process(*psn) {
                     forget_enhanced_ui_state(process.pid());
                     if let Ok(mut entity_commands) = commands.get_entity(entity) {
                         entity_commands.try_despawn();
@@ -555,6 +541,43 @@ pub(super) fn application_event_trigger(
             }
             _ => (),
         }
+    }
+
+    for (psn, (observer, pid_hint)) in launches {
+        if let Some((BProcess(process), entity, has_children)) = find_process(psn) {
+            if has_children {
+                continue;
+            }
+            if pid_hint.is_none() {
+                // Readiness KVO uses the same message as the initial launch.
+                // Re-arm an existing process instead of ignoring that signal.
+                let timeout = process_ready_timeout(process.name(), &mut commands);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert((
+                        FreshMarker,
+                        crate::ecs::systems::PendingWindowRecovery::default(),
+                        timeout,
+                    ));
+                }
+                continue;
+            }
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
+        }
+
+        let process: BProcess = Process::new(&psn, observer, pid_hint).into();
+        if process.pid() == 0 {
+            debug!("Skipping process with PID 0 (likely kernel_task).");
+            continue;
+        }
+        let timeout = process_ready_timeout(process.name(), &mut commands);
+        commands.spawn((
+            FreshMarker,
+            crate::ecs::systems::PendingWindowRecovery::default(),
+            timeout,
+            process,
+        ));
     }
 }
 
@@ -1135,7 +1158,11 @@ pub(super) fn spawn_window_trigger(
 ) {
     let new_windows = &mut trigger.event_mut().0;
 
-    while let Some(mut window) = new_windows.pop() {
+    // Preserve the source's window order explicitly. Iteration order for the
+    // subsequent `Added<Window>` query is not a stable way to undo LIFO
+    // processing here, and can change when otherwise unrelated systems are
+    // merged into the schedule.
+    for mut window in std::mem::take(new_windows) {
         let window_id = window.id();
 
         if windows.iter().any(|window| window.id() == window_id) {
@@ -1426,14 +1453,14 @@ pub(super) fn apply_window_positions(
             && let Ok((_, mut strip, _, _)) = workspaces.get_mut(target)
         {
             if is_active {
+                let focused_entity = ctx.windows.focused().map(|(_, entity)| entity);
                 // Attempt inserting the window at a pre-defined position.
                 let insert_at = properties.insertion().map_or_else(
                     || {
                         // Otherwise attempt inserting it after the current focus.
-                        let focused_window = ctx.windows.focused();
                         // Insert to the right of the currently focused window
-                        focused_window
-                            .and_then(|(_, entity)| strip.index_of(entity).ok())
+                        focused_entity
+                            .and_then(|entity| strip.index_of(entity).ok())
                             .and_then(|insert_at| {
                                 (insert_at + 1 < strip.len()).then_some(insert_at + 1)
                             })
@@ -1445,7 +1472,7 @@ pub(super) fn apply_window_positions(
                 match insert_at {
                     Some(after) => {
                         debug!("New window inserted at {after}");
-                        strip.insert_at(after, entity);
+                        strip.insert_at_preserving(after, entity, focused_entity);
                     }
                     None => strip.append(entity),
                 }

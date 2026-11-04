@@ -205,9 +205,15 @@ impl Process {
     /// # Returns
     ///
     /// A `Pin<Box<Self>>` containing the new `Process` instance.
-    pub fn new(psn: &ProcessSerialNumber, observer: Retained<WorkspaceObserver>) -> Pin<Box<Self>> {
-        let mut pid: Pid = 0;
-        unsafe { GetProcessPID(psn, NonNull::from(&mut pid).as_ptr()) };
+    pub fn new(
+        psn: &ProcessSerialNumber,
+        observer: Retained<WorkspaceObserver>,
+        pid_hint: Option<Pid>,
+    ) -> Pin<Box<Self>> {
+        let mut pid = pid_hint.unwrap_or_default();
+        if pid_hint.is_none() {
+            unsafe { GetProcessPID(psn, NonNull::from(&mut pid).as_ptr()) };
+        }
 
         let mut nameref: *const CFString = std::ptr::null();
         unsafe { CopyProcessName(psn, &raw mut nameref) };
@@ -230,6 +236,20 @@ impl Process {
             observing_activated: AtomicBool::new(false),
             force_manage: false,
         })
+    }
+
+    /// Retries resolving the Cocoa application for process events that arrive
+    /// before `LaunchServices` has registered the process fully.
+    fn refresh_application(&mut self) {
+        if self.application.is_some() {
+            return;
+        }
+
+        let mut pid = self.pid;
+        if unsafe { GetProcessPID(&raw const self.psn, &raw mut pid) } == 0 {
+            self.pid = pid;
+        }
+        self.application = NSRunningApplication::runningApplicationWithProcessIdentifier(self.pid);
     }
 
     /// Checks if the application associated with this process is observable (i.e., has a regular activation policy).
@@ -376,6 +396,15 @@ impl Process {
     ///
     /// - Adds or removes KVO observers based on the application's launch and activation state.
     pub fn ready(&mut self) -> bool {
+        self.refresh_application();
+        if self.application.is_none() {
+            debug!(
+                "{} ({}) is not registered with LaunchServices yet",
+                self.name, self.pid
+            );
+            return false;
+        }
+
         if !self.finished_launching() {
             debug!(
                 "{} ({}) is not finished launching, subscribing to finishedLaunching changes",
