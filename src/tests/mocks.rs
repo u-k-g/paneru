@@ -801,6 +801,8 @@ impl MockState {
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
         let mut wm = MockWindowManagerApi::new();
 
+        wm.expect_dim_windows().returning(|_, _| ());
+
         let s = self.clone();
         wm.expect_window_is_unordered().returning(move |window_id| {
             let inner = s.inner.force_read();
@@ -833,6 +835,8 @@ impl MockState {
             });
 
         let s = self.clone();
+        wm.expect_display_uuid()
+            .returning(|display_id| Some(format!("display-{display_id}")));
         wm.expect_present_displays().returning(move || {
             s.inner
                 .force_read()

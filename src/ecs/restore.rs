@@ -30,6 +30,7 @@ pub(crate) struct SessionRestore {
     state: PaneruState,
     timer: Timer,
     saved_hard_keys: HashSet<WindowHardMatchKey>,
+    cross_space: bool,
 }
 
 impl SessionRestore {
@@ -39,6 +40,18 @@ impl SessionRestore {
             state,
             timer: Timer::new(grace, TimerMode::Once),
             saved_hard_keys,
+            cross_space: false,
+        }
+    }
+
+    pub(crate) fn is_cross_space(&self) -> bool {
+        self.cross_space
+    }
+
+    pub(crate) fn for_setup(state: PaneruState, grace: Duration) -> Self {
+        Self {
+            cross_space: true,
+            ..Self::new(state, grace)
         }
     }
 }
@@ -442,8 +455,13 @@ pub(super) fn restore_window_state(
         restoration
     };
 
+    // An unknown space matches any saved space. Thus a setup restore can move windows across displays.
+    let cross_space = session
+        .as_deref()
+        .is_some_and(|session| session.cross_space);
     let window_workspaces = workspaces
         .iter()
+        .filter(|_| !cross_space)
         .flat_map(|(_, strip, _, _)| {
             let id = strip.id();
             strip
@@ -465,10 +483,14 @@ pub(super) fn restore_window_state(
 
     let mut existing_workspace_parents = HashMap::new();
     let mut active_workspace_ids = HashSet::new();
+    let mut active_display_entities = HashSet::new();
     let mut emptied_existing_strips = HashSet::new();
     for (entity, mut strip, child, active) in &mut workspaces {
         if active {
             active_workspace_ids.insert(strip.id());
+            if let Some(child) = child {
+                active_display_entities.insert(child.parent());
+            }
         }
         if let Some(child) = child {
             existing_workspace_parents
@@ -548,7 +570,9 @@ pub(super) fn restore_window_state(
             .get(&planned.workspace_id)
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
-        let origin = if is_global_active {
+        let is_shown =
+            is_global_active || (is_active && !active_display_entities.contains(&display_entity));
+        let origin = if is_shown {
             display.bounds().min
         } else {
             display.bounds().max - PARKED_STRIP_SLIVER
@@ -583,6 +607,8 @@ pub(super) fn restore_window_state(
 
         if is_global_active {
             spawned.insert(RestoredActivation);
+        } else if is_shown {
+            spawned.insert(SelectedVirtualMarker);
         } else {
             if is_active {
                 spawned.insert(SelectedVirtualMarker);

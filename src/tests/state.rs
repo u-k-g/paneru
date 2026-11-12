@@ -70,6 +70,7 @@ fn extract_query_state(world: &mut World) -> crate::errors::Result<PaneruQuerySt
 #[test]
 fn test_state_serialization() {
     let window = SavedWindow {
+        width_ratio: None,
         window_id: 1,
         pid: 123,
         psn: ProcessSerialNumber { high: 0, low: 1 },
@@ -85,6 +86,7 @@ fn test_state_serialization() {
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
         displays: vec![SavedDisplay {
+            uuid: None,
             display_id: TEST_DISPLAY_ID,
             bounds: SavedRect {
                 min_x: 0,
@@ -115,6 +117,7 @@ fn test_state_serialization() {
 #[test]
 fn test_state_restoration() {
     let window = SavedWindow {
+        width_ratio: None,
         window_id: 1,
         pid: 123,
         psn: ProcessSerialNumber { high: 0, low: 1 },
@@ -216,6 +219,7 @@ fn test_state_serializes_display_and_active_virtual_workspace() {
     assert_eq!(
         state.displays,
         vec![SavedDisplay {
+            uuid: None,
             display_id: TEST_DISPLAY_ID,
             bounds: SavedRect {
                 min_x: 0,
@@ -301,6 +305,7 @@ fn test_state_save_is_loadable_from_path() {
         timestamp: 123_456_789,
         active_display_id: Some(TEST_DISPLAY_ID),
         displays: vec![SavedDisplay {
+            uuid: None,
             display_id: TEST_DISPLAY_ID,
             bounds: SavedRect {
                 min_x: 0,
@@ -509,6 +514,7 @@ fn restore_state(workspaces: Vec<SavedWorkspace>) -> PaneruState {
 
 fn saved_window(window_id: WinID, pid: Pid, bundle_id: &str, title: &str) -> SavedWindow {
     SavedWindow {
+        width_ratio: None,
         window_id,
         pid,
         psn: ProcessSerialNumber { high: 0, low: 1 },
@@ -860,12 +866,9 @@ fn test_query_state_tolerates_workspace_query_failure() {
         extract_query_state(harness.world()).expect("query state should survive workspace failure");
     assert_eq!(state.virtual_workspaces.len(), 1);
 
-    #[cfg(feature = "lua")]
-    {
-        let set = extract_window_set(harness.world())
-            .expect("window set should survive workspace failure");
-        assert_eq!(set.displays().len(), 1);
-    }
+    let set =
+        extract_window_set(harness.world()).expect("window set should survive workspace failure");
+    assert_eq!(set.displays().len(), 1);
 }
 
 #[test]
@@ -969,7 +972,6 @@ fn test_query_state_tracks_float_after_virtual_workspace_is_reaped() {
 }
 
 /// Builds the `WindowSet` a Lua handler would be given, from the live world.
-#[cfg(feature = "lua")]
 fn extract_window_set(
     world: &mut World,
 ) -> crate::errors::Result<crate::types::windowset::WindowSet> {
@@ -980,7 +982,6 @@ fn extract_window_set(
     params.extract_window_set()
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_window_set_keeps_the_column_structure_a_flat_query_loses() {
     use crate::tests::harness::TestHarness;
@@ -1017,7 +1018,6 @@ fn test_window_set_keeps_the_column_structure_a_flat_query_loses() {
     assert_eq!(set.column_of(middle), Some(1));
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_window_set_reports_focus_and_window_identity() {
     use crate::tests::harness::TestHarness;
@@ -1043,7 +1043,6 @@ fn test_window_set_reports_focus_and_window_identity() {
     );
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_window_set_marks_floating_windows_outside_the_strip() {
     use crate::commands::{Command, Operation};
@@ -1068,7 +1067,6 @@ fn test_window_set_marks_floating_windows_outside_the_strip() {
     assert!(!workspace.floating[0].managed);
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
     use crate::commands::Command;
@@ -1114,7 +1112,6 @@ fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
     assert_eq!(after.focused(), Some(focused), "the focus did not move");
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_layout_op_stack_lands_in_the_named_column() {
     use crate::commands::Command;
@@ -1153,7 +1150,6 @@ fn test_layout_op_stack_lands_in_the_named_column() {
     assert_eq!(columns(&mut harness), vec![vec![first, last], vec![middle]]);
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_layout_op_stack_onto_fullscreen_column_leaves_window_in_place() {
     use crate::commands::Command;
@@ -1212,7 +1208,6 @@ fn test_layout_op_stack_onto_fullscreen_column_leaves_window_in_place() {
     );
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
     use crate::commands::Command;
@@ -1249,7 +1244,6 @@ fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
     );
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_set_frame_places_a_floating_window() {
     use crate::commands::Command;
@@ -1302,7 +1296,6 @@ fn test_set_frame_places_a_floating_window() {
 }
 /// The numbers of the test space's virtual workspaces, in order: those there
 /// are, not the gaps the query state fills in.
-#[cfg(feature = "lua")]
 fn workspace_numbers(world: &mut World) -> Vec<u32> {
     let mut numbers: Vec<u32> = world
         .query::<&LayoutStrip>()
@@ -1314,7 +1307,6 @@ fn workspace_numbers(world: &mut World) -> Vec<u32> {
     numbers
 }
 
-#[cfg(feature = "lua")]
 fn reaping(on: bool) -> Config {
     use crate::config::MainOptions;
 
@@ -1330,14 +1322,12 @@ fn reaping(on: bool) -> Config {
 
 /// Windows 1 and 2 sent to workspaces 2 and 3, staying on 1, then window 1
 /// brought back: workspace 2 is left empty, behind the active one's back.
-#[cfg(feature = "lua")]
 fn empty_the_second(harness: &mut crate::tests::harness::TestHarness) {
     empty_the_second_with(harness, &mut |_| true);
 }
 
 /// As `empty_the_second`, with `before` done to the world as the last window
 /// leaves.
-#[cfg(feature = "lua")]
 fn empty_the_second_with(
     harness: &mut crate::tests::harness::TestHarness,
     before: &mut dyn FnMut(&mut World) -> bool,
@@ -1368,7 +1358,6 @@ fn empty_the_second_with(
     harness.advance(std::time::Duration::from_millis(200));
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_a_workspace_emptied_behind_the_active_one_is_reaped_and_the_numbers_keep_their_gap() {
     use crate::tests::harness::TestHarness;
@@ -1393,7 +1382,6 @@ fn test_a_workspace_emptied_behind_the_active_one_is_reaped_and_the_numbers_keep
     assert_eq!(state.active.virtual_workspace_number, Some(3));
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_an_emptied_workspace_stays_with_reaping_off() {
     use crate::tests::harness::TestHarness;
@@ -1406,7 +1394,6 @@ fn test_an_emptied_workspace_stays_with_reaping_off() {
     assert_eq!(workspace_numbers(harness.world()), vec![1, 2, 3]);
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_the_active_workspace_stays_when_its_last_window_closes() {
     use crate::commands::Command;
@@ -1436,7 +1423,6 @@ fn test_the_active_workspace_stays_when_its_last_window_closes() {
     assert_eq!(state.active.virtual_workspace_number, Some(2));
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_a_workspace_shown_on_its_display_stays_when_emptied() {
     use crate::tests::harness::TestHarness;
@@ -1462,7 +1448,6 @@ fn test_a_workspace_shown_on_its_display_stays_when_emptied() {
     assert_eq!(workspace_numbers(harness.world()), vec![1, 2, 3]);
 }
 
-#[cfg(feature = "lua")]
 #[test]
 fn test_a_workspace_made_empty_stays() {
     use crate::commands::Command;

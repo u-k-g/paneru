@@ -21,7 +21,8 @@ use std::pin::Pin;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    FocusedMarker, MouseHeldMarker, OpenedFrom, SystemTheme, Timeout, Unmanaged, VerifyFocus,
+    ClickFocusMarker, FocusedMarker, MouseHeldMarker, OpenedFrom, SystemTheme, Timeout, Unmanaged,
+    VerifyFocus,
 };
 use crate::commands::visible_floating_entities;
 use crate::config::Config;
@@ -577,11 +578,26 @@ fn mouse_follows_focus(
     displays: Query<&Display>,
     workspaces: MouseFocusStrips,
     restored: Query<&RestoreFocusMarker>,
+    clicked: Query<(Entity, &ClickFocusMarker)>,
+    mut commands: Commands,
 ) {
     let entity = *focused;
+    let mut click_focused = false;
+    for (marker_entity, marker) in &clicked {
+        if marker.0 == entity {
+            click_focused = true;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(marker_entity) {
+            entity_commands.try_despawn();
+        }
+    }
     let Some(window) = windows.get(entity) else {
         return;
     };
+    if click_focused {
+        debug!("Suppressing center mouse after a click");
+        return;
+    }
     if workspaces
         .iter()
         .find_map(|(_, _, scrolling, active, _, _)| if active { scrolling } else { None })

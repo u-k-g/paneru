@@ -894,6 +894,12 @@ impl Config {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
     }
 
+    pub fn remember_display_setups(&self) -> bool {
+        self.options()
+            .remember_display_setups
+            .is_some_and(|remember| remember)
+    }
+
     pub fn reap_empty_workspaces(&self) -> bool {
         // Default is disabled..
         self.options()
@@ -1346,6 +1352,10 @@ pub struct MainOptions {
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
+
+    /// Remembers the layout of each display setup and restores it when that setup returns.
+    /// Default: false.
+    pub remember_display_setups: Option<bool>,
 
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are
     /// never auto-merged into a tab group with an existing same-app sibling.

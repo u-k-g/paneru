@@ -1,14 +1,14 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::With;
+use bevy::ecs::query::{Or, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Query, Res, Single};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::{MouseHeldMarker, Timeout};
+use super::{ClickFocusMarker, MouseHeldMarker, Timeout};
 use crate::config::Config;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::layout::LayoutStrip;
@@ -213,6 +213,12 @@ fn mouse_moved_trigger(
     }
 }
 
+// An app can send the focus notification after the user releases the button.
+const CLICK_FOCUS_GRACE: Duration = Duration::from_secs(1);
+
+type StaleClickMarkers<'w, 's> =
+    Query<'w, 's, Entity, Or<(With<MouseHeldMarker>, With<ClickFocusMarker>)>>;
+
 /// Handles mouse down events.
 ///
 /// This function finds the window at the click point. If the window is not fully visible,
@@ -231,7 +237,7 @@ fn mouse_down_trigger(
     active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
-    mouse_held: Query<Entity, With<MouseHeldMarker>>,
+    stale_markers: StaleClickMarkers,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -258,10 +264,18 @@ fn mouse_down_trigger(
         }
 
         // Clean up any stale marker from a previous click.
-        for held in &mouse_held {
-            if let Ok(mut entity_commands) = commands.get_entity(held) {
+        for marker in &stale_markers {
+            if let Ok(mut entity_commands) = commands.get_entity(marker) {
                 entity_commands.try_despawn();
             }
+        }
+
+        if windows
+            .focused()
+            .is_none_or(|(_, focused)| focused != entity)
+        {
+            let grace = Timeout::new(CLICK_FOCUS_GRACE, None, &mut commands);
+            commands.spawn((ClickFocusMarker(entity), grace));
         }
 
         if config.window_hidden_ratio() >= 1.0 {
@@ -402,7 +416,7 @@ fn horizontal_warp_mouse_trigger(
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
     for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, .. } = event else {
+        let (Event::MouseMoved { point, .. } | Event::MouseDragged { point, .. }) = event else {
             continue;
         };
 
@@ -432,13 +446,13 @@ fn horizontal_warp_mouse_trigger(
             .iter()
             .find(|display| display.bounds().contains(point))
         else {
-            return;
+            continue;
         };
 
         let on_left_edge = (point.x - current_display.bounds().min.x).abs() < EDGE_THRESHOLD;
         let on_right_edge = (current_display.bounds().max.x - point.x).abs() < EDGE_THRESHOLD;
         if !on_left_edge && !on_right_edge {
-            return;
+            continue;
         }
 
         let mut target_displays = displays
@@ -459,7 +473,7 @@ fn horizontal_warp_mouse_trigger(
         target_displays
             .sort_by_key(|display| (display.bounds().min.y - current_display.bounds().min.y).abs());
         let Some(warp_to) = target_displays.first() else {
-            return;
+            continue;
         };
         let target = warp_to.bounds();
 
@@ -499,7 +513,7 @@ fn horizontal_warp_mouse_trigger(
         let signed_offset = config.horizontal_mouse_warp_offset() * direction_sign;
         let target_y = target.min.y + relative_y + signed_offset;
         if target_y < target.min.y || target_y >= target.max.y {
-            return;
+            continue;
         }
 
         let landing = Origin::new(target_x, target_y);
