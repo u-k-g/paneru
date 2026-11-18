@@ -45,8 +45,11 @@ use skylight::{
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
 };
-pub(crate) use windows::forget_enhanced_ui_state;
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
+pub(crate) use windows::{
+    enhanced_ui_restore_pending, forget_enhanced_ui_state, next_enhanced_ui_restore_timeout_ms,
+    restore_deferred_enhanced_ui,
+};
 
 #[cfg(test)]
 pub use process::MockProcessApi;
@@ -787,6 +790,11 @@ fn existing_application_window_list(
     space_window_list_for_connection(cid, spaces, app.connection(), true)
 }
 
+/// Wall-clock ceiling on a single application's brute-force scan: generous
+/// next to a healthy scan, but short enough that an app which never resolves
+/// cannot hold up initialisation, which waits on these tasks.
+const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
+
 /// How many applications may run [`bruteforce_windows`] at the same time.
 ///
 /// Each loop iteration is a synchronous, private-API AX round trip. Letting
@@ -796,11 +804,6 @@ fn existing_application_window_list(
 /// wedge `WindowServer`'s main thread past the watchdog's timeout. Capping
 /// concurrency keeps the aggregate call rate bounded no matter how many apps
 /// need a scan.
-/// Wall-clock ceiling on a single application's brute-force scan: generous
-/// next to a healthy scan, but short enough that an app which never resolves
-/// cannot hold up initialisation, which waits on these tasks.
-const BRUTEFORCE_BUDGET: Duration = Duration::from_millis(250);
-
 const MAX_CONCURRENT_BRUTEFORCE: usize = 2;
 
 /// Blocking counting semaphore gating concurrent [`bruteforce_windows`] scans.

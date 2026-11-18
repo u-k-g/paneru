@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::{App, Plugin, PostUpdate, Update};
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -32,9 +33,9 @@ use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::scroll::{PageGestureState, PageInFlight};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, RepositionMarker, ReshuffleAroundMarker,
-    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
-    VerifyWindowSize,
+    ActiveWorkspaceMarker, Bounds, LayoutPosition, Position, RaiseWindow, RepositionMarker,
+    ReshuffleAroundMarker, ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    StrayFocusEvent, VerifyWindowSize,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -129,6 +130,9 @@ impl Plugin for FocusEventsPlugin {
             Update,
             (
                 detect_focus_rejection.in_set(super::UpdateSet::Events),
+                handle_tab_indicator_click
+                    .in_set(super::UpdateSet::Events)
+                    .run_if(bevy::ecs::schedule::common_conditions::on_message::<Event>),
                 fix_window_size_on_focus.in_set(super::UpdateSet::Focus),
                 autocenter_window_on_focus
                     .in_set(super::UpdateSet::Layout)
@@ -163,6 +167,7 @@ impl Plugin for FocusEventsPlugin {
             .add_observer(forget_openers)
             .add_observer(maintain_verify_focus_singleton)
             .add_observer(virtual_strip_activated)
+            .add_observer(update_tabbed_active_on_focus)
             .add_observer(stray_focus_observer)
             .add_observer(focus_window_trigger)
             .add_observer(raise_window_trigger);
@@ -313,7 +318,7 @@ fn clear_pending_focus_layout(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn maintain_focus_singleton(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     windows: Query<(Entity, Has<FocusedMarker>), With<Window>>,
     mut config: GlobalState,
     mut commands: Commands,
@@ -344,7 +349,7 @@ fn maintain_focus_singleton(
 /// Focus reaching another column of a strip forgets where that strip's windows
 /// were opened from, as niri does.
 fn forget_openers(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     openers: Populated<Entity, With<OpenedFrom>>,
     workspaces: Query<&LayoutStrip>,
     mut commands: Commands,
@@ -430,15 +435,11 @@ pub(super) fn fix_window_size_on_focus(
     }
 }
 
-/// Ensures at most one window entity carries [`VerifyFocus`] at any time, so
-/// rapid focus switching cancels verification on intermediate windows.
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn maintain_verify_focus_singleton(
-    trigger: On<Add, VerifyFocus>,
-    verifying: Query<Entity, With<VerifyFocus>>,
-    mut commands: Commands,
+fn cancel_other_verify_focus(
+    target: Entity,
+    verifying: &Query<Entity, With<VerifyFocus>>,
+    commands: &mut Commands,
 ) {
-    let target = trigger.event().entity;
     for entity in verifying {
         if entity != target
             && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -446,6 +447,17 @@ fn maintain_verify_focus_singleton(
             entity_commands.try_remove::<(Timeout, VerifyFocus)>();
         }
     }
+}
+
+/// Ensures at most one window entity carries [`VerifyFocus`] at any time, so
+/// rapid focus switching cancels verification on intermediate windows.
+#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+fn maintain_verify_focus_singleton(
+    trigger: On<Add<VerifyFocus>>,
+    verifying: Query<Entity, With<VerifyFocus>>,
+    mut commands: Commands,
+) {
+    cancel_other_verify_focus(trigger.event().entity, &verifying, &mut commands);
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -598,6 +610,12 @@ fn mouse_follows_focus(
         debug!("Suppressing center mouse after a click");
         return;
     }
+    if !config.mouse_follows_focus()
+        || global_state.skip_reshuffle()
+        || global_state.ffm_flag().is_some_and(|id| id == window.id())
+    {
+        return;
+    }
     if workspaces
         .iter()
         .find_map(|(_, _, scrolling, active, _, _)| if active { scrolling } else { None })
@@ -613,10 +631,7 @@ fn mouse_follows_focus(
         global_state.skip_reshuffle(),
         global_state.ffm_flag()
     );
-    if config.mouse_follows_focus()
-        && !global_state.skip_reshuffle()
-        && global_state.ffm_flag().is_none_or(|id| id != window.id())
-        && let Some(frame) = windows.moving_frame(entity)
+    if let Some(frame) = windows.moving_frame(entity)
         && let Some((_, child, _, _, position, reposition)) = workspaces
             .into_iter()
             .find(|(strip, _, _, _, _, _)| strip.contains(entity))
@@ -645,7 +660,7 @@ fn mouse_follows_focus(
 }
 
 fn dim_window_trigger(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     windows: Windows,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
@@ -662,7 +677,7 @@ fn dim_window_trigger(
 }
 
 fn dim_remove_window_trigger(
-    trigger: On<Remove, FocusedMarker>,
+    trigger: On<Remove<FocusedMarker>>,
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
@@ -689,7 +704,7 @@ fn dim_remove_window_trigger(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn virtual_strip_activated(
-    trigger: On<Add, FocusedMarker>,
+    trigger: On<Add<FocusedMarker>>,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     mut commands: Commands,
 ) {
@@ -703,6 +718,68 @@ fn virtual_strip_activated(
     }
 }
 
+/// Marks a newly-focused tabbed-display member as its group's active tab.
+/// Observes `FocusedMarker` rather than `WindowFocused` so it fires without
+/// waiting for the OS round-trip.
+#[allow(clippy::needless_pass_by_value)]
+fn update_tabbed_active_on_focus(
+    trigger: On<Add<FocusedMarker>>,
+    mut workspaces: Query<&mut LayoutStrip>,
+    mut positions: Query<&mut LayoutPosition>,
+) {
+    let entity = trigger.entity;
+    for mut strip in &mut workspaces {
+        // Check via `&self` first so untouched strips aren't marked changed.
+        if strip.is_parked_tab(entity) && strip.set_active_tab(entity) {
+            // All members share one `LayoutPosition`, so a tab switch alone
+            // changes nothing and `position_layout_windows` (gated on
+            // `Changed<LayoutPosition>`) wouldn't swap the tabs, e.g. when a
+            // `ManualStripOffset` pins the strip. Force the mark.
+            if let Ok(index) = strip.index_of(entity)
+                && let Ok(column) = strip.get(index)
+            {
+                for member in column.window_iter() {
+                    if let Ok(mut layout_position) = positions.get_mut(member) {
+                        layout_position.set_changed();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Focuses the tab clicked in the tab indicator
+/// (`Event::TabIndicatorClicked`), keeping the pointer in place like a normal
+/// window click.
+fn handle_tab_indicator_click(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    stale_markers: super::mouse::StaleClickMarkers,
+    mut commands: Commands,
+) {
+    for event in messages.read() {
+        let Event::TabIndicatorClicked { window_id } = &event else {
+            continue;
+        };
+        let Some((_, entity)) = windows.find(*window_id) else {
+            continue;
+        };
+        for marker in &stale_markers {
+            if let Ok(mut entity_commands) = commands.get_entity(marker) {
+                entity_commands.try_despawn();
+            }
+        }
+        if windows
+            .focused()
+            .is_none_or(|(_, focused)| focused != entity)
+        {
+            let grace = Timeout::new(super::mouse::CLICK_FOCUS_GRACE, None, &mut commands);
+            commands.spawn((ClickFocusMarker(entity), grace));
+        }
+        commands.focus_entity(entity, true);
+    }
+}
+
 fn focus_window_trigger(
     trigger: On<FocusWindow>,
     windows: Windows,
@@ -711,13 +788,7 @@ fn focus_window_trigger(
     mut commands: Commands,
 ) {
     let FocusWindow { entity, raise } = *trigger.event();
-    for other in verifying {
-        if other != entity
-            && let Ok(mut entity_commands) = commands.get_entity(other)
-        {
-            entity_commands.try_remove::<(Timeout, VerifyFocus)>();
-        }
-    }
+    cancel_other_verify_focus(entity, &verifying, &mut commands);
     let Some(window) = windows.get(entity) else {
         return;
     };
@@ -753,8 +824,7 @@ fn raise_window_trigger(
         let viewport = active_display.actual_bounds(&config);
         let strip = active_display.active_strip();
         strip
-            .all_windows()
-            .into_iter()
+            .window_iter()
             .filter_map(|entity| {
                 if entity == focus {
                     None
@@ -811,7 +881,7 @@ fn recover_lost_focus(
     if let Ok(strip) = active_workspace
         .single()
         .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
+        && let Some(entity) = strip.first()
     {
         error!("Lost focus marker, recovering!");
         commands.focus_entity(entity, false);
@@ -819,7 +889,7 @@ fn recover_lost_focus(
 }
 
 pub(super) fn stray_focus_observer(
-    trigger: On<Add, Window>,
+    trigger: On<Add<Window>>,
     focus_events: Populated<(Entity, &StrayFocusEvent)>,
     windows: Windows,
     mut commands: Commands,

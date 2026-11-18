@@ -1,9 +1,11 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Or, With};
+use bevy::ecs::query::{Has, Or, With};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Query, Res, Single};
+use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -12,7 +14,7 @@ use super::{ClickFocusMarker, MouseHeldMarker, Timeout};
 use crate::config::Config;
 use crate::ecs::focus::PendingFocusLayout;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{GlobalState, Windows};
+use crate::ecs::params::{GlobalState, WindowCtx, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, RepositionMarker,
     Scrolling, SpawnCommandsExt, UpdateSet,
@@ -53,6 +55,7 @@ impl Plugin for MouseEventsPlugin {
                 mouse_up_trigger,
                 horizontal_warp_mouse_trigger,
             )
+                .chain()
                 .in_set(UpdateSet::Input)
                 .run_if(on_message::<InputEvent>),
         );
@@ -101,6 +104,26 @@ fn mouse_moved_trigger(
 ) {
     const FIND_WINDOW_THROTTLE: Duration = Duration::from_millis(50);
 
+    if !config.focus_follows_mouse() || global_state.ffm_flag().is_some() {
+        return;
+    }
+
+    // Command focus is applied before auto-centering starts in PostUpdate.
+    // Until the strip and its windows settle, hit-testing sees intermediate
+    // geometry and can undo that focus by selecting the previous window.
+    // Mouse-driven focus keeps skip_reshuffle set and remains unaffected.
+    if !global_state.skip_reshuffle()
+        && (!pending_focus_layout.is_empty()
+            || active_workspaces.iter().any(|(entity, strip)| {
+                moving
+                    .iter()
+                    .any(|moving| moving == entity || strip.contains(moving))
+            }))
+    {
+        trace!("mouse focus suppressed during command-driven slide");
+        return;
+    }
+
     for InputEvent(event) in messages.read() {
         let Event::MouseMoved { point, modifiers } = event else {
             continue;
@@ -118,39 +141,15 @@ fn mouse_moved_trigger(
         // Corner dead zone: suppress focus events when the cursor sits in
         // the bottom-right of any display (where hidden virtual workspace
         // slivers park). See is_in_corner_dead_zone for details.
-        let cursor = origin_from(*point);
+        let pointer = origin_from(*point);
         if displays.iter().any(|(display, dock)| {
-            display.bounds().contains(cursor)
-                && is_in_corner_dead_zone(cursor, display, dock, &config)
+            display.bounds().contains(pointer)
+                && is_in_corner_dead_zone(pointer, display, dock, &config)
         }) {
             trace!("mouse moved suppressed in corner dead-zone {point:?}");
             continue;
         }
 
-        if !config.focus_follows_mouse() {
-            continue;
-        }
-        if global_state.ffm_flag().is_some() {
-            trace!("ffm_window_id > 0");
-            continue;
-        }
-
-        // Command focus is applied before auto-centering starts in PostUpdate.
-        // Until the strip and its windows settle, hit-testing sees intermediate
-        // geometry and can undo that focus by selecting the previous window.
-        // Mouse-driven focus keeps skip_reshuffle set and remains unaffected.
-        if !global_state.skip_reshuffle()
-            && (!pending_focus_layout.is_empty()
-                || active_workspaces.iter().any(|(entity, strip)| {
-                    moving
-                        .iter()
-                        .any(|moving| moving == entity || strip.contains(moving))
-                }))
-        {
-            trace!("mouse focus suppressed during command-driven slide");
-            continue;
-        }
-        let pointer = origin_from(*point);
         if let Some((focused, _)) = windows.focused()
             && focused.frame().contains(pointer)
         {
@@ -214,10 +213,56 @@ fn mouse_moved_trigger(
 }
 
 // An app can send the focus notification after the user releases the button.
-const CLICK_FOCUS_GRACE: Duration = Duration::from_secs(1);
+pub(super) const CLICK_FOCUS_GRACE: Duration = Duration::from_secs(1);
 
-type StaleClickMarkers<'w, 's> =
+pub(super) type StaleClickMarkers<'w, 's> =
     Query<'w, 's, Entity, Or<(With<MouseHeldMarker>, With<ClickFocusMarker>)>>;
+
+type ClickableWorkspaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static Position,
+        Option<&'static RepositionMarker>,
+        &'static ChildOf,
+        Option<&'static Scrolling>,
+        Has<ActiveWorkspaceMarker>,
+    ),
+>;
+
+fn is_window_obscured_beyond_ratio(
+    entity: Entity,
+    windows: &Windows,
+    workspaces: &ClickableWorkspaces,
+    displays: &Query<(&Display, Option<&DockPosition>)>,
+    config: &Config,
+) -> bool {
+    let Some(((display, dock), strip_target)) = workspaces
+        .iter()
+        .find(|(_, strip, ..)| strip.contains(entity))
+        .and_then(|(_, _, pos, repo, child, _, _)| {
+            let target = repo.map_or(pos.0, |r| r.0);
+            Some((displays.get(child.parent()).ok()?, target))
+        })
+    else {
+        return false;
+    };
+    let (Some(layout_pos), Some(frame)) = (
+        windows.layout_position(entity),
+        windows.moving_frame(entity),
+    ) else {
+        return false;
+    };
+    let size = frame.size();
+    let viewport = display.actual_display_bounds(dock, config);
+    let projected_min = layout_pos.0 + strip_target;
+    let projected_frame = IRect::from_corners(projected_min, projected_min + size);
+    let visible_width = viewport.intersect(projected_frame).width().max(0);
+    let hidden_fraction = 1.0 - f64::from(visible_width) / f64::from(size.x.max(1));
+    visible_width == 0 || hidden_fraction > config.window_hidden_ratio()
+}
 
 /// Handles mouse down events.
 ///
@@ -233,12 +278,11 @@ type StaleClickMarkers<'w, 's> =
 /// * `commands` - Bevy commands to trigger a reshuffle.
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
-    windows: Windows,
-    active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    workspaces: ClickableWorkspaces,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
-    config: Res<Config>,
     stale_markers: StaleClickMarkers,
-    mut commands: Commands,
+    mut ctx: WindowCtx,
 ) {
     for InputEvent(event) in messages.read() {
         let Event::MouseDown { point, .. } = event else {
@@ -249,15 +293,16 @@ fn mouse_down_trigger(
         let Some((_, entity)) = window_manager
             .find_window_at_point(point)
             .ok()
-            .and_then(|window_id| windows.find(window_id))
+            .and_then(|window_id| ctx.windows.find(window_id))
         else {
             continue;
         };
 
         // Stop any ongoing scroll.
-        for (entity, scroll) in active_workspace {
-            if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
+        for (strip_entity, _, _, _, _, scroll, active) in &workspaces {
+            if active
+                && scroll.is_some()
+                && let Ok(mut entity_commands) = ctx.commands.get_entity(strip_entity)
             {
                 entity_commands.try_remove::<Scrolling>();
             }
@@ -265,26 +310,34 @@ fn mouse_down_trigger(
 
         // Clean up any stale marker from a previous click.
         for marker in &stale_markers {
-            if let Ok(mut entity_commands) = commands.get_entity(marker) {
+            if let Ok(mut entity_commands) = ctx.commands.get_entity(marker) {
                 entity_commands.try_despawn();
             }
         }
 
-        if windows
+        let focused_changed = ctx
+            .windows
             .focused()
-            .is_none_or(|(_, focused)| focused != entity)
-        {
-            let grace = Timeout::new(CLICK_FOCUS_GRACE, None, &mut commands);
-            commands.spawn((ClickFocusMarker(entity), grace));
+            .is_none_or(|(_, focused)| focused != entity);
+        if focused_changed {
+            let grace = Timeout::new(CLICK_FOCUS_GRACE, None, &mut ctx.commands);
+            ctx.commands.spawn((ClickFocusMarker(entity), grace));
         }
 
-        if config.window_hidden_ratio() >= 1.0 {
-            // At max hidden ratio, never reshuffle on click.
-        } else {
+        if ctx.config.window_hidden_ratio() < 1.0
+            && (focused_changed
+                || is_window_obscured_beyond_ratio(
+                    entity,
+                    &ctx.windows,
+                    &workspaces,
+                    &displays,
+                    &ctx.config,
+                ))
+        {
             // Defer reshuffle until mouse-up so the window doesn't shift
             // mid-click. The Timeout auto-despawns if mouse-up is lost.
-            let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-            commands.spawn((MouseHeldMarker(entity), timeout));
+            let timeout = Timeout::new(Duration::from_secs(5), None, &mut ctx.commands);
+            ctx.commands.spawn((MouseHeldMarker(entity), timeout));
         }
     }
 }
@@ -396,6 +449,142 @@ pub(super) struct WarpVelocityState {
     last: Option<(Origin, Instant)>,
 }
 
+fn rect_contains(rect: IRect, point: Origin) -> bool {
+    (rect.min.x..rect.max.x).contains(&point.x) && (rect.min.y..rect.max.y).contains(&point.y)
+}
+
+#[derive(Clone, Copy)]
+struct RowDisplay {
+    frame: IRect,
+    row_offset_x: i32,
+}
+
+struct WarpDesk {
+    row: Vec<RowDisplay>,
+    lowest: IRect,
+}
+
+impl WarpDesk {
+    fn from_displays(
+        displays: &Query<&Display>,
+        config: &Config,
+        warp_direction: i16,
+    ) -> Option<Self> {
+        if !config.horizontal_mouse_warp_lowest_below() {
+            return None;
+        }
+        // The pointer can be in a menu bar, which `Display::bounds` leaves out.
+        let frames = displays.iter().map(Display::frame).collect::<Vec<_>>();
+        Self::new(&frames, warp_direction)
+    }
+
+    fn new(frames: &[IRect], warp_direction: i16) -> Option<Self> {
+        if frames.len() < 3 {
+            return None;
+        }
+        let lowest = *frames.iter().max_by_key(|frame| frame.min.y)?;
+        let mut upward = frames
+            .iter()
+            .copied()
+            .filter(|frame| *frame != lowest)
+            .collect::<Vec<_>>();
+        upward.sort_by_key(|frame| std::cmp::Reverse((frame.min.y, frame.min.x)));
+        upward.dedup_by_key(|frame| (frame.min.y, frame.min.x));
+        // The display above the lowest one keeps its macOS x.
+        // Thus the native crossing between these two displays agrees with the row.
+        let anchor = *upward.first()?;
+        let row = upward
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let row_min_x = if warp_direction > 0 {
+                    anchor.min.x + upward[..index].iter().map(IRect::width).sum::<i32>()
+                } else {
+                    anchor.max.x - upward[..=index].iter().map(IRect::width).sum::<i32>()
+                };
+                RowDisplay {
+                    frame: *frame,
+                    row_offset_x: row_min_x - frame.min.x,
+                }
+            })
+            .collect();
+        Some(Self { row, lowest })
+    }
+
+    fn is_lowest(&self, display: &Display) -> bool {
+        self.lowest == display.frame()
+    }
+
+    fn landing(
+        &self,
+        previous: Option<Origin>,
+        point: Origin,
+        edge: i32,
+        inset: i32,
+    ) -> Option<Origin> {
+        previous
+            .and_then(|previous| self.row_crossing(previous, point, inset))
+            .or_else(|| self.up_from_lowest(point, edge, inset))
+    }
+
+    fn member(&self, point: Origin) -> Option<RowDisplay> {
+        self.row
+            .iter()
+            .copied()
+            .find(|display| rect_contains(display.frame, point))
+    }
+
+    // macOS moves the pointer across a shared edge without a stop at the edge.
+    // Thus only the previous point shows that the pointer left a row display.
+    fn row_crossing(&self, previous: Origin, point: Origin, inset: i32) -> Option<Origin> {
+        // An event from before a sideways warp still has the old position.
+        // It jumps by the width of a display, which a real crossing does not.
+        const MAX_CROSSING_STEP_X: i32 = 400;
+        let from = self.member(previous)?;
+        let to = self.member(point)?;
+        if to.frame == from.frame || (point.x - previous.x).abs() >= MAX_CROSSING_STEP_X {
+            return None;
+        }
+        let row_x = previous.x + from.row_offset_x;
+        let over_lowest = (self.lowest.min.x..self.lowest.max.x).contains(&row_x);
+        if to.frame.min.y >= from.frame.max.y {
+            Some(if over_lowest {
+                Origin::new(
+                    row_x.clamp(self.lowest.min.x + inset, self.lowest.max.x - 1 - inset),
+                    self.lowest.min.y + inset,
+                )
+            } else {
+                Origin::new(previous.x, from.frame.max.y - 1)
+            })
+        } else {
+            (to.frame.max.y <= from.frame.min.y).then(|| Origin::new(previous.x, from.frame.min.y))
+        }
+    }
+
+    fn up_from_lowest(&self, point: Origin, edge: i32, inset: i32) -> Option<Origin> {
+        let on_top_edge = rect_contains(self.lowest, point) && point.y - self.lowest.min.y < edge;
+        let native_above = self
+            .member(Origin::new(point.x, self.lowest.min.y - 1))
+            .is_some();
+        if !on_top_edge || native_above {
+            return None;
+        }
+        self.row
+            .iter()
+            .find(|display| {
+                (display.frame.min.x + display.row_offset_x
+                    ..display.frame.max.x + display.row_offset_x)
+                    .contains(&point.x)
+            })
+            .map(|display| {
+                Origin::new(
+                    point.x - display.row_offset_x,
+                    display.frame.max.y - 1 - inset,
+                )
+            })
+    }
+}
+
 fn horizontal_warp_mouse_trigger(
     mut messages: MessageReader<InputEvent>,
     displays: Query<&Display>,
@@ -415,6 +604,14 @@ fn horizontal_warp_mouse_trigger(
     /// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
+    let Some(warp_direction) = config.horizontal_mouse_warp() else {
+        return;
+    };
+    if displays.count() < 2 {
+        return;
+    }
+
+    let mut desk: Option<Option<WarpDesk>> = None;
     for InputEvent(event) in messages.read() {
         let (Event::MouseMoved { point, .. } | Event::MouseDragged { point, .. }) = event else {
             continue;
@@ -425,21 +622,30 @@ fn horizontal_warp_mouse_trigger(
 
         // Compute velocity from the previous sample before deciding whether to
         // warp, then refresh the sample so subsequent events build on this one.
-        let velocity_x = state.last.and_then(|(prev, t)| {
+        let recent_previous = state
+            .last
+            .filter(|(_, t)| now.saturating_duration_since(*t) <= VELOCITY_FRESHNESS);
+        let velocity_x = recent_previous.and_then(|(prev, t)| {
             let dt = now.saturating_duration_since(t);
-            if dt.is_zero() || dt > VELOCITY_FRESHNESS {
+            if dt.is_zero() {
                 return None;
             }
             let dx = f64::from(point.x - prev.x);
             Some(dx / dt.as_secs_f64())
         });
+        let previous = recent_previous.map(|(previous, _)| previous);
         state.last = Some((point, now));
 
-        let Some(warp_direction) = config.horizontal_mouse_warp() else {
-            return;
-        };
-        if displays.count() < 2 {
-            return;
+        let desk = desk
+            .get_or_insert_with(|| WarpDesk::from_displays(&displays, &config, warp_direction))
+            .as_ref();
+
+        if let Some(landing) =
+            desk.and_then(|desk| desk.landing(previous, point, EDGE_THRESHOLD, LANDING_INSET))
+        {
+            window_manager.warp_mouse(landing);
+            state.last = Some((landing, now));
+            continue;
         }
 
         let Some(current_display) = displays
@@ -448,6 +654,9 @@ fn horizontal_warp_mouse_trigger(
         else {
             continue;
         };
+        if desk.is_some_and(|desk| desk.is_lowest(current_display)) {
+            continue;
+        }
 
         let on_left_edge = (point.x - current_display.bounds().min.x).abs() < EDGE_THRESHOLD;
         let on_right_edge = (current_display.bounds().max.x - point.x).abs() < EDGE_THRESHOLD;
@@ -455,8 +664,9 @@ fn horizontal_warp_mouse_trigger(
             continue;
         }
 
-        let mut target_displays = displays
+        let Some(warp_to) = displays
             .iter()
+            .filter(|display| desk.is_none_or(|desk| !desk.is_lowest(display)))
             .filter(|display| {
                 let above = display.bounds().min.y < current_display.bounds().min.y;
                 let below = display.bounds().min.y > current_display.bounds().min.y;
@@ -468,11 +678,8 @@ fn horizontal_warp_mouse_trigger(
                     below
                 }
             })
-            .collect::<Vec<_>>();
-
-        target_displays
-            .sort_by_key(|display| (display.bounds().min.y - current_display.bounds().min.y).abs());
-        let Some(warp_to) = target_displays.first() else {
+            .min_by_key(|display| (display.bounds().min.y - current_display.bounds().min.y).abs())
+        else {
             continue;
         };
         let target = warp_to.bounds();

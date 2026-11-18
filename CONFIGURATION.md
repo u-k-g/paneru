@@ -26,9 +26,10 @@ General behavior settings for the window manager.
 | `mouse_follows_focus` | Boolean | `true` | If enabled, the mouse cursor will warp to the center of the focused window when focus changes via keyboard. |
 | `horizontal_mouse_warp` | Integer ``(-1, 1)`` | Off | If enabled, the mouse will warp to another screen above or below, when touching the left or right edge. The direction depends on the direction - a negative value will cause the left edge to warp to a screen above and the right edge to a screen below. This allows having horizontal positioning of displays while having them aligned in a virtual layout in macOS settings. The cursor lands at the *opposite* edge of the target display (preserving cursor flow), with the source's relative Y position. Carries pre-warp horizontal velocity to avoid a "standing start", and skips the warp when the equivalent Y has no position on the target — matching macOS's native side-by-side behavior for displays of unequal height. The warp also applies while a mouse button is held, so a dragged window crosses to the target display. (inspired by https://github.com/mogenson/WarpMouse.spoon) |
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
+| `horizontal_mouse_warp_lowest_below` | Boolean | `false` | With `horizontal_mouse_warp` and three or more displays, the lowest display (for example a laptop under a row of monitors) is not part of the warp row. Moving down out of any row display reaches it at the matching position, and moving up from it reaches the row display above that position. The row starts at the display directly above the lowest one, at its macOS position, so place the lowest display in macOS under the part of the row it sits under. Its left and right edges do not warp. The pointer never moves up or down between two row displays, because they sit side by side: past the lowest display it stops at the edge. |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
-| `animation_speed` | Float | `28.0` | Exponential window-animation speed. The comfortable range is roughly 12–30; higher values settle faster. Set a very high value to effectively disable animations. |
+| `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
 | `sliver_width` | Integer (px) | `5` | Horizontal width of off-screen windows kept visible. |
@@ -248,12 +249,17 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_manage` | Toggle between tiled and floating state. |
 | `window_stack` | Stack the current window into the column on the left. |
 | `window_unstack` | Pull a window out of a stack into its own column. |
+| `window_consume` | Consume the column to the right into the current column (stack it below). |
+| `window_expel` | Pull the focused window out of its stack into its own column on the right, keeping focus on the stack. |
 | `window_tabbeddisplay` | Toggle the focused stack between a normal split display and a tabbed display (one window visible at a time, sharing the full column). Cycle tabs with `window_focus_north`/`window_focus_south`. |
 | `window_equalize` | Make all windows in a stack equal height. |
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
+| `window_displaymove_<id>` | Move focused window to the monitor with this display ID and follow it. `paneru query active` reports display IDs. |
+| `window_displaysend_<id>` | Move focused window to the monitor with this display ID but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
+| `mouse_display_<id>` | Warp mouse cursor to the monitor with this display ID. |
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
@@ -560,6 +566,28 @@ In Light Mode, the border ignores `color_night`.
 The border changes color immediately when the macOS appearance changes.
 
 > **Tip:** You can override the `border_radius` for specific applications in the `[windows]` section. See [Window Rules](#6-window-rules).
+
+### `[decorations.tab_indicator]`
+
+A thin clickable strip drawn along one edge of a tabbed-display column (`window_tabbeddisplay`, see [Keybindings](#5-keybindings)) — one segment per tab, the active one highlighted, click a segment to switch straight to that tab.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Bool | `true` | Whether the indicator is drawn on a tabbed column. |
+| `position` | String | `'left'` | Which edge of the column the indicator sits against: `'left'`, `'right'`, `'top'`, or `'bottom'`. |
+| `width` | Float (px) | `6.0` | Thickness of the indicator strip. |
+| `gap` | Float (px) | `4.0` | Gap between the indicator and the column it belongs to. |
+| `segment_gap` | Float (px) | `2.0` | Gap between adjacent tab segments. |
+| `active_color` | String (Hex) | `"#5AC8FA"` | Color of the active tab's segment. |
+| `inactive_color` | String (Hex) | `"#666666"` | Color of inactive tab segments. |
+
+**Example:**
+```toml
+[decorations.tab_indicator]
+position = "left"
+active_color = "#89b4fa"
+inactive_color = "#45475a"
+```
 
 ## 8. Lua Scripting
 

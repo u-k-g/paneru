@@ -195,7 +195,7 @@ impl Plugin for DisplayEventsPlugin {
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_active_display_marker(
-    trigger: On<Add, ActiveDisplayMarker>,
+    trigger: On<Add<ActiveDisplayMarker>>,
     displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
     mut commands: Commands,
 ) {
@@ -536,6 +536,13 @@ fn place_extracted_strip(
     target_space_id: WorkspaceId,
     mut extracted: LayoutStrip,
 ) {
+    // The strip that receives the focused window becomes the active one.
+    // Otherwise the old row stays shown and the focused window is scrolled into
+    // view on top of it.
+    let holds_focus = extracted
+        .all_windows()
+        .into_iter()
+        .any(|entity| world.get::<FocusedMarker>(entity).is_some());
     let empty_row_0 = world
         .query::<(Entity, &LayoutStrip, Has<NativeFullscreenMarker>)>()
         .iter(world)
@@ -561,6 +568,9 @@ fn place_extracted_strip(
                 .remove::<PreviousStripPosition>()
                 .insert((Position(display_bounds.min), SelectedVirtualMarker));
         }
+        if holds_focus {
+            world.entity_mut(dst_entity).insert(ActiveWorkspaceMarker);
+        }
         return;
     }
 
@@ -573,14 +583,14 @@ fn place_extracted_strip(
         .map_or(0, |max_idx| max_idx + 1);
 
     extracted.virtual_index = next_virtual_index;
-    let focus = extracted.first().ok().and_then(|col| col.top());
-    if next_virtual_index == 0 {
+    let focus = extracted.first();
+    let strip_entity = if next_virtual_index == 0 {
         world.spawn((
             Position(display_bounds.min),
             extracted,
             ChildOf(display_entity),
             SelectedVirtualMarker,
-        ));
+        ))
     } else {
         world.spawn((
             Position(display_bounds.max - PARKED_STRIP_SLIVER),
@@ -590,7 +600,11 @@ fn place_extracted_strip(
             },
             extracted,
             ChildOf(display_entity),
-        ));
+        ))
+    }
+    .id();
+    if holds_focus {
+        world.entity_mut(strip_entity).insert(ActiveWorkspaceMarker);
     }
 }
 

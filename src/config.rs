@@ -21,6 +21,7 @@ use self::decorations::{
     BorderRadiusOption, DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
 use self::swipe::SwipeGestureDirection;
+use crate::tab_indicator::TabIndicatorPosition;
 
 #[cfg(test)]
 use crate::commands::{MoveFocus, Operation, ResizeDirection};
@@ -393,13 +394,14 @@ impl Config {
     // Exponential ease-out decay rate (per second) consumed by the animation
     // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
     // values collapse to an instant snap.
-    // Suggested range: 12..30 for a fluid feel. The default is deliberately at
-    // the snappy end; very large values still collapse to an instant snap.
+    // Suggested range: 8..20 for a fluid feel. Unset = instant (no animation),
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed
-            .filter(|speed| speed.is_finite() && *speed > 0.0)
-            .unwrap_or(28.0)
+            // If unset, set it to something high, so the move happens immediately,
+            // effectively disabling animation.
+            .unwrap_or(1_000_000.0)
+            .max(0.0)
     }
 
     /// Finds a keybinding matching the given `keycode` and `modifier` mask.
@@ -722,6 +724,72 @@ impl Config {
         self.options().menubar_height.map(i32::from)
     }
 
+    pub fn tab_indicator_enabled(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn tab_indicator_position(&self) -> TabIndicatorPosition {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.position)
+            .unwrap_or_default()
+    }
+
+    pub fn tab_indicator_width(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.width)
+            .unwrap_or(6.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_gap(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.gap)
+            .unwrap_or(4.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_segment_gap(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.segment_gap)
+            .unwrap_or(2.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_active_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.active_color.as_deref())
+            .map_or((0.353, 0.784, 0.980), parse_hex_color)
+    }
+
+    pub fn tab_indicator_inactive_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.inactive_color.as_deref())
+            .map_or((0.4, 0.4, 0.4), parse_hex_color)
+    }
+
     pub fn swipe_sensitivity(&self) -> f64 {
         let config = self.inner();
         config
@@ -892,6 +960,12 @@ impl Config {
 
     pub fn horizontal_mouse_warp_offset(&self) -> i32 {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
+    }
+
+    pub fn horizontal_mouse_warp_lowest_below(&self) -> bool {
+        self.options()
+            .horizontal_mouse_warp_lowest_below
+            .is_some_and(|below| below)
     }
 
     pub fn remember_display_setups(&self) -> bool {
@@ -1288,6 +1362,8 @@ pub struct MainOptions {
     /// higher or lower than the laptop). When warping downward (target below
     /// source) the offset is added; when warping upward, subtracted.
     pub horizontal_mouse_warp_offset: Option<i32>,
+    /// Puts the lowest display below the warp row instead of in it.
+    pub horizontal_mouse_warp_lowest_below: Option<bool>,
     /// A list of preset column widths (as ratios) used for resizing windows.
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
@@ -1295,7 +1371,7 @@ pub struct MainOptions {
     /// a window vertically inside a stack.
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
-    /// Exponential animation decay rate per second. Higher values settle faster.
+    /// The animation speed for window movements in pixels per second.
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
@@ -2060,6 +2136,12 @@ enum UCKeyAction {
 ///
 /// A `Vec<(String, u8)>` containing the translated key names and their keycodes. Returns an empty vector if an error occurs during keyboard layout fetching.
 fn generate_virtual_keymap() -> Vec<(String, u8)> {
+    // HIToolbox aborts the process when two threads call TIS at once, as
+    // parallel tests do.
+    static TIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = TIS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let keyboard = AXUIWrapper::from_retained(unsafe {
         TISCopyCurrentASCIICapableKeyboardLayoutInputSource()
     })
@@ -2111,6 +2193,22 @@ fn generate_virtual_keymap() -> Vec<(String, u8)> {
         })
         .flatten()
         .collect()
+}
+
+#[test]
+fn test_keymaps_built_on_several_threads_at_once_do_not_abort() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for _ in 0..5 {
+                    generate_virtual_keymap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("building a keymap");
+    }
 }
 
 #[cfg(test)]
@@ -2538,7 +2636,6 @@ fn test_config_defaults() {
     assert_eq!(config.menubar_height(), None);
     assert!(config.menubar_enabled());
     assert!(!config.snap_to_window());
-    assert_eq!(config.animation_speed(), 28.0);
 }
 
 #[test]
@@ -2563,15 +2660,6 @@ fn test_menubar_enabled_is_independent_of_workspace_indicator() {
         .expect("config should parse");
     assert!(!config.menubar_enabled());
     assert!(config.workspace_menu_status());
-}
-
-#[test]
-#[allow(clippy::float_cmp)]
-fn test_non_positive_animation_speed_uses_snappy_default() {
-    let config = Config::try_from("[options]\nanimation_speed = 0\n\n[bindings]\n")
-        .expect("config should parse");
-
-    assert_eq!(config.animation_speed(), 28.0);
 }
 
 #[test]

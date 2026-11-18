@@ -11,7 +11,7 @@ use crate::events::{DestroySource, Event};
 use crate::manager::app::MockApplicationApi;
 use crate::manager::{
     Application, Display, MockProcessApi, MockWindowApi, MockWindowManagerApi, Origin, Size,
-    Window, origin_from, origin_to,
+    Window, WindowPadding, origin_from, origin_to,
 };
 use crate::platform::{Modifiers, Pid, ProcessSerialNumber, WinID, WorkspaceId};
 
@@ -44,11 +44,18 @@ pub(crate) struct MockWindowData {
     pub(crate) border_radius: Option<f64>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
+    /// The last horizontal and vertical padding the engine set, which the
+    /// mock does not apply to its frames.
+    pub(crate) padding_set: (Option<i32>, Option<i32>),
     pub(crate) child_role: bool,
     /// The narrowest width the app accepts, like an `NSWindow.minSize`.
     pub(crate) min_width: i32,
     /// The widest width the app accepts, or no limit when zero.
     pub(crate) max_width: i32,
+    /// When true, `resize()` clamps the window's bottom edge to the active
+    /// display's bottom edge and rejects height growth while parked off-screen,
+    /// modelling macOS WindowServer/AppKit frame constraints.
+    pub(crate) clamp_height_to_display: bool,
 }
 
 impl Default for MockWindowData {
@@ -68,9 +75,11 @@ impl Default for MockWindowData {
             border_radius: None,
             horizontal_padding: 0,
             vertical_padding: 0,
+            padding_set: (None, None),
             child_role: false,
             min_width: 0,
             max_width: 0,
+            clamp_height_to_display: false,
         }
     }
 }
@@ -497,6 +506,10 @@ impl MockState {
         let s = self.clone();
         mw.expect_resize().returning(move |size| {
             let mut inner = s.inner.force_write();
+            let display_bounds = inner
+                .displays
+                .get(&inner.active_display_id)
+                .map(|d| d.bounds);
             if let Some(w) = inner.windows.get_mut(&id) {
                 let max_width = if w.max_width > 0 {
                     w.max_width
@@ -504,7 +517,20 @@ impl MockState {
                     i32::MAX
                 };
                 let width = size.x.max(w.min_width).min(max_width);
-                w.frame.max = w.frame.min + size.with_x(width);
+                let height = if w.clamp_height_to_display
+                    && let Some(bounds) = display_bounds
+                {
+                    let on_screen_horizontally =
+                        w.frame.max.x > bounds.min.x + 20 && w.frame.min.x < bounds.max.x - 20;
+                    if !on_screen_horizontally && size.y > w.frame.height() {
+                        w.frame.height()
+                    } else {
+                        size.y.min((bounds.max.y - w.frame.min.y).max(1))
+                    }
+                } else {
+                    size.y
+                };
+                w.frame.max = w.frame.min + Size::new(width, height);
             }
         });
 
@@ -679,7 +705,15 @@ impl MockState {
             .returning(move |_psn, _focused, _focused_psn| {
                 s.set_focused_window(id);
             });
-        mw.expect_set_padding().return_const(());
+        let s = self.clone();
+        mw.expect_set_padding().returning(move |padding| {
+            if let Some(window) = s.inner.force_write().windows.get_mut(&id) {
+                match padding {
+                    WindowPadding::Horizontal(padding) => window.padding_set.0 = Some(padding),
+                    WindowPadding::Vertical(padding) => window.padding_set.1 = Some(padding),
+                }
+            }
+        });
 
         Window::new(Box::new(mw))
     }

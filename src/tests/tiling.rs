@@ -1032,6 +1032,65 @@ fn test_closing_unfocused_popup_preserves_editor_focus() {
         ]);
 }
 
+fn assert_shown_whole(world: &mut World, id: i32) {
+    let mut query = world.query::<&crate::manager::Window>();
+    let frame = query
+        .iter(world)
+        .find(|window| window.id() == id)
+        .unwrap_or_else(|| panic!("window {id} not found"))
+        .frame();
+    assert!(
+        frame.min.x >= 0 && frame.max.x <= TEST_DISPLAY_WIDTH,
+        "window {id} must be shown whole on the display, got {frame:?}"
+    );
+}
+
+/// Windows left of the focused one close while it keeps focus. Each close
+/// pulls the columns after it left while the strip's origin stays put, so the
+/// focused window has to be scrolled back into view.
+#[test]
+fn test_focused_survivor_stays_shown_when_windows_left_of_it_close() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(4)
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 3);
+            assert_shown_whole(world, 3);
+            state.os_close_window(0);
+        })
+        .on_iteration(2, |world, state| {
+            assert!(!window_exists(world, 0));
+            assert_shown_whole(world, 3);
+            state.os_close_window(1);
+        })
+        .on_iteration(3, |world, state| {
+            assert!(!window_exists(world, 1));
+            assert_shown_whole(world, 3);
+            state.os_close_window(2);
+        })
+        .on_iteration(4, |world, _state| {
+            assert!(!window_exists(world, 2));
+            assert_focused!(world, 3);
+            assert_shown_whole(world, 3);
+        })
+        .run(commands);
+}
+
 fn window_x(world: &mut World, id: i32) -> i32 {
     let mut query = world.query::<&crate::manager::Window>();
     query
@@ -1052,6 +1111,58 @@ fn strip_column(world: &mut World, id: i32) -> Option<usize> {
         .query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>()
         .iter(world)
         .find_map(|strip| strip.index_of(entity).ok())
+}
+
+fn padding_set(state: &MockState, id: i32) -> (Option<i32>, Option<i32>) {
+    let mut set = (None, None);
+    state.update_window(id, |window| set = window.padding_set);
+    set
+}
+
+/// `apply_window_defaults` pads only a window that opens tiled, so a window
+/// that opens floating has to get its padding when it is tiled.
+#[test]
+fn test_window_tiled_from_floating_gets_its_padding() {
+    let mut floating = WindowParams::new("^Window 1$", Some("test".to_string()));
+    floating.floating = Some(true);
+    let mut padded = WindowParams::new(".*", None);
+    padded.horizontal_padding = Some(4);
+    padded.vertical_padding = Some(4);
+    let config: Config = (MainOptions::default(), vec![floating, padded]).into();
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        }, // 0
+        Event::Command {
+            command: Command::PrintState,
+        }, // 1
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        }, // 2: tile window 1
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, state| {
+            assert_focused!(world, 1);
+            let entity = find_window_entity(1, world);
+            assert!(world.entity(entity).contains::<crate::ecs::Unmanaged>());
+            assert_eq!(padding_set(&state, 0), (Some(4), Some(4)));
+            assert_eq!(padding_set(&state, 1), (None, None));
+        })
+        .on_iteration(2, |world, state| {
+            let entity = find_window_entity(1, world);
+            assert!(!world.entity(entity).contains::<crate::ecs::Unmanaged>());
+            assert_eq!(
+                padding_set(&state, 1),
+                (Some(4), Some(4)),
+                "a window tiled from floating must get its padding"
+            );
+        })
+        .run(commands);
 }
 
 fn window_exists(world: &mut World, id: i32) -> bool {
@@ -1159,6 +1270,96 @@ fn test_startup_floating_window_does_not_steal_initial_focus_or_enter_strip() {
             assert_window_at!(world, 2, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
+}
+
+/// A new window that opens floating and focused takes focus in Paneru, so
+/// `window_manage` acts on it, not on the window focused before it. macOS does
+/// not report the focus change here, as when the app was not tracked yet.
+#[test]
+fn test_new_floating_window_takes_focus() {
+    let mut params = WindowParams::new("^Window 1$", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    let floating = |world: &mut World, id| {
+        let entity = find_window_entity(id, world);
+        matches!(
+            world.entity(entity).get::<crate::ecs::Unmanaged>(),
+            Some(crate::ecs::Unmanaged::Floating)
+        )
+    };
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, |world, state| {
+            let frame = IRect::new(100, 100, 500, 400);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            state.set_focused_window(1);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(2, move |world, _state| {
+            assert!(floating(world, 1), "the rule floats window 1");
+        })
+        .on_iteration(4, move |world, _state| {
+            assert!(
+                !floating(world, 0),
+                "window_manage must not float the previously focused window"
+            );
+            assert!(
+                !floating(world, 1),
+                "window_manage must tile the new window"
+            );
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::Window(Operation::Manage),
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// A new floating window with a `dont_focus` rule leaves focus where it was.
+#[test]
+fn test_new_floating_window_with_dont_focus_leaves_focus() {
+    let mut params = WindowParams::new("^Window 1$", None);
+    params.floating = Some(true);
+    params.dont_focus = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, |world, state| {
+            let frame = IRect::new(100, 100, 500, 400);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            state.set_focused_window(1);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
 }
 
 /// Regression test: stacking an already-focused window (`Operation::Stack(true)`)
@@ -2009,4 +2210,124 @@ fn balance_pins_a_strip_that_now_fits_to_the_left_edge() {
         last.max.x <= TEST_DISPLAY_WIDTH,
         "strip overflows: {last:?}"
     );
+}
+
+/// The float key acts on the window the engine marks focused. When the user
+/// has switched to a window the engine does not manage, such as one from an
+/// accessory app, that mark still sits on the last managed window. Floating it
+/// would change a window the user is not looking at.
+#[test]
+fn test_float_ignores_window_macos_no_longer_focuses() {
+    const ACCESSORY: i32 = TEST_PROCESS_ID + 1;
+    let manage = || Event::Command {
+        command: Command::Window(Operation::Manage),
+    };
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        }, // 0
+        Event::Command {
+            command: Command::PrintState,
+        }, // 1
+        manage(), // 2
+        Event::Command {
+            command: Command::PrintState,
+        }, // 3
+        manage(), // 4
+    ];
+    let floating = |world: &mut World, id| {
+        let entity = find_window_entity(id, world);
+        world.get::<crate::ecs::Unmanaged>(entity).is_some()
+    };
+
+    TestHarness::new()
+        .with_windows(2)
+        .with_focused_window(0)
+        .on_iteration(0, |_world, state| {
+            state.spawn_app(ACCESSORY, "com.example.accessory", "Accessory");
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            state.spawn_window(ACCESSORY, TEST_WORKSPACE_ID, 9, frame);
+            state.update_app(TEST_PROCESS_ID, |app| app.is_frontmost = false);
+            state.focus_window(9);
+        })
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .on_iteration(2, move |world, state| {
+            assert!(
+                !floating(world, 0),
+                "window 0 must stay tiled while macOS focuses another app"
+            );
+            state.update_app(ACCESSORY, |app| app.is_frontmost = false);
+            state.update_app(TEST_PROCESS_ID, |app| app.is_frontmost = true);
+            state.focus_window(0);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert!(
+                floating(world, 0),
+                "window 0 must float once macOS focuses it again"
+            );
+        })
+        .run(commands);
+}
+
+/// An app too busy to answer the focused-window query must not block the
+/// float key, so only a different answer from macOS skips the toggle.
+#[test]
+fn test_float_proceeds_when_the_app_cannot_report_focus() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        }, // 0
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        }, // 1
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .with_focused_window(0)
+        .on_iteration(0, |_world, state| {
+            state.update_app(TEST_PROCESS_ID, |app| app.focused_window_id = None);
+        })
+        .on_iteration(1, |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                world.get::<crate::ecs::Unmanaged>(entity).is_some(),
+                "window 0 must float when its app cannot report focus"
+            );
+        })
+        .run(commands);
+}
+
+/// macOS can focus another window of the same app before its focus event
+/// reaches the engine. The float key must not float the window the user left.
+#[test]
+fn test_float_ignores_window_before_its_app_reports_new_focus() {
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        }, // 0
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        }, // 1
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .with_focused_window(0)
+        .on_iteration(0, |_world, state| {
+            state.set_focused_window(1);
+        })
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            for id in [0, 1] {
+                let entity = find_window_entity(id, world);
+                assert!(
+                    world.get::<crate::ecs::Unmanaged>(entity).is_none(),
+                    "window {id} must stay tiled"
+                );
+            }
+        })
+        .run(commands);
 }

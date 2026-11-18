@@ -129,6 +129,10 @@ impl Display {
         bounds
     }
 
+    pub fn frame(&self) -> IRect {
+        self.bounds
+    }
+
     pub fn width(&self) -> i32 {
         self.bounds().width()
     }

@@ -7,7 +7,7 @@ use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
-use bevy::ecs::query::{Added, Changed, Or, With};
+use bevy::ecs::query::{Added, Changed, Or, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_changed, resource_exists};
@@ -37,7 +37,7 @@ use crate::lua;
 use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashMessageManager, OverlayManager, TabIndicatorManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
@@ -60,6 +60,13 @@ pub mod workspace;
 #[cfg(feature = "lua")]
 pub(crate) use triggers::apply_config_side_effects;
 
+/// Work that must precede Bevy's clock update in [`First`].
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FirstSet {
+    /// Answer pending Lua queries and pump OS events before sampling time.
+    Pump,
+}
+
 /// Deterministic execution phases for the [`PreUpdate`] schedule.
 ///
 /// Bevy's topological sort breaks ties between unconstrained systems using its
@@ -70,8 +77,6 @@ pub(crate) use triggers::apply_config_side_effects;
 /// unrelated systems.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PreUpdateSet {
-    /// Answer pending Lua queries from the previous frame and pump OS events.
-    Pump,
     /// Split high-rate pointer/gesture events out of `Messages<Event>` before
     /// command and trigger readers iterate the main queue.
     Demux,
@@ -136,6 +141,17 @@ type OverlayFocusedMoved<'w, 's> = Query<
     ),
 >;
 
+type TabIndicatorWindowMoved<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    (
+        With<Window>,
+        Without<Unmanaged>,
+        Or<(Changed<Position>, Changed<Bounds>)>,
+    ),
+>;
+
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -180,17 +196,43 @@ pub fn register_systems(app: &mut bevy::app::App) {
                     || !workspace_changed.is_empty()
                     || !focused_moved.is_empty()))
     };
+    // Not gated on dimming/borders being enabled, unlike the dim overlay.
+    let tab_indicators_dirty =
+        |config: Option<Res<Config>>,
+         menubar: Option<Res<crate::menubar::MenuBarVisibility>>,
+         mission_control: Option<Res<MissionControlActive>>,
+         active_strips: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+         strip_changed: OverlayStripChanged,
+         mut scrolling_removed: RemovedComponents<Scrolling>,
+         focus_gained: Query<(), Added<FocusedMarker>>,
+         workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
+         window_moved: TabIndicatorWindowMoved| {
+            let scrolling_ended = scrolling_removed.read().count() > 0;
+            let Some(config) = config else {
+                return false;
+            };
+            config.is_changed()
+                || (config.tab_indicator_enabled()
+                    && (menubar.is_some_and(|mb| mb.is_changed())
+                        || mission_control.is_some_and(|mc| mc.is_changed())
+                        || scrolling_ended
+                        || !strip_changed.is_empty()
+                        || !workspace_changed.is_empty()
+                        || ((!focus_gained.is_empty() || !window_moved.is_empty())
+                            && active_strips.iter().any(LayoutStrip::has_tabbed_stacks))))
+        };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
 
     app.configure_sets(
+        First,
+        FirstSet::Pump
+            .after(bevy::ecs::message::MessageUpdateSystems)
+            .before(bevy::time::TimeSystems),
+    );
+    app.configure_sets(
         PreUpdate,
-        (
-            PreUpdateSet::Pump,
-            PreUpdateSet::Demux,
-            PreUpdateSet::Dispatch,
-        )
-            .chain(),
+        (PreUpdateSet::Demux, PreUpdateSet::Dispatch).chain(),
     );
     app.configure_sets(
         Update,
@@ -227,10 +269,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    // Sample Bevy time after the blocking OS wait, so this frame uses its own
+    // elapsed interval rather than the previous frame's sleep.
+    app.add_systems(First, systems::pump_events.in_set(FirstSet::Pump));
     app.add_systems(
         PreUpdate,
         (
-            systems::pump_events.in_set(PreUpdateSet::Pump),
             systems::demux_input_events.in_set(PreUpdateSet::Demux),
             // Read creation notifications in the same frame that pumps them.
             // Otherwise an idle pump can wait up to its next timeout before
@@ -307,21 +351,15 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PostUpdate,
         (
-            (
-                systems::prepare_animation_frame,
-                systems::animate_resize_entities,
-                systems::animate_entities,
-                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
-                systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
-                systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
-            (
-                systems::animate_resize_entities,
-                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
-            )
-                .chain(),
+            systems::prepare_animation_frame,
+            systems::animate_entities,
+            systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
+            systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
+            systems::animate_resize_entities,
+            systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
+            systems::restore_enhanced_ui.run_if(crate::manager::enhanced_ui_restore_pending),
         )
+            .chain()
             .in_set(PostUpdateSet::Animate),
     );
     app.add_systems(
@@ -338,6 +376,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                     .or_eager(resource_changed::<Config>)
                     .or_eager(resource_changed::<crate::menubar::MenuBarVisibility>),
             ),
+            systems::update_tab_indicators.run_if(tab_indicators_dirty),
         )
             .in_set(PostUpdateSet::Ui),
     );
@@ -516,6 +555,14 @@ pub struct NativeFullscreenMarker {
 pub struct FullWidthMarker {
     pub width_ratio: f64,
 }
+
+/// Marks a window that is currently parked off-screen as an inactive member of
+/// a tabbed-display stack (or transitioning into tabbed display). When the
+/// window next returns to an on-screen slot, `position_layout_windows` snaps it
+/// directly into place instead of animating it in from the display edge, and
+/// removes the marker so subsequent strip movements animate normally.
+#[derive(Component)]
+pub struct ParkedTabMarker;
 
 /// Enum component indicating the unmanaged state of a window.
 #[derive(Component, Debug)]
@@ -881,6 +928,7 @@ fn autorelease_runner(mut app: BevyApp) -> bevy::app::AppExit {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
 
@@ -970,14 +1018,17 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
     crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
+    let tab_indicator_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     let initial_config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
+    let tab_indicator_manager = TabIndicatorManager::new(mtm, tab_indicator_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
+        .insert_non_send(tab_indicator_manager)
         .insert_non_send(receiver);
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML

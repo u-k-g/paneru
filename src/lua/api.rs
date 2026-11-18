@@ -625,7 +625,9 @@ fn install_script_state(
 #[allow(clippy::too_many_lines)]
 fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     use crate::config::{
-        MainOptions, RestoreOptions, format_modifiers,
+        MainOptions, RestoreOptions,
+        decorations::{DecorationsOptions, TabIndicatorOptions},
+        format_modifiers,
         padding::PaddingOptions,
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
@@ -642,6 +644,7 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         mouse_follows_focus: _,
         horizontal_mouse_warp: _,
         horizontal_mouse_warp_offset: _,
+        horizontal_mouse_warp_lowest_below: _,
         preset_column_widths: _,
         preset_stack_heights: _,
         animation_speed,
@@ -682,6 +685,10 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     options.set(
         "horizontal_mouse_warp_offset",
         config.horizontal_mouse_warp_offset(),
+    )?;
+    options.set(
+        "horizontal_mouse_warp_lowest_below",
+        config.horizontal_mouse_warp_lowest_below(),
     )?;
     options.set("preset_column_widths", config.preset_column_widths())?;
     options.set("preset_stack_heights", config.preset_stack_heights())?;
@@ -779,6 +786,24 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     swipe.set("scroll", scroll)?;
     root.set("swipe", swipe)?;
 
+    let DecorationsOptions {
+        active: _,
+        inactive: _,
+        workspace_menu_status: _,
+        menu: _,
+        workspace_popup_status: _,
+        tab_indicator: _,
+    } = DecorationsOptions::default();
+    let TabIndicatorOptions {
+        enabled: _,
+        position: _,
+        width: _,
+        gap: _,
+        segment_gap: _,
+        active_color: _,
+        inactive_color: _,
+    } = TabIndicatorOptions::default();
+
     let decorations = lua.create_table()?;
     decorations.set("workspace_menu_status", config.workspace_menu_status())?;
     decorations.set("workspace_popup_status", config.workspace_popup_status())?;
@@ -801,6 +826,22 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     dim.set("color", "#000000")?;
     inactive.set("dim", dim)?;
     decorations.set("inactive", inactive)?;
+
+    let tab_indicator = lua.create_table()?;
+    tab_indicator.set("enabled", config.tab_indicator_enabled())?;
+    let position_str = match config.tab_indicator_position() {
+        crate::tab_indicator::TabIndicatorPosition::Left => "left",
+        crate::tab_indicator::TabIndicatorPosition::Right => "right",
+        crate::tab_indicator::TabIndicatorPosition::Top => "top",
+        crate::tab_indicator::TabIndicatorPosition::Bottom => "bottom",
+    };
+    tab_indicator.set("position", position_str)?;
+    tab_indicator.set("width", config.tab_indicator_width())?;
+    tab_indicator.set("gap", config.tab_indicator_gap())?;
+    tab_indicator.set("segment_gap", config.tab_indicator_segment_gap())?;
+    tab_indicator.set("active_color", "#5AC8FA")?;
+    tab_indicator.set("inactive_color", "#666666")?;
+    decorations.set("tab_indicator", tab_indicator)?;
     root.set("decorations", decorations)?;
 
     let RestoreOptions {
@@ -850,6 +891,7 @@ mod tests {
     use super::*;
     use crate::config::{
         MainOptions, RestoreOptions,
+        decorations::TabIndicatorOptions,
         padding::PaddingOptions,
         swipe::{GestureOptions, ScrollOptions, SwipeOptions},
     };
@@ -973,6 +1015,16 @@ mod tests {
             assert!(
                 !val.is_nil(),
                 "RestoreOptions field '{field}' is missing from paneru.config.restore!"
+            );
+        }
+
+        let decorations_table: Table = root.get("decorations").unwrap();
+        let tab_indicator_table: Table = decorations_table.get("tab_indicator").unwrap();
+        for field in struct_field_names::<TabIndicatorOptions>() {
+            let val: Value = tab_indicator_table.get(field.as_str()).unwrap();
+            assert!(
+                !val.is_nil(),
+                "TabIndicatorOptions field '{field}' is missing from paneru.config.decorations.tab_indicator!"
             );
         }
         let defaults = config_to_lua_table(&lua, &Config::default()).unwrap();

@@ -372,8 +372,9 @@ fn no_setup_restore(session: Option<Res<super::restore::SessionRestore>>) -> boo
     !session.is_some_and(|session| session.is_cross_space())
 }
 
+#[allow(clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn detect_moved_windows(
+pub(crate) fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
     mut workspaces: Query<(
         &mut LayoutStrip,
@@ -484,14 +485,26 @@ fn detect_moved_windows(
             continue;
         }
 
-        debug!("Window {entity} moved to workspace {workspace_id}.");
-        let moving_entities = workspaces
+        // A parked tab's off-screen position can look like a move to another
+        // display; don't split the group over it. A move of the active tab is
+        // honored below and takes the whole group along.
+        if workspaces
             .iter()
-            .find_map(|(strip, _, _, _)| strip.tab_group(entity))
-            .unwrap_or_else(|| vec![entity]);
+            .any(|(strip, _, _, _)| strip.is_parked_tab(entity))
+        {
+            continue;
+        }
+
+        debug!("Window {entity} moved to workspace {workspace_id}.");
+        let group = workspaces
+            .iter()
+            .find_map(|(strip, _, _, _)| strip.relocation_group(entity));
+        let moving_entities = group
+            .as_ref()
+            .map_or_else(|| vec![entity], |group| group.members().to_vec());
         for (mut strip, strip_entity, _, _) in &mut workspaces {
             if strip_entity == *activated_workspace {
-                strip.append_tab_group(&moving_entities);
+                strip.append_relocation_group(entity, group.as_ref());
             } else {
                 for moving_entity in &moving_entities {
                     strip.remove(*moving_entity);
@@ -526,10 +539,12 @@ fn is_batch_workspace_move(
         if child.is_none() {
             return true;
         }
-        let first_group = strip
-            .tab_group(matching[0])
-            .unwrap_or_else(|| vec![matching[0]]);
-        matching.iter().any(|entity| !first_group.contains(entity))
+        let first_group = strip.relocation_group(matching[0]);
+        matching.iter().any(|&entity| {
+            !first_group.as_ref().map_or(entity == matching[0], |group| {
+                group.members().contains(&entity)
+            })
+        })
     })
 }
 
@@ -544,7 +559,7 @@ fn workspace_destroyed_handler(
 ) {
     let mut present_display_ids = None;
     for event in messages.read() {
-        let Event::SpaceDestroyed { space_id } = event else {
+        let Event::SpaceDestroyed { space_id } = &event else {
             continue;
         };
         focus_history.forget_workspace(*space_id);
@@ -553,7 +568,7 @@ fn workspace_destroyed_handler(
             .iter()
             .filter(|(strip, _, _, _)| strip.id() == *space_id)
             .map(|(strip, entity, parent, fullscreen)| {
-                let window = strip.first().ok().and_then(|col| col.top());
+                let window = strip.first();
                 (
                     entity,
                     parent.map(ChildOf::parent),
@@ -635,7 +650,7 @@ fn workspace_created_handler(
     mut commands: Commands,
 ) {
     for event in messages.read() {
-        let Event::SpaceCreated { space_id } = event else {
+        let Event::SpaceCreated { space_id } = &event else {
             continue;
         };
 
@@ -786,7 +801,7 @@ pub(crate) fn cleanup_unordered_windows(
 /// Removes previuos `ActiveWorkspaceMarker`'s when a new one is inserted.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_active_workspace_marker(
-    trigger: On<Add, ActiveWorkspaceMarker>,
+    trigger: On<Add<ActiveWorkspaceMarker>>,
     workspaces: Query<(Entity, Has<ActiveWorkspaceMarker>), With<LayoutStrip>>,
     mut commands: Commands,
 ) {
@@ -863,7 +878,7 @@ fn flash_workspace_on_activation(
 /// Removes previuos `SelectedVirtualMarker`'s when a new one is inserted.
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn cleanup_selected_space_marker(
-    trigger: On<Add, SelectedVirtualMarker>,
+    trigger: On<Add<SelectedVirtualMarker>>,
     workspaces: Query<(Entity, &LayoutStrip, Has<SelectedVirtualMarker>)>,
     mut commands: Commands,
 ) {
@@ -906,16 +921,19 @@ fn handle_virtual_window_moves(
     let (display_entity, active_display, dock) = *active_display;
     let viewport = active_display.actual_display_bounds(dock, &config);
     for (window_entity, move_marker) in &moved_windows {
-        let moving_entities = workspaces
+        let group = workspaces
             .get(source_entity)
             .ok()
-            .and_then(|(_, strip, _, _, _)| strip.tab_group(window_entity))
-            .unwrap_or_else(|| vec![window_entity]);
+            .and_then(|(_, strip, _, _, _)| strip.relocation_group(window_entity));
+        let moving_entities = group
+            .as_ref()
+            .map_or_else(|| vec![window_entity], |group| group.members().to_vec());
         for moving_entity in &moving_entities {
             if let Ok(mut entity_commands) = commands.get_entity(*moving_entity) {
                 entity_commands.try_remove::<VirtualMoveMarker>();
             }
         }
+
         let follow = matches!(move_marker.move_focus, MoveFocus::Follow);
 
         let target_idx = move_marker.target_virtual_index;
@@ -966,7 +984,7 @@ fn handle_virtual_window_moves(
                 workspace_id
             );
             let mut new_strip = LayoutStrip::new(workspace_id, target_idx);
-            new_strip.append_tab_group(&moving_entities);
+            new_strip.append_relocation_group(window_entity, group.as_ref());
 
             let mut spawned = commands.spawn_layout_strip(new_strip, origin, display_entity, false);
             if stay {
@@ -983,14 +1001,11 @@ fn handle_virtual_window_moves(
         // Preserve the source strip's scroll position for when the user returns.
         if !stay
             && let Ok(mut entity_commands) = commands.get_entity(source_entity)
-            && let Ok((_, source_strip, position, _, _)) = workspaces.get(source_entity)
+            && let Ok((_, _, position, _, _)) = workspaces.get(source_entity)
         {
-            let focus = source_strip
-                .left_neighbour(window_entity)
-                .or_else(|| source_strip.right_neighbour(window_entity));
             entity_commands.try_insert(PreviousStripPosition {
                 origin: position.0,
-                focus,
+                focus: source_neighbour,
             });
         }
 
@@ -998,8 +1013,10 @@ fn handle_virtual_window_moves(
         for (entity, mut strip, _, _, _) in &mut workspaces {
             if entity == target_entity {
                 match mid_placement {
-                    Some((slot, _)) => strip.insert_tab_group_at(slot, &moving_entities),
-                    None => strip.append_tab_group(&moving_entities),
+                    Some((slot, _)) => {
+                        strip.insert_relocation_group_at(slot, window_entity, group.as_ref());
+                    }
+                    None => strip.append_relocation_group(window_entity, group.as_ref()),
                 }
             } else {
                 for moving_entity in &moving_entities {
@@ -1510,6 +1527,7 @@ pub(crate) fn show_active_workspace(
         if let Some(focus) = *focus
             && strip.contains(focus)
         {
+            let focus = strip.active_tab(focus).unwrap_or(focus);
             spawn_restore_focus_guard(focus, &mut commands);
 
             commands.focus_entity(focus, false);
