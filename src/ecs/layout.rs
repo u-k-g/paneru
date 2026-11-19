@@ -411,6 +411,11 @@ pub struct LayoutStrip {
     /// Existing window whose visual x position must survive the next layout
     /// pass. Insertions to its left rebase the strip by the exact slot delta.
     pending_anchor: Option<Entity>,
+    /// Window whose position must survive the next `remove` on this strip.
+    /// Callers with focus knowledge (window removal, minimization) mark the
+    /// focused member; `remove` itself converts it into a `pending_anchor`
+    /// when the closed column sits strictly left of it.
+    removal_anchor: Option<Entity>,
 }
 
 impl LayoutStrip {
@@ -421,6 +426,7 @@ impl LayoutStrip {
             columns: VecDeque::new(),
             tabbed_stacks: EntityHashMap::default(),
             pending_anchor: None,
+            removal_anchor: None,
         }
     }
 
@@ -433,6 +439,7 @@ impl LayoutStrip {
             columns,
             tabbed_stacks: EntityHashMap::default(),
             pending_anchor: None,
+            removal_anchor: None,
         }
     }
 
@@ -494,6 +501,14 @@ impl LayoutStrip {
                 .is_ok_and(|anchor_index| insertion <= anchor_index)
         });
         self.insert_at(insertion, entity);
+    }
+
+    /// Marks `anchor` as the window whose visual x must survive the next
+    /// layout pass, provided it is still a member. Removal-side callers pass
+    /// the focused window so a column closing left of it rebases the strip
+    /// instead of dragging it left; the guard lives in `remove`.
+    pub fn preserve_on_next_layout(&mut self, anchor: Entity) {
+        self.removal_anchor = Some(anchor);
     }
 
     /// Appends a window ID as a `Single` panel to the end of the pane.
@@ -648,6 +663,20 @@ impl LayoutStrip {
         if self.pending_anchor == Some(entity) {
             self.pending_anchor = None;
         }
+        // A column closing strictly left of the removal anchor must not drag
+        // the anchor left with it: arm the anchor before the removal shifts
+        // the indices, so the next layout pass rebases the strip by the
+        // anchor's slot delta instead. `removal_anchor` is opt-in — plain
+        // removals keep today's behavior.
+        if let Some(anchor) = self.removal_anchor
+            && anchor != entity
+            && let (Ok(removed_index), Ok(anchor_index)) =
+                (self.index_of(entity), self.index_of(anchor))
+            && removed_index < anchor_index
+        {
+            self.pending_anchor = Some(anchor);
+        }
+        self.removal_anchor = None;
         let removed = self
             .index_of(entity)
             .ok()
@@ -1551,12 +1580,18 @@ pub(super) fn layout_strip_changed(
             .relative_positions(height, &get_window_frame)
             .collect::<Vec<_>>();
 
+        // `old_x` is the anchor's on-screen x while `new_x` is its new
+        // layout-relative slot, so the strip origin is *assigned*
+        // `old_x - new_x`: the one origin at which the anchor's screen
+        // position is unchanged. Adding the delta to the previous origin
+        // instead is correct only when that origin was already 0, and is
+        // silently off by it on a scrolled strip.
         if let Some((old_x, new_x)) = old_anchor_x.zip(anchor.and_then(|anchor| {
             changed
                 .iter()
                 .find_map(|(entity, frame)| (*entity == anchor).then_some(frame.min.x))
         })) {
-            strip_position.0.x += old_x - new_x;
+            strip_position.0.x = old_x - new_x;
         }
 
         for (entity, frame) in changed {
@@ -2614,6 +2649,50 @@ mod tests {
         // e3 (single) gets full viewport height.
         let e3_frame = out.iter().find(|(e, _)| *e == entities[3]).unwrap().1;
         assert_eq!(e3_frame.height(), 600);
+    }
+
+    #[test]
+    fn remove_preserving_anchors_focus_only_left_of_it() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), (), ()]).collect::<Vec<Entity>>();
+
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+
+        // A column closing strictly left of the marked focus arms the anchor;
+        // the layout pass then rebases the strip by the focus' slot delta.
+        strip.preserve_on_next_layout(entities[2]);
+        strip.remove(entities[0]);
+        assert_eq!(strip.pending_anchor, Some(entities[2]));
+
+        // Closing at or right of the focus changes nothing: the focus' slot
+        // does not move, so no anchor is armed.
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+        strip.preserve_on_next_layout(entities[1]);
+        strip.remove(entities[1]);
+        assert_eq!(strip.pending_anchor, None);
+        strip.preserve_on_next_layout(entities[1]);
+        strip.remove(entities[2]);
+        assert_eq!(strip.pending_anchor, None);
+
+        // A marked focus that is not even a member arms nothing.
+        let outsider = world.spawn_empty().id();
+        strip.preserve_on_next_layout(outsider);
+        strip.remove(entities[0]);
+        assert_eq!(strip.pending_anchor, None);
+
+        // Unmarked removals keep today's behavior.
+        let mut strip = LayoutStrip::default();
+        for &entity in &entities {
+            strip.append(entity);
+        }
+        strip.remove(entities[0]);
+        assert_eq!(strip.pending_anchor, None);
     }
 
     #[test]

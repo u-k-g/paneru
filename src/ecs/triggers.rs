@@ -823,6 +823,9 @@ pub(super) fn window_minimized_trigger(
 
         for (mut strip, active) in workspaces {
             if active {
+                if let Some((_, focused)) = windows.focused() {
+                    strip.preserve_on_next_layout(focused);
+                }
                 give_away_focus(
                     entity,
                     opener,
@@ -1621,6 +1624,13 @@ pub(super) fn window_removal_trigger(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
+        if active
+            && !global_state.skip_reshuffle()
+            && !global_state.initializing()
+            && let Some((_, focused)) = windows.focused()
+        {
+            strip.preserve_on_next_layout(focused);
+        }
         strip.remove(entity);
 
         // The strip's origin stays put, so closing a column left of the
